@@ -9,6 +9,8 @@ SSH_ALIAS    ?= $(INSTANCE)
 
 GCLOUD_SSH = gcloud compute ssh $(REMOTE_USER)@$(INSTANCE) \
              --project=$(GCP_PROJECT) --zone=$(ZONE) --tunnel-through-iap
+# Non-login SSH shells don't source ~/.profile, so uv (~/.local/bin) isn't on PATH
+REMOTE_INIT = export PATH=$$HOME/.local/bin:$$PATH
 
 sync:
 	rsync -avz \
@@ -23,7 +25,7 @@ sync:
 	  "$(LOCAL_DIR)/" $(SSH_ALIAS):$(REMOTE_DIR)/
 
 install:
-	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev && \
+	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev && \
 	  uv pip install 'moshi @ git+https://github.com/kyutai-labs/moshi-rag.git#subdirectory=moshi'"
 
 ssh:
@@ -31,9 +33,9 @@ ssh:
 
 # Run a command on the remote instance, e.g.:  make remote CMD="nvidia-smi"
 remote:
-	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && $(CMD)"
+	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && $(CMD)"
 
 smoke:
-	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && uv run evals/runner.py --config configs/baseline_with_retrieval.yaml --mode smoke"
+	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && uv run evals/runner.py --config configs/baseline_with_retrieval.yaml --mode smoke"
 
 .PHONY: sync install ssh remote smoke
