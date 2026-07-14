@@ -1,0 +1,17 @@
+model:
+  checkpoint: base
+  retrieval:
+    enabled: true
+    backend: gemini_api
+    model: gemini-2.0-flash
+    latency_gate_ms: 1500
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.e2ekd
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

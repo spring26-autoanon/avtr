@@ -1,0 +1,23 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# secrets
+.env
+
+# runtime artifacts
+checkpoint_cache/
+evals/results/
+demo/sessions/
+
+# editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
