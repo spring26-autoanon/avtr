@@ -54,13 +54,35 @@ alias gcloudcmd='gcloud compute ssh jupyter@wb-gpu-a1ultra \
 
 Steps 1–2 are on your **local machine**; steps 3 onward are inside an SSH session.
 
-### Step 1 — Generate SSH config entry (local machine)
+### Step 1 — Set up SSH alias with IAP tunnel (local machine)
+
+The VM has no external IP. All SSH connections must go through **Cloud IAP
+(Identity-Aware Proxy)**, which opens an encrypted tunnel from your machine
+to GCP's IAP service, which then proxies to the instance. Without this,
+rsync/ssh will either hang (direct IP, no route) or be refused.
+
+First, run `gcloud compute config-ssh` to generate your keys and known-hosts file:
 
 ```bash
 gcloud compute config-ssh --project=adsp-s26-autoanon
 ```
 
-This writes a block named `wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon` into `~/.ssh/config`.
+This writes a long-form entry (`wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon`)
+that points to the external IP directly — **do not use that entry**, it bypasses
+IAP and hangs. Instead, add the following short alias to `~/.ssh/config`:
+
+```
+Host wb-gpu-a1ultra
+  HostName wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon
+  User jupyter
+  IdentityFile ~/.ssh/google_compute_engine
+  ProxyCommand gcloud compute start-iap-tunnel wb-gpu-a1ultra %p --listen-on-stdin --project=adsp-s26-autoanon --zone=us-central1-c
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+```
+
+This alias routes all SSH traffic through IAP (`start-iap-tunnel`) so `make sync`,
+`make install`, and `make ssh` all work without needing a VPN or firewall rule.
 
 ### Step 2 — Sync code to remote (local machine)
 
