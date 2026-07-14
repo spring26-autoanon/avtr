@@ -36,7 +36,7 @@ Instance:     wb-gpu-a1ultra
 User:         jupyter
 Remote path:  /home/jupyter/moshirag-evals
 Connection:   gcloud compute ssh with --tunnel-through-iap (no external IP)
-SSH alias:    wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon
+SSH alias:    wb-gpu-a1ultra  (short alias in ~/.ssh/config with IAP ProxyCommand)
 ```
 
 ### gcloud shorthand (add to your shell profile)
@@ -76,7 +76,7 @@ rsync -avz \
   --exclude 'evals/results' --exclude 'demo/sessions' --exclude '*.pyc' \
   --exclude '.env' --exclude '.git' \
   "/home/ubuntuvm/Documents/Workspace/Agentic Capstone Playground/moshirag-evals/" \
-  jupyter@wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon:/home/jupyter/moshirag-evals/
+  wb-gpu-a1ultra:/home/jupyter/moshirag-evals/
 ```
 
 ### Step 3 — SSH into the VM
@@ -122,7 +122,7 @@ make sync
 make smoke
 
 # 3. Pull results back if needed
-rsync -avz jupyter@wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon:/home/jupyter/moshirag-evals/evals/results/ ./evals/results/
+rsync -avz wb-gpu-a1ultra:/home/jupyter/moshirag-evals/evals/results/ ./evals/results/
 ```
 
 ---

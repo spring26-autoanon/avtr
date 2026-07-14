@@ -5,8 +5,7 @@ REMOTE_USER  ?= jupyter
 REMOTE_DIR   ?= /home/jupyter/moshirag-evals
 LOCAL_DIR    ?= /home/ubuntuvm/Documents/Workspace/Agentic Capstone Playground/moshirag-evals
 
-# SSH alias if configured in ~/.ssh/config (optional shorthand)
-SSH_ALIAS    ?= $(REMOTE_USER)@$(INSTANCE).$(ZONE).$(GCP_PROJECT)
+SSH_ALIAS    ?= $(INSTANCE)
 
 GCLOUD_SSH = gcloud compute ssh $(REMOTE_USER)@$(INSTANCE) \
              --project=$(GCP_PROJECT) --zone=$(ZONE) --tunnel-through-iap
