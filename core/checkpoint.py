@@ -73,6 +73,8 @@ def _download_gcs(uri: str) -> str:
     logger.info("Downloading %d object(s) from %s → %s", len(blobs), uri, local_root)
 
     for blob in blobs:
+        if blob.name.endswith("/"):  # skip GCS directory placeholder objects
+            continue
         rel = blob.name[len(blob_prefix):].lstrip("/")
         dest = local_root / rel if rel else local_root
         if dest.exists():
