@@ -3,7 +3,7 @@ ZONE         ?= us-central1-c
 INSTANCE     ?= wb-gpu-a1ultra
 REMOTE_USER  ?= jupyter
 REMOTE_DIR   ?= /home/jupyter/moshirag-evals
-LOCAL_DIR    ?= .
+LOCAL_DIR    ?= /home/ubuntuvm/Documents/Workspace/Agentic Capstone Playground/moshirag-evals
 
 # SSH alias if configured in ~/.ssh/config (optional shorthand)
 SSH_ALIAS    ?= $(REMOTE_USER)@$(INSTANCE).$(ZONE).$(GCP_PROJECT)
@@ -21,7 +21,7 @@ sync:
 	  --exclude '*.pyc' \
 	  --exclude '.env' \
 	  --exclude '.git' \
-	  $(LOCAL_DIR)/ $(REMOTE_USER)@$(INSTANCE):$(REMOTE_DIR)/
+	  "$(LOCAL_DIR)/" $(SSH_ALIAS):$(REMOTE_DIR)/
 
 install:
 	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev && \

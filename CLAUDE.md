@@ -36,7 +36,7 @@ Instance:     wb-gpu-a1ultra
 User:         jupyter
 Remote path:  /home/jupyter/moshirag-evals
 Connection:   gcloud compute ssh with --tunnel-through-iap (no external IP)
-SSH alias:    <SSH_ALIAS>   ← fill in your ~/.ssh/config shortname
+SSH alias:    wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon
 ```
 
 ### gcloud shorthand (add to your shell profile)
@@ -65,7 +65,7 @@ This writes a block named `wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon` into 
 ### Step 2 — Sync code to remote (local machine)
 
 ```bash
-make sync LOCAL_DIR=/path/to/moshirag-evals
+make sync
 ```
 
 Or equivalently:
@@ -75,7 +75,8 @@ rsync -avz \
   --exclude '.venv' --exclude '__pycache__' --exclude 'checkpoint_cache' \
   --exclude 'evals/results' --exclude 'demo/sessions' --exclude '*.pyc' \
   --exclude '.env' --exclude '.git' \
-  /path/to/moshirag-evals/ jupyter@wb-gpu-a1ultra:/home/jupyter/moshirag-evals/
+  "/home/ubuntuvm/Documents/Workspace/Agentic Capstone Playground/moshirag-evals/" \
+  jupyter@wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon:/home/jupyter/moshirag-evals/
 ```
 
 ### Step 3 — SSH into the VM
@@ -115,13 +116,13 @@ uv run python -c "from core.checkpoint import resolve_checkpoint; resolve_checkp
 
 ```bash
 # 1. Edit locally, then sync
-make sync LOCAL_DIR=/path/to/moshirag-evals
+make sync
 
 # 2. Run smoke eval on remote to confirm nothing is broken
 make smoke
 
 # 3. Pull results back if needed
-rsync -avz jupyter@wb-gpu-a1ultra:/home/jupyter/moshirag-evals/evals/results/ ./evals/results/
+rsync -avz jupyter@wb-gpu-a1ultra.us-central1-c.adsp-s26-autoanon:/home/jupyter/moshirag-evals/evals/results/ ./evals/results/
 ```
 
 ---
