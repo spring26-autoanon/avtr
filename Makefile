@@ -10,7 +10,7 @@ SSH_ALIAS    ?= $(INSTANCE)
 GCLOUD_SSH = gcloud compute ssh $(REMOTE_USER)@$(INSTANCE) \
              --project=$(GCP_PROJECT) --zone=$(ZONE) --tunnel-through-iap
 # Non-login SSH shells don't source ~/.profile, so uv (~/.local/bin) isn't on PATH
-REMOTE_INIT = export PATH=$$HOME/.local/bin:$$PATH
+REMOTE_INIT = export PATH=\$$HOME/.local/bin:\$$PATH
 
 sync:
 	rsync -avz \
