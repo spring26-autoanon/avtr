@@ -20,7 +20,7 @@ gpu = [
     "torchaudio",
     "transformers",
     "speechbrain",
-    "openai-whisper",
+    "faster-whisper",
     "sounddevice",
     # moshi installed separately on VM — see make install
     # (git dep pulls aiohttp which needs cc, absent in dev container)
