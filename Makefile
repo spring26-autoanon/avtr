@@ -26,7 +26,9 @@ sync:
 
 install:
 	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev && \
-	  uv pip install 'moshi @ git+https://github.com/kyutai-labs/moshi-rag.git#subdirectory=moshi'"
+	  uv pip install 'moshi @ git+https://github.com/kyutai-labs/moshi-rag.git#subdirectory=moshi' && \
+	  sed -i 's/huggingface-hub>=0.34.0,<1.0/huggingface-hub>=0.34.0/' \
+	  .venv/lib/python3.11/site-packages/transformers/dependency_versions_table.py"
 
 ssh:
 	$(GCLOUD_SSH)
