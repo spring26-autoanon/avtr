@@ -24,7 +24,8 @@ sync:
 	  $(LOCAL_DIR)/ $(REMOTE_USER)@$(INSTANCE):$(REMOTE_DIR)/
 
 install:
-	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev"
+	$(GCLOUD_SSH) -- "cd $(REMOTE_DIR) && uv sync --extra gpu --extra dev && \
+	  uv pip install 'moshi @ git+https://github.com/kyutai-labs/moshi-rag.git#subdirectory=moshi'"
 
 ssh:
 	$(GCLOUD_SSH)
