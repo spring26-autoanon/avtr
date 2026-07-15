@@ -15,6 +15,7 @@ set -euo pipefail
 CKPT=/home/jupyter/moshirag-evals/checkpoint_cache/adsp-s26-autoanon-bucket/checkpoints/base/moshirag-base-bf16
 
 REFERENCE_ENCODER_URL=http://localhost:9999 \
+LLM_BASE_URL=http://localhost:9998 \
 uv run python -m moshi.server \
   --moshi-weight "$CKPT/model.safetensors" \
   --mimi-weight "$CKPT/tokenizer-e351c8d8-checkpoint125.safetensors" \
