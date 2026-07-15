@@ -134,6 +134,49 @@ uv run python -c "from core.checkpoint import resolve_checkpoint; resolve_checkp
 
 ---
 
+## Running the live demo
+
+The demo requires two services running on the VM plus an IAP port-forward on macOS.
+
+### On the VM
+
+```bash
+cd /home/jupyter/moshirag-evals
+bash scripts/run_demo.sh                          # base checkpoint, local STT
+bash scripts/run_demo.sh --checkpoint lora-v1    # fine-tuned checkpoint
+bash scripts/run_demo.sh --stt gradium           # Gradium STT (faster, needs STT_URL + STT_API_KEY in .env)
+```
+
+This starts a tmux session `demo` with:
+- **window 0 (conditioner):** reference encoder on port 8001 — encodes retrieved text for model conditioning
+- **window 1 (server):** moshi-rag main server on port 8998 — waits 20s for conditioner, then starts
+
+Monitor with `tmux attach -t demo`. Stop with `tmux kill-session -t demo`.
+
+### On macOS — IAP port forward (keep terminal open)
+
+```bash
+gcloud compute start-iap-tunnel wb-gpu-a1ultra 8998 \
+  --local-host-port=localhost:8998 \
+  --project=adsp-s26-autoanon --zone=us-central1-c
+```
+
+Then open **http://localhost:8998** in your browser. Allow mic access when prompted.
+
+### Required .env additions for the demo
+
+```
+LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+LLM_API_KEY=<same as GEMINI_API_KEY>
+LLM_MODEL_NAME=gemini-2.0-flash
+OPENAI_API_KEY=<same as GEMINI_API_KEY>
+# Gradium STT only (optional, --stt gradium):
+# STT_URL=wss://eu.api.gradium.ai/api/speech/asr
+# STT_API_KEY=<gradium-key>
+```
+
+---
+
 ## Code change workflow
 
 ```bash
