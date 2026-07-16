@@ -353,7 +353,7 @@ def _write_run(path: Path, checkpoint: str, resp_acc: float, total_p95: float, g
         "evals": {
             "knowledge.halu_eval_audio": {
                 "scores": {"ref_acc": 0.42, "resp_acc": resp_acc},
-                "metadata": {"n": 100, "judge_model": "gemini-2.0-flash"},
+                "metadata": {"n": 100, "judge_model": "gemini-3.5-flash"},
                 "errors": [],
                 "completed": True,
                 "last_completed_index": 100,

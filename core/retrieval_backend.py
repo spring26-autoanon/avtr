@@ -65,10 +65,29 @@ class GeminiAPIBackend(RetrievalBackend):
 
             t0 = time.perf_counter()
             try:
+                from google.genai import types
+
                 response = self._client.models.generate_content(
                     model=self.model,
                     contents=prompt,
+                    config=types.GenerateContentConfig(
+                        # This is a fast fact-lookup, not a reasoning task —
+                        # request minimal thinking effort. Gemini 3.x models
+                        # (unlike the 2.5 family) can't disable thinking
+                        # entirely, only reduce it; default is "medium".
+                        thinking_config=types.ThinkingConfig(thinking_level="low"),
+                        # Generous headroom for thinking + the actual answer.
+                        # Known, tracked failure mode: Gemini 3.x's mandatory
+                        # thinking can consume the entire output budget and
+                        # return zero visible text if this isn't set high
+                        # enough — https://github.com/googleapis/python-genai/issues/2121
+                        max_output_tokens=1024,
+                    ),
                 )
+                # Read .text inside the try: some SDK versions raise here
+                # (rather than just returning empty) when a response has no
+                # usable text parts.
+                text = response.text
             except Exception as exc:
                 latency = time.perf_counter() - t0
                 logger.warning("Gemini API call failed after %.3fs: %s", latency, exc)
@@ -81,6 +100,15 @@ class GeminiAPIBackend(RetrievalBackend):
             if latency * 1000 > self.latency_gate_ms:
                 raise LatencyGateError(latency, self.latency_gate_ms)
 
-            return response.text, latency
+            if not text:
+                # Same known Gemini 3.x issue as above, manifesting as an
+                # empty-but-"successful" response instead of an exception —
+                # non-deterministic per call, so retry rather than treat
+                # this as a valid empty answer.
+                logger.warning("Gemini response had no visible text content — retrying")
+                last_exc = RuntimeError("Gemini returned no text content")
+                continue
+
+            return text, latency
 
         raise last_exc  # type: ignore[misc]

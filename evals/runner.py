@@ -16,6 +16,7 @@ import datetime
 import importlib
 import inspect
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -86,7 +87,7 @@ def build_model(cfg: dict) -> ModelInterface:
 
     if retrieval_cfg.get("enabled"):
         backend = GeminiAPIBackend(
-            model=retrieval_cfg.get("model", "gemini-2.0-flash"),
+            model=retrieval_cfg.get("model", "gemini-3.5-flash"),
             latency_gate_ms=retrieval_cfg["latency_gate_ms"],
         )
     else:
@@ -449,6 +450,11 @@ def main() -> None:
         help="Compare two result JSON files",
     )
     args = parser.parse_args()
+
+    # Without this, core/model_interface.py's logger.info() calls (checkpoint,
+    # ARC-Encoder, warmup progress) are silently discarded — Python's logging
+    # module does nothing until configured.
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
 
     if args.compare:
         compare_runs(args.compare[0], args.compare[1])

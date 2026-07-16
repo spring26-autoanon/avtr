@@ -3,8 +3,16 @@ model:
   retrieval:
     enabled: true
     backend: gemini_api
-    model: gemini-2.0-flash
-    latency_gate_ms: 1500
+    model: gemini-3.5-flash
+    # 1500 was tuned for gemini-2.0-flash (now deprecated/shut down). Its
+    # replacement, gemini-3.5-flash, is a "thinking" model that defaults to
+    # medium thinking effort and — unlike the 2.5 family's
+    # reasoning_effort="none" — cannot fully disable it. Observed real-world
+    # latency on a short retrieval prompt was ~6.8s at the default thinking
+    # level, before core/retrieval_backend.py requested thinking_level="low".
+    # 8000 is a buffer above that unoptimized figure; tighten once real
+    # latency stats are available with the low-thinking request in place.
+    latency_gate_ms: 8000
 
 evals:
   - knowledge.open_audio_bench
