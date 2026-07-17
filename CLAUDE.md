@@ -211,16 +211,38 @@ considered and deliberately deferred — the workaround is reliable, and this
 was assessed as a deep, uncertain investigation into moshi's own step-loop
 internals for a UX-latency improvement, not a correctness fix.
 
-**Relevant if/when eval work resumes**: `evals/registry/*`'s eval
-implementations will use `MoshiRAGAdapter.respond()`, not `respond_stream()`.
-`respond()` shares the same underlying moshi-side mechanisms (`_retrieval_start
-_time`, `_doing_retrieval`, `_wait_step_index_at_least` pacing — even the
-original, unmodified `_feed_loop` uses the same pacing call) and the same
-`_patch_catch_reference_text` callback fix applies there too (it's on
-`_TimedInferenceJob`, shared by both). But `_step_watchdog` is defined only
-inside `respond_stream()` — `respond()` has no safety net if it hits the same
-stuck-`_doing_retrieval` condition. Not yet observed on `respond()` (it hasn't
-been exercised against a real checkpoint at all), but worth watching for.
+**Update**: confirmed on the first real eval run against a real checkpoint —
+`knowledge.open_audio_bench`'s smoke test hung indefinitely on the 4th
+question's `<ret>` trigger, no exception, exactly the predicted
+`_doing_retrieval` deadlock. `_step_watchdog` was extracted to module scope
+in `core/model_interface.py` and wired into `respond()`'s `_run()` the same
+way it was already wired into `respond_stream()` — both now get the same
+6-10s self-healing recovery instead of one of them hanging forever.
+
+**Second, separate bug found on the same run, after the watchdog fix**: with
+the hang resolved, the full 15-question smoke test completed but scored 0%
+on every subset, including trivially easy LlamaQ questions ("capital of
+France"). Root cause, confirmed against the real
+`inference_utils/inference_job.py` source (not the earlier comment's wrong
+claim that `stop_on_end_of_input=True, max_tail_silence=None` "matches
+run_inference.py's defaults" — it doesn't; `run_inference.py` defaults
+`stop_on_end_of_input` to `False` and its own argparse *requires* a real
+`--max-consecutive-silence-frames` value whenever it's `False`).
+`stop_on_end_of_input=True` makes `_output_loop` switch to a hard 1-second
+`asyncio.wait_for()` timeout on `output_queue.get()` the moment input
+feeding ends, finalizing the whole job the instant it fires — confirmed
+mid-`<ret>`-wait on a real question ("Reference generation cancelled" logged
+right after "Started waiting for 6 steps", well before that wait elapsed).
+The model essentially never got a chance to speak. Fixed in `respond()` by
+switching to `stop_on_end_of_input=False, max_tail_silence=_TAIL_SILENCE_STEPS`
+— the same consecutive-`<pad>`-token termination `respond_stream()` already
+uses successfully, with no timeout risk and no gating needed (unlike
+`respond_stream()`'s `_client_done` gate, a natural pause correctly ending
+the job is exactly what a one-shot `respond()` call should do). Also fixed a
+related latent bug found in the same code path: `respond()`'s
+`inner_text = "".join(trace["model_text"])` was joining the literal string
+`"<pad>"` for every silent step straight into the returned answer text,
+polluting whatever the LLM judge sees — now filtered out.
 
 ### On the VM
 

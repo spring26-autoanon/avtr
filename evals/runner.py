@@ -46,6 +46,13 @@ class EvalResult:
     errors: list[str] = field(default_factory=list)
     completed: bool = False
     last_completed_index: int = 0
+    # Optional per-question deep-dive record (question, model response,
+    # retrieved context/text, judge verdict, ...). Deliberately NOT written
+    # into the main run-*.json by _result_to_dict() — that file's schema is
+    # relied on by compare_runs() and is meant to stay a small, diffable
+    # summary. Written instead to a separate companion file by
+    # write_transcripts(); see its docstring.
+    transcript: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ── BaseEval ──────────────────────────────────────────────────────────────────
@@ -145,12 +152,19 @@ def _git_hash() -> str:
 # ── Partial result detection ──────────────────────────────────────────────────
 
 
+def _transcript_path(output_path: Path) -> Path:
+    """run-<id>.json -> run-<id>-transcript.json, same directory."""
+    return output_path.with_name(output_path.stem + "-transcript.json")
+
+
 def find_partial_result(checkpoint: str, config_path: str, mode: str) -> dict | None:
     """Return the most recent incomplete result for this checkpoint+config+mode."""
     if not RESULTS_DIR.exists():
         return None
     candidates = []
     for f in RESULTS_DIR.glob("run-*.json"):
+        if f.name.endswith("-transcript.json"):
+            continue
         try:
             with open(f) as fh:
                 data = json.load(fh)
@@ -167,6 +181,19 @@ def find_partial_result(checkpoint: str, config_path: str, mode: str) -> dict | 
         return None
     _, data, path = max(candidates, key=lambda x: x[0])
     print(f"Resuming from partial result: {path}")
+
+    # Merge in the companion transcript file, if any, so resumed evals can
+    # keep appending to prior transcript entries instead of losing them.
+    transcript_path = _transcript_path(path)
+    if transcript_path.exists():
+        try:
+            with open(transcript_path) as fh:
+                transcript_doc = json.load(fh)
+            for name, entries in transcript_doc.get("transcripts", {}).items():
+                data.setdefault("evals", {}).setdefault(name, {})["transcript"] = entries
+        except Exception:
+            pass
+
     return data
 
 
@@ -192,6 +219,33 @@ def write_results(
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     doc = {**run_doc, "completed": completed, "evals": {n: _result_to_dict(r) for n, r in eval_results.items()}}
     with open(output_path, "w") as f:
+        json.dump(doc, f, indent=2)
+
+
+def write_transcripts(run_doc: dict, eval_results: dict[str, EvalResult], output_path: Path) -> None:
+    """
+    Companion file to the main results JSON: full per-question transcripts
+    (question, model response, retrieved context/text, judge verdict, ...)
+    for evals that populate EvalResult.transcript. Kept in a separate
+    run-<id>-transcript.json rather than merged into the main run-<id>.json
+    — compare_runs() and any external tooling read that file expecting the
+    documented summary schema (scores/metadata/errors/completed/
+    last_completed_index) and nothing else; transcripts are for manual
+    per-record deep-dive validation, not for the summary/comparison view.
+    No-ops (writes nothing) if no eval in this run populated a transcript.
+    """
+    transcripts = {n: r.transcript for n, r in eval_results.items() if r.transcript}
+    if not transcripts:
+        return
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    doc = {
+        "run_id": run_doc["run_id"],
+        "checkpoint": run_doc["checkpoint"],
+        "config": run_doc["config"],
+        "mode": run_doc["mode"],
+        "transcripts": transcripts,
+    }
+    with open(_transcript_path(output_path), "w") as f:
         json.dump(doc, f, indent=2)
 
 
@@ -262,6 +316,7 @@ def run_evals(config_path: str, mode: str, spot_check: bool) -> None:
                 errors=data.get("errors", []),
                 completed=data.get("completed", False),
                 last_completed_index=data.get("last_completed_index", 0),
+                transcript=data.get("transcript", []),
             )
 
     model = build_model(cfg)
@@ -286,6 +341,10 @@ def run_evals(config_path: str, mode: str, spot_check: bool) -> None:
             "_spot_check": spot_check,
             "_mode": mode,
             "_resume_from": prior.last_completed_index if prior else 0,
+            # Full prior result, not just the index — evals with cumulative
+            # state (e.g. running accuracy across subsets) need prior.scores/
+            # metadata to resume correctly, not just a bare counter.
+            "_prior_result": prior,
         }
 
         try:
@@ -294,6 +353,7 @@ def run_evals(config_path: str, mode: str, spot_check: bool) -> None:
             result = EvalResult(eval_name=name, errors=[str(exc)], completed=False)
             eval_results[name] = result
             write_results(run_doc, eval_results, completed=False, output_path=output_path)
+            write_transcripts(run_doc, eval_results, output_path=output_path)
             print(f"\n✗ eval '{name}' failed: {exc}")
             print(f"  partial results written to: {output_path}")
             sys.exit(1)
@@ -305,10 +365,15 @@ def run_evals(config_path: str, mode: str, spot_check: bool) -> None:
 
         # Write after each eval so a mid-run crash doesn't lose everything
         write_results(run_doc, eval_results, completed=False, output_path=output_path)
+        write_transcripts(run_doc, eval_results, output_path=output_path)
 
     write_results(run_doc, eval_results, completed=all_completed, output_path=output_path)
+    write_transcripts(run_doc, eval_results, output_path=output_path)
     print(SEP)
     print(f"results written to: {output_path}")
+    transcript_path = _transcript_path(output_path)
+    if transcript_path.exists():
+        print(f"transcripts written to: {transcript_path}")
 
 
 # ── Comparison CLI ────────────────────────────────────────────────────────────
@@ -466,4 +531,17 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Running this file as a script (`uv run evals/runner.py ...`, per every
+    # documented usage in this repo) loads it as `__main__`, a module object
+    # distinct from `evals.runner`. load_eval_class() below dynamically
+    # imports each registry module, which does `from evals.runner import
+    # BaseEval` — triggering a *second*, independent import of this same
+    # file under the `evals.runner` name, producing a second BaseEval class
+    # object. issubclass(EvalSubclass, BaseEval) then fails identity
+    # comparison even though the code is identical, because EvalSubclass
+    # inherits from evals.runner.BaseEval while load_eval_class checks
+    # against __main__.BaseEval. Aliasing sys.modules here makes any later
+    # `import evals.runner` resolve to this already-loaded module instead of
+    # re-executing the file, so both sides see the same class objects.
+    sys.modules.setdefault("evals.runner", sys.modules["__main__"])
     main()

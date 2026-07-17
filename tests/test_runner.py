@@ -14,12 +14,14 @@ from evals.runner import (
     BaseEval,
     EvalResult,
     _indicator,
+    _transcript_path,
     build_model,
     compare_runs,
     find_partial_result,
     load_eval_class,
     run_evals,
     write_results,
+    write_transcripts,
 )
 from core.model_interface import ModelInterface, StubModelAdapter
 from core.retrieval_backend import NullBackend
@@ -179,6 +181,159 @@ def test_write_and_read_results(tmp_path):
         assert data["completed"] is True
         assert data["evals"]["fixture.constant"]["scores"]["score"] == 0.75
         assert data["evals"]["fixture.constant"]["last_completed_index"] == 5
+    finally:
+        runner_mod.RESULTS_DIR = orig
+
+
+def _run_doc(run_id: str = "2025-01-01T00-00-00Z") -> dict:
+    return {
+        "run_id": run_id,
+        "checkpoint": "base",
+        "checkpoint_uri": "local/base",
+        "config": "configs/test.yaml",
+        "mode": "smoke",
+        "git_hash": "abc1234",
+        "timestamp": "2025-01-01T00:00:00Z",
+    }
+
+
+def test_write_results_never_includes_transcript(tmp_path):
+    """The main run-*.json must stay exactly the documented summary schema —
+    compare_runs() and any external tooling rely on that. Transcript data
+    must never leak into it, even when an EvalResult carries one."""
+    from evals import runner as runner_mod
+    orig = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    try:
+        results = {
+            "knowledge.open_audio_bench": EvalResult(
+                eval_name="knowledge.open_audio_bench",
+                scores={"triviaqa_acc": 0.5},
+                completed=True,
+                last_completed_index=5,
+                transcript=[{"question": "q", "model_response": "a"}],
+            )
+        }
+        out = runner_mod.RESULTS_DIR / "run-test.json"
+        write_results(_run_doc(), results, completed=True, output_path=out)
+
+        with open(out) as f:
+            data = json.load(f)
+
+        assert "transcript" not in data["evals"]["knowledge.open_audio_bench"]
+        assert set(data["evals"]["knowledge.open_audio_bench"].keys()) == {
+            "scores", "metadata", "errors", "completed", "last_completed_index",
+        }
+    finally:
+        runner_mod.RESULTS_DIR = orig
+
+
+def test_write_transcripts_noop_when_no_eval_has_one(tmp_path):
+    from evals import runner as runner_mod
+    orig = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+    runner_mod.RESULTS_DIR.mkdir()
+
+    try:
+        results = {"fixture.constant": EvalResult(eval_name="fixture.constant", scores={"score": 0.5})}
+        out = runner_mod.RESULTS_DIR / "run-test.json"
+        write_transcripts(_run_doc(), results, output_path=out)
+        assert not _transcript_path(out).exists()
+    finally:
+        runner_mod.RESULTS_DIR = orig
+
+
+def test_write_transcripts_writes_companion_file(tmp_path):
+    from evals import runner as runner_mod
+    orig = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    try:
+        transcript = [
+            {"subset": "triviaqa", "index": 0, "question": "capital of France?",
+             "model_response": "Paris", "retrieval_context": "", "retrieval_text": "",
+             "judge_verdict": "correct"},
+        ]
+        results = {
+            "knowledge.open_audio_bench": EvalResult(
+                eval_name="knowledge.open_audio_bench",
+                scores={"triviaqa_acc": 1.0},
+                completed=True,
+                transcript=transcript,
+            )
+        }
+        out = runner_mod.RESULTS_DIR / "run-test.json"
+        run_doc = _run_doc()
+        write_transcripts(run_doc, results, output_path=out)
+
+        tpath = _transcript_path(out)
+        assert tpath.exists()
+        assert tpath.name == "run-test-transcript.json"
+        with open(tpath) as f:
+            data = json.load(f)
+        assert data["run_id"] == run_doc["run_id"]
+        assert data["transcripts"]["knowledge.open_audio_bench"] == transcript
+    finally:
+        runner_mod.RESULTS_DIR = orig
+
+
+def test_find_partial_result_merges_companion_transcript(tmp_path):
+    from evals import runner as runner_mod
+    orig = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+    runner_mod.RESULTS_DIR.mkdir()
+
+    try:
+        run_doc = {
+            **_run_doc(),
+            "completed": False,
+            "evals": {
+                "fixture.constant": {
+                    "scores": {"score": 0.5},
+                    "metadata": {},
+                    "errors": [],
+                    "completed": False,
+                    "last_completed_index": 3,
+                }
+            },
+        }
+        out = runner_mod.RESULTS_DIR / "run-test.json"
+        with open(out, "w") as f:
+            json.dump(run_doc, f)
+
+        transcript_doc = {
+            **_run_doc(),
+            "transcripts": {
+                "fixture.constant": [{"question": "q1", "model_response": "partial answer"}]
+            },
+        }
+        with open(_transcript_path(out), "w") as f:
+            json.dump(transcript_doc, f)
+
+        partial = find_partial_result("base", "configs/test.yaml", "smoke")
+        assert partial is not None
+        assert partial["evals"]["fixture.constant"]["transcript"] == [
+            {"question": "q1", "model_response": "partial answer"}
+        ]
+    finally:
+        runner_mod.RESULTS_DIR = orig
+
+
+def test_find_partial_result_ignores_transcript_files_as_candidates(tmp_path):
+    """A lone -transcript.json (no matching run-*.json) must never be
+    mistaken for a resumable run itself."""
+    from evals import runner as runner_mod
+    orig = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+    runner_mod.RESULTS_DIR.mkdir()
+
+    try:
+        stray = runner_mod.RESULTS_DIR / "run-orphan-transcript.json"
+        with open(stray, "w") as f:
+            json.dump({**_run_doc(), "transcripts": {}}, f)
+
+        assert find_partial_result("base", "configs/test.yaml", "smoke") is None
     finally:
         runner_mod.RESULTS_DIR = orig
 

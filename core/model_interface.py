@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import struct
 import tempfile
 import time
@@ -45,6 +46,31 @@ _TAIL_SILENCE_STEPS = 25
 # than requiring manual .env setup.
 _DEFAULT_LLM_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 _DEFAULT_LLM_MODEL_NAME = "gemini-3.5-flash"
+
+_BYTE_FALLBACK_TOKEN_RE = re.compile(r"^<0x[0-9A-Fa-f]{2}>$")
+
+
+def _clean_model_text(pieces: list[str]) -> str:
+    """
+    Detokenize trace["model_text"] into readable text.
+
+    inference_job.py's own _output_loop computes a cleaned, space-normalized
+    version of each token for its internal turn-taking/display logic
+    (_decode_text_token does text.replace("▁", " ")) but appends the *raw*
+    id_to_piece() output to the trace instead of that cleaned value — so the
+    trace (and anything built from it, like respond()'s returned text) is
+    literal SentencePiece pieces: word-start markers as "▁" and occasional
+    byte-fallback pieces like "<0x00>" for bytes with no direct vocab entry.
+    Reproduces the same "▁" -> " " replacement here, plus drops byte-fallback
+    pieces entirely (never meaningful spoken content, same category as the
+    "<pad>" filtering this already needs).
+    """
+    words = [
+        p.replace("▁", " ")
+        for p in pieces
+        if p != "<pad>" and not _BYTE_FALLBACK_TOKEN_RE.match(p)
+    ]
+    return "".join(words).strip()
 
 
 def _silent_wav(duration_s: float = 0.5, sample_rate: int = _SAMPLE_RATE) -> bytes:
@@ -111,6 +137,7 @@ class StubModelAdapter(ModelInterface):
         metadata = {
             "ttfat_s": self._TTFAT_S,
             "first_audio_token_ts": t0 + self._TTFAT_S,
+            "retrieval_context": self._TRANSCRIPTION if self.retrieval_backend is not None else "",
             "retrieval_text": ref_text,
             "retrieval_latency_s": retrieval_latency_s,
         }
@@ -199,6 +226,7 @@ class _TimedInferenceJob:
         self.ttfat_s: float = 0.0
         self.t_first_audio: float = 0.0
         self.retrieval_latency_s: float = 0.0
+        self.retrieval_context: str = ""
         self._t_question_end: float | None = None
         self._first_audio_recorded = False
 
@@ -245,6 +273,7 @@ class _TimedInferenceJob:
 
         async def _patched_get_reference_text(context: str) -> tuple[str, str, float, str]:
             t0 = time.perf_counter()
+            self.retrieval_context = context
             try:
                 ref_text, latency = backend.retrieve(context)
                 self.retrieval_latency_s = latency
@@ -252,6 +281,17 @@ class _TimedInferenceJob:
                 logger.warning("RetrievalBackend.retrieve() failed: %s", exc)
                 ref_text, latency = "", 0.0
             elapsed = time.perf_counter() - t0
+            # Distinct "[RetrievalBackend]" tag so this doesn't get confused
+            # with moshi's own "[Reference] Triggering retrieval with
+            # context_len=N snippet='...'" line — that one only shows a
+            # truncated tail of context and never logs what came back.
+            # Neither context nor ref_text is truncated here: seeing the full
+            # exchange (including confirming NullBackend genuinely returned
+            # empty, not silently truncated something real) is the point.
+            logger.info(
+                "[RetrievalBackend] context=%r -> reference_text=%r (backend_latency=%.3fs)",
+                context, ref_text, latency,
+            )
             return context, ref_text, elapsed, "RetrievalBackend"
 
         self._job.rag_manager.get_reference_text = _patched_get_reference_text
@@ -375,6 +415,70 @@ class _TimedInferenceJob:
     @stt.setter
     def stt(self, v):
         self._job.stt = v
+
+
+async def _step_watchdog(raw_job) -> None:
+    """
+    Logs step_index every 3s so a stalled turn shows definitively whether the
+    model's own step loop is still advancing — a true deadlock here raises no
+    exception and hits no timeout on its own, confirmed on a real run.
+
+    Also a safety net for a confirmed race: _patch_catch_reference_text's own
+    fix (clearing _doing_retrieval right after handle_reference_fn completes)
+    only works if _output_loop's step loop has already set _doing_retrieval =
+    True by the time that callback runs. With NullBackend, retrieval is
+    near-instant (no network call), so the callback can complete *before*
+    _output_loop's own step_index == self._retrieval_start_step check ever
+    fires — meaning _doing_retrieval gets set True only *after* our callback
+    already checked and found it False, and nothing is left to ever clear it
+    — a real run confirmed exactly this (our own "still True" warning never
+    fired, yet step_index still froze with doing_retrieval stuck True).
+    Whether the callback wins or loses that race depends on retrieval
+    latency, not something a callback alone can reliably fix — so if
+    step_index is stalled with doing_retrieval stuck True for two
+    consecutive checks (6s+, well past any legitimate retrieval), clear it
+    here regardless of why it got stuck.
+
+    Shared by respond() and respond_stream(): confirmed on respond_stream()
+    first, but both paths build a raw InferenceJob and drive it through
+    _TimedInferenceJob.run() against the same moshi-rag step loop, so
+    respond() was always exposed to the identical deadlock — it just hadn't
+    been exercised against a real checkpoint yet. Confirmed on a real
+    respond() run: stuck at step_index with doing_retrieval=True and no
+    watchdog, hung indefinitely with no exception until this was added.
+    """
+    last_step = None
+    stalled_while_retrieving = 0
+    while True:
+        await asyncio.sleep(3.0)
+        current_step = raw_job.step_index
+        advancing = current_step != last_step
+        # Confirmed working via this exact log at INFO level across several
+        # real runs — kept at DEBUG now so normal sessions aren't spammed
+        # every 3s; the WARNING below, which fires only when it actually has
+        # to intervene, stays visible at the default level.
+        logger.debug(
+            "[watchdog] step_index=%d (%s) doing_retrieval=%s slot_idx=%s",
+            current_step,
+            "advancing" if advancing else "STALLED",
+            raw_job._doing_retrieval,
+            raw_job.slot_idx,
+        )
+        if not advancing and raw_job._doing_retrieval:
+            stalled_while_retrieving += 1
+            if stalled_while_retrieving >= 2:
+                logger.warning(
+                    "[watchdog] step_index stalled at %d with doing_retrieval "
+                    "stuck True for %ds — forcibly clearing (known race: "
+                    "_output_loop can set this True after our own callback "
+                    "already checked and finished, especially with "
+                    "near-instant NullBackend retrieval)",
+                    current_step, stalled_while_retrieving * 3,
+                )
+                raw_job._doing_retrieval = False
+        else:
+            stalled_while_retrieving = 0
+        last_step = current_step
 
 
 class MoshiRAGAdapter(ModelInterface):
@@ -655,25 +759,52 @@ class MoshiRAGAdapter(ModelInterface):
                     state,
                     in_path,
                     out_path,
-                    stop_on_end_of_input=True,
-                    # Matches run_inference.py's own argparse defaults: no
-                    # ground-truth reference override (we supply retrieval
-                    # via RetrievalBackend), no sidecar JSON file, and
-                    # max_tail_silence=None (its default even in the
-                    # streaming branch — only set when the CLI's
-                    # --max-consecutive-silence-frames is passed explicitly).
+                    # UPDATE, confirmed against the real inference_job.py
+                    # source (not the earlier, wrong assumption that
+                    # stop_on_end_of_input=True + max_tail_silence=None
+                    # "matches run_inference.py's defaults" — run_inference.py
+                    # actually defaults stop_on_end_of_input to False, and its
+                    # own argparse *requires* a real --max-consecutive-
+                    # silence-frames value whenever it's False). With
+                    # stop_on_end_of_input=True, _output_loop switches to a
+                    # hard 1-second asyncio.wait_for() timeout on
+                    # output_queue.get() the moment input feeding ends — and
+                    # finalizes the WHOLE job the instant that fires, even
+                    # mid-<ret>-wait (confirmed on a real run: "[Reference]
+                    # Reference generation cancelled" logged right after
+                    # "Started waiting for 6 steps", well before that wait
+                    # elapsed). That produced near-empty responses across
+                    # every question in a real smoke test — the model never
+                    # got a real chance to speak. stop_on_end_of_input=False
+                    # keeps feeding silence and calling output_queue.get()
+                    # with NO timeout after input ends — termination instead
+                    # comes from max_tail_silence's consecutive-<pad>-token
+                    # check (_check_tail_silence), the same bounded mechanism
+                    # respond_stream() already relies on. Not gating it
+                    # behind something like _client_done here: unlike
+                    # respond_stream()'s continuous multi-turn session,
+                    # respond() is inherently one question in, one answer
+                    # out — a natural pause SHOULD end the job.
+                    stop_on_end_of_input=False,
                     use_gt_reference=False,
-                    max_tail_silence=None,
+                    max_tail_silence=_TAIL_SILENCE_STEPS,
                     sidecar={},
                 )
                 timed = _TimedInferenceJob(raw_job, retrieval_backend)
                 slot_idx = await state.wait_acquire_slot(raw_job)
                 timed.slot_idx = slot_idx
                 timed.stt = stt
+                # See _step_watchdog's docstring: respond() drives the same
+                # moshi-rag step loop as respond_stream() and is exposed to
+                # the identical _doing_retrieval deadlock — confirmed on a
+                # real respond() run (hung indefinitely on a <ret> trigger,
+                # no exception, before this was added).
+                watchdog_task = asyncio.create_task(_step_watchdog(raw_job), name="step-watchdog")
                 try:
                     async with asyncio.TaskGroup() as tg:
                         await timed.run(tg)
                 finally:
+                    watchdog_task.cancel()
                     if timed.slot_idx >= 0:
                         await state.release_slot(timed.slot_idx)
                 step_task.cancel()
@@ -694,11 +825,15 @@ class MoshiRAGAdapter(ModelInterface):
                 audio_out = _silent_wav(duration_s=0.1, sample_rate=sample_rate)
 
             trace = job.trace
-            inner_text = "".join(trace.get("model_text", []))
+            inner_text = _clean_model_text(trace.get("model_text", []))
 
             metadata = {
                 "ttfat_s": job.ttfat_s,
                 "first_audio_token_ts": job.t_first_audio,
+                # What was actually sent to RetrievalBackend.retrieve() —
+                # previously invisible anywhere (moshi's own "[Reference]
+                # Triggering retrieval..." log only shows a truncated tail).
+                "retrieval_context": job.retrieval_context,
                 "retrieval_text": trace.get("reference_text", ""),
                 "retrieval_latency_s": job.retrieval_latency_s,
                 "rag_triggered": "rag_trigger_step" in trace,
@@ -905,68 +1040,7 @@ class MoshiRAGAdapter(ModelInterface):
 
             timed._job.output_queue.get = _tee_get
 
-            async def _step_watchdog() -> None:
-                """
-                Logs step_index every 3s so a stalled turn shows definitively
-                whether the model's own step loop is still advancing — a true
-                deadlock here raises no exception and hits no timeout on its
-                own, confirmed on a real run.
-
-                Also a safety net for a confirmed race:
-                _patch_catch_reference_text's own fix (clearing
-                _doing_retrieval right after handle_reference_fn completes)
-                only works if _output_loop's step loop has already set
-                _doing_retrieval = True by the time that callback runs. With
-                NullBackend, retrieval is near-instant (no network call), so
-                the callback can complete *before* _output_loop's own
-                step_index == self._retrieval_start_step check ever fires —
-                meaning _doing_retrieval gets set True only *after* our
-                callback already checked and found it False, and nothing is
-                left to ever clear it — a real run confirmed exactly this
-                (our own "still True" warning never fired, yet step_index
-                still froze with doing_retrieval stuck True). Whether the
-                callback wins or loses that race depends on retrieval
-                latency, not something a callback alone can reliably fix —
-                so if step_index is stalled with doing_retrieval stuck True
-                for two consecutive checks (6s+, well past any legitimate
-                retrieval), clear it here regardless of why it got stuck.
-                """
-                last_step = None
-                stalled_while_retrieving = 0
-                while True:
-                    await asyncio.sleep(3.0)
-                    current_step = raw_job.step_index
-                    advancing = current_step != last_step
-                    # Confirmed working via this exact log at INFO level
-                    # across several real runs — kept at DEBUG now so normal
-                    # sessions aren't spammed every 3s; the WARNING below,
-                    # which fires only when it actually has to intervene,
-                    # stays visible at the default level.
-                    logger.debug(
-                        "[watchdog] step_index=%d (%s) doing_retrieval=%s slot_idx=%s",
-                        current_step,
-                        "advancing" if advancing else "STALLED",
-                        raw_job._doing_retrieval,
-                        raw_job.slot_idx,
-                    )
-                    if not advancing and raw_job._doing_retrieval:
-                        stalled_while_retrieving += 1
-                        if stalled_while_retrieving >= 2:
-                            logger.warning(
-                                "[watchdog] step_index stalled at %d with "
-                                "doing_retrieval stuck True for %ds — forcibly "
-                                "clearing (known race: _output_loop can set this "
-                                "True after our own callback already checked and "
-                                "finished, especially with near-instant "
-                                "NullBackend retrieval)",
-                                current_step, stalled_while_retrieving * 3,
-                            )
-                            raw_job._doing_retrieval = False
-                    else:
-                        stalled_while_retrieving = 0
-                    last_step = current_step
-
-            watchdog_task = asyncio.create_task(_step_watchdog(), name="step-watchdog")
+            watchdog_task = asyncio.create_task(_step_watchdog(raw_job), name="step-watchdog")
 
             slot_idx = await state.wait_acquire_slot(raw_job)
             timed.slot_idx = slot_idx
