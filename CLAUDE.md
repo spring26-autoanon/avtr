@@ -181,7 +181,7 @@ actually ending) — confirmed necessary on a real run, where the underlying
 padding-token heuristic misfired mid-conversation with the client still
 connected (see the comment on that patch for the full mechanism).
 
-### Known issue: ~6-10s pause on every retrieval trigger — both backends
+### Known issue (BACKLOGGED, not accepted long-term): ~6-10s pause on every retrieval trigger — both backends
 
 Confirmed via a step-index watchdog (`_step_watchdog` in `respond_stream()`):
 whenever the model predicts `<ret>`, moshi's own `_output_loop` is supposed to
@@ -207,9 +207,16 @@ step-loop bookkeeping, not something fixed at the root — `run_inference.py`
 no no-retrieval mode at all and processes one full utterance per job rather
 than our continuous multi-turn session shape, so this exact condition may
 simply be untested upstream. Root-causing the actual step_index mismatch was
-considered and deliberately deferred — the workaround is reliable, and this
-was assessed as a deep, uncertain investigation into moshi's own step-loop
-internals for a UX-latency improvement, not a correctness fix.
+considered and **backlogged, not permanently accepted** — the workaround is
+reliable enough to keep working on other things, but this still needs a real
+root-cause pass, not just a "good enough" writeoff. Deferred because it was
+assessed as a deep, uncertain investigation into moshi's own step-loop
+internals, and lower priority than getting the eval suite built out. Revisit
+once the eval suite is further along. Confirmed via the demo turn-2
+investigation below that this pause affects **both** `respond()` and
+`respond_stream()` equally (a real two-question demo session needed the
+watchdog on both retrieval triggers) — unlike the silent-response bug below,
+which is `respond()`-only, this one is a shared, cross-cutting issue.
 
 **Update**: confirmed on the first real eval run against a real checkpoint —
 `knowledge.open_audio_bench`'s smoke test hung indefinitely on the 4th
@@ -243,6 +250,69 @@ related latent bug found in the same code path: `respond()`'s
 `inner_text = "".join(trace["model_text"])` was joining the literal string
 `"<pad>"` for every silent step straight into the returned answer text,
 polluting whatever the LLM judge sees — now filtered out.
+
+### Known issue: `respond()`-only silent-response bug when retrieval is enabled
+
+Third, separate bug, found once the above two were fixed and `open_audio_bench`
+was run **with retrieval enabled**: the first `respond()` call on a
+`MoshiRAGAdapter` instance produces a correct, retrieval-grounded answer, but
+every subsequent `respond()` call goes **completely silent** — zero non-`<pad>`
+tokens for the whole turn, no `<ret>` ever predicted, endless "[VAD] User
+stopped speaking but LM buffer empty, remaining in user turn." Only manifests
+when retrieval is enabled; the earlier no-retrieval smoke test ran 15
+sequential questions with no such issue.
+
+Three targeted hypotheses were tested against a real checkpoint and each
+**ruled out** with real diagnostic evidence, in order:
+1. **Stale RAG conditioning surviving into the next job** — ruled out.
+   `BatchRunner.run_step()`'s own `is_first`-triggered reset was confirmed
+   (via temporary logging, since removed) to correctly clear
+   `pending_streaming_sums` before the second call's first frame.
+2. **A cross-thread CUDA sync gap** between the conditioning update
+   (`_handle_reference_text` → `update_streaming_sum_tensors`, an async GPU
+   copy) and the next generation step — ruled out. An explicit
+   `torch.cuda.synchronize()` there (also since removed) made no difference.
+3. **Per-call event-loop/step-task teardown** — `respond()` used to call
+   `asyncio.run(_run())` fresh per question (new event loop, new
+   `state._step_loop()` task, every time), unlike `run_inference.py`'s own
+   structure (one step loop, created once, running continuously across every
+   file in the batch). Ruled out — switching `respond()` to a persistent
+   event loop + step task (`MoshiRAGAdapter._ensure_step_loop()`, kept for
+   the adapter's whole lifetime) made no difference either.
+
+**What did work**: pointing conditioning at a real, separate-process
+`server_conditioner.py` sidecar (`REFERENCE_ENCODER_URL` env var — see
+`MoshiRAGAdapter`'s "Conditioning" docstring) instead of the in-process
+ARC-Encoder fixed it, confirmed in two independent real-checkpoint tests
+(different questions, both flipped from silent to correct). This points at
+something about conditioning and generation sharing one CUDA context/process
+— the in-process ARC-Encoder is a deliberate project requirement (see specs),
+something moshi-rag's own reference architecture never has to handle since
+its encoder always runs in a genuinely separate process.
+
+**Critically, `respond_stream()` (the demo) does NOT have this bug.** A real
+two-question session (retrieval on, generous silence gap between questions)
+responded correctly both times, with genuine multi-turn memory (question 2's
+retrieval context correctly included question 1's full exchange). This makes
+sense structurally: the demo's one continuous session only ever does the
+`is_first` reset once, at true session start, and never re-exercises whatever
+`respond()`'s per-call fresh-job pattern hits. So this is scoped to
+`respond()`/evals specifically, not a general in-process-conditioning problem
+— and it should **stay** scoped there: making `respond()` session-like (to
+match how `respond_stream()` avoids the bug) would be wrong, since eval
+questions need to be scored independently, and a shared session would leak
+prior questions' context into later ones' retrieval and generation (observed
+directly: question 2's retrieval context included question 1's Q&A verbatim
+in the demo test — correct there, would silently corrupt eval scores here).
+
+**Status**: root cause not fully pinned down (we know pointing at a separate
+process fixes it, not precisely why the in-process path breaks). The spec's
+blanket "no sidecar" requirement needs a scoped update — allow it for
+`respond()`/evals specifically, keep `respond_stream()`/the demo in-process
+(confirmed unaffected, no reason to change it). Not yet implemented as the
+default; `REFERENCE_ENCODER_URL` exists as an opt-in workaround in the
+meantime, requires manually running `server_conditioner.py` as a second
+process. See specs for the pending requirement update.
 
 ### On the VM
 
@@ -316,6 +386,11 @@ rsync -avz wb-gpu-a1ultra:/home/jupyter/moshirag-evals/evals/results/ ./evals/re
 ## Running evals
 
 ```bash
+# Tiny — 1 question/subset, under a minute per eval — rapid dev-iteration
+# sanity ping while building/debugging one eval at a time. Too small a
+# sample to trust any score from; not a substitute for smoke.
+uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml --mode tiny
+
 # Smoke — 5 questions/subset, ~10 min, sanity check
 uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml --mode smoke
 
@@ -340,6 +415,31 @@ uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yam
 ```
 
 Results are written to `evals/results/` tagged with checkpoint, timestamp, git hash, config, and mode.
+
+### Retrieval-enabled runs: `respond()`-only silent-response bug workaround
+
+See "Known issue: `respond()`-only silent-response bug when retrieval is
+enabled" above — any eval run against `baseline_with_retrieval.yaml` (or any
+config with retrieval enabled) currently only produces a real answer on the
+*first* retrieval-triggering question, then goes silent on every subsequent
+one. Until this has a permanent fix, work around it by pointing conditioning
+at a real, separate `server_conditioner.py` process:
+
+```bash
+# Terminal 1 — start the sidecar (adjust CKPT to your resolved checkpoint dir)
+CKPT=checkpoint_cache/adsp-s26-autoanon-bucket/checkpoints/base/moshirag-base-bf16
+uv run --all-extras python -m moshi.server_conditioner \
+  --config "$CKPT/config.json" --moshi-weight "$CKPT/model.safetensors" \
+  --conditioner reference_with_time --cuda-device 0 --port 8001
+
+# Terminal 2 — run the eval pointed at it
+export REFERENCE_ENCODER_URL=http://localhost:8001
+uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml
+```
+
+`unset REFERENCE_ENCODER_URL` and stop the sidecar process to go back to
+normal (spec-default) in-process conditioning. Only needed for `respond()`
+(evals) — never needed for the demo (`respond_stream()`, confirmed unaffected).
 
 ---
 

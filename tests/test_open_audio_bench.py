@@ -118,6 +118,20 @@ def test_run_smoke_mode_scores_all_subsets():
     assert entry["judge_verdict"] == "correct"
 
 
+def test_run_tiny_mode_limits_to_one_per_subset():
+    model = _FakeModel()
+    with patch.object(oab, "_load_rows", side_effect=_fake_rows), \
+         patch.object(oab, "_load_audio_bytes", return_value=b"wav-bytes"), \
+         patch.object(oab, "call_gemini", return_value="the score is [Correct]"):
+        result = oab.OpenAudioBenchEval().run(model, {}, "tiny")
+
+    assert result.metadata["n_triviaqa"] == 1
+    assert result.metadata["n_webq"] == 1
+    assert result.metadata["n_llamaq"] == 1
+    assert result.last_completed_index == 3  # 1 per subset x 3 subsets
+    assert model.calls == 3
+
+
 def test_run_records_errors_without_aborting():
     model = _FakeModel()
 

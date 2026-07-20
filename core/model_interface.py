@@ -497,6 +497,35 @@ class MoshiRAGAdapter(ModelInterface):
         (get_conditioning_remote_async) is monkeypatched in _load_models() to
         call the local EncoderService directly instead. See
         _patch_inprocess_conditioning().
+      - EVAL-ONLY ESCAPE HATCH, unset by default: if the REFERENCE_ENCODER_URL
+        env var is set, this in-process patching is skipped entirely and
+        moshi-rag's own unmodified get_conditioning_remote_async is left in
+        place, pointed at that URL (a real, separate `python -m
+        moshi.server_conditioner` process).
+
+        Backstory: respond() has a confirmed bug — the first call on a
+        MoshiRAGAdapter instance produces a correct answer, but every
+        subsequent call goes completely silent (zero non-<pad> tokens, no
+        <ret> ever predicted) whenever retrieval is enabled. Three targeted
+        hypotheses were ruled out with real diagnostic evidence first: stale
+        streaming_sum state surviving into the next job (BatchRunner's own
+        is_first-triggered reset was confirmed correctly clearing it), a
+        cross-thread CUDA sync gap between the conditioning update and the
+        next generation step (an explicit torch.cuda.synchronize() there
+        made no difference), and per-call event-loop/step-task teardown
+        (switching respond() to a persistent loop, same as run_inference.py's
+        own structure, made no difference either). Pointing conditioning at
+        a real separate-process sidecar instead measurably fixed it in two
+        independent real-checkpoint tests. respond_stream() (the demo) was
+        separately confirmed NOT to have this bug at all — a real two-question
+        session with retrieval on responded correctly both times — so this is
+        scoped to respond()/evals specifically, not a general problem with
+        in-process conditioning. The spec's blanket "no sidecar" requirement
+        needs a scoped update to reflect this; until that's settled and a
+        permanent fix lands, this env var lets evals opt into the confirmed
+        workaround without changing default (spec-compliant, in-process)
+        behavior. respond_stream()/the demo should keep using in-process
+        conditioning regardless — it isn't affected by this bug.
 
     Retrieval:
       - If retrieval_backend is NullBackend or None: moshi-rag's RAG path is
@@ -514,6 +543,44 @@ class MoshiRAGAdapter(ModelInterface):
         self.checkpoint_path = checkpoint_path
         self.retrieval_backend = retrieval_backend or NullBackend()
         self._load_models()
+        # See _ensure_step_loop() — lazily created on first respond() call,
+        # then kept alive for this adapter's whole lifetime.
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._step_task: asyncio.Task | None = None
+
+    def _ensure_step_loop(self) -> None:
+        """
+        Start (once) a persistent event loop + step_task for respond(), and
+        keep both alive across every subsequent respond() call on this
+        adapter instance — matching run_inference.py's own structure, where
+        the step loop is created once outside the per-job loop and stays
+        running continuously across every wav file in the batch via
+        asyncio.gather. respond() previously called asyncio.run(_run())
+        fresh per question: a brand new event loop and a brand new
+        state._step_loop() task, created and torn down every single time —
+        a real, confirmed structural difference from the reference
+        implementation. Investigating a reproduced bug (with retrieval
+        enabled, only the first respond() call on an adapter instance ever
+        produces a response — every subsequent call goes completely silent,
+        zero non-<pad> tokens, no <ret> ever predicted) after two other
+        targeted hypotheses were each ruled out with real diagnostic
+        evidence: stale RAG conditioning surviving into the next job (ruled
+        out — BatchRunner's own is_first-triggered reset was confirmed
+        correctly clearing pending_streaming_sums before the second call);
+        and a cross-thread CUDA ordering gap between the conditioning
+        update and the next generation step (ruled out — an explicit
+        torch.cuda.synchronize() there made no difference). This addresses
+        the next remaining structural difference instead of another guess
+        at CUDA timing.
+        """
+        if self._loop is not None:
+            return
+        self._loop = asyncio.new_event_loop()
+
+        async def _start_step_loop() -> asyncio.Task:
+            return asyncio.create_task(self._state._step_loop(), name="step-loop")
+
+        self._step_task = self._loop.run_until_complete(_start_step_loop())
 
     def _resolve_checkpoint_paths(self, checkpoint_dir: Path) -> dict[str, Path]:
         """
@@ -596,8 +663,23 @@ class MoshiRAGAdapter(ModelInterface):
         # LocalSpeechToText.__init__ asserts its mimi isn't already streaming.
         self._stt_template = LocalSpeechToText(deepcopy(self._mimi))
 
-        self._arc_encoder = self._load_arc_encoder(args, ckpt_paths)
-        self._patch_inprocess_conditioning()
+        # See the class docstring's "Conditioning" section — unset in normal
+        # operation; opt-in workaround for a confirmed respond()-only bug,
+        # pending a scoped spec update and a permanent fix.
+        sidecar_url = os.environ.get("REFERENCE_ENCODER_URL")
+        if sidecar_url:
+            logger.warning(
+                "REFERENCE_ENCODER_URL=%s set — using an external sidecar "
+                "conditioner process instead of in-process ARC-Encoder. "
+                "Confirmed workaround for a respond()-only bug (see class "
+                "docstring); not yet the default (spec still requires "
+                "in-process conditioning as the normal architecture).",
+                sidecar_url,
+            )
+            self._arc_encoder = None
+        else:
+            self._arc_encoder = self._load_arc_encoder(args, ckpt_paths)
+            self._patch_inprocess_conditioning()
 
         # See _DEFAULT_LLM_BASE_URL above — moshi's ServerState.__init__
         # requires these to exist even though its own LLM call is never
@@ -610,11 +692,13 @@ class MoshiRAGAdapter(ModelInterface):
             mimi=self._mimi,
             text_tokenizer=self._text_tokenizer,
             lm_gen=self._lm_gen,
-            # Vestigial after _patch_inprocess_conditioning(): the only code
-            # that ever read this attribute (get_conditioning_remote_async,
-            # patched below) now calls self._arc_encoder directly instead of
-            # making an HTTP request, so no real URL is needed here.
-            reference_encoder_url="in-process",
+            # Vestigial after _patch_inprocess_conditioning() (the only code
+            # that ever read this attribute, get_conditioning_remote_async,
+            # is patched to call self._arc_encoder directly instead of
+            # making an HTTP request) — UNLESS sidecar_url is set, in which
+            # case that patch never happened and this URL is what the real,
+            # unmodified get_conditioning_remote_async actually calls.
+            reference_encoder_url=sidecar_url or "in-process",
             stt_wait_time=args.stt_wait_time,
             gradium_stt=False,
             device=args.device,
@@ -748,13 +832,14 @@ class MoshiRAGAdapter(ModelInterface):
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as fout:
             out_path = Path(fout.name)
 
+        self._ensure_step_loop()
+
         try:
             stt = deepcopy(self._stt_template)
             state = self._state
             retrieval_backend = self.retrieval_backend
 
             async def _run() -> _TimedInferenceJob:
-                step_task = asyncio.create_task(state._step_loop(), name="step-loop")
                 raw_job = InferenceJob(
                     state,
                     in_path,
@@ -807,14 +892,12 @@ class MoshiRAGAdapter(ModelInterface):
                     watchdog_task.cancel()
                     if timed.slot_idx >= 0:
                         await state.release_slot(timed.slot_idx)
-                step_task.cancel()
-                try:
-                    await step_task
-                except asyncio.CancelledError:
-                    pass
                 return timed
 
-            job = asyncio.run(_run())
+            # Runs on the persistent loop from _ensure_step_loop() — the
+            # step_task started there keeps running continuously across
+            # every respond() call, not recreated per question.
+            job = self._loop.run_until_complete(_run())
 
             # Reconstruct audio WAV from accumulated PCM chunks
             sample_rate = int(self._state.runner.mimi.sample_rate)
@@ -840,6 +923,15 @@ class MoshiRAGAdapter(ModelInterface):
                 "rag_trigger_step": trace.get("rag_trigger_step"),
                 "question_end_step": trace.get("question_end_step"),
             }
+
+            # One clear, greppable line per question — everything else about
+            # whether <ret> fired is buried in dozens of moshi-internal log
+            # lines ("[Reference] Triggering retrieval...", "[Buffer]
+            # buffering model text...", etc). Search logs for "[respond]".
+            logger.info(
+                "[respond] rag_triggered=%s ttfat=%.3fs response=%r",
+                metadata["rag_triggered"], metadata["ttfat_s"], inner_text[:200],
+            )
 
             return audio_out, inner_text, metadata
 

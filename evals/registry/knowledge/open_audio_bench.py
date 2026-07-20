@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 _REPO_ID = "baichuan-inc/OpenAudioBench"
 _JUDGE_MODEL = "gemini-3.5-flash"
 
-_MODE_SAMPLE_SIZE = {"smoke": 5, "sample": 100}  # "full" => all rows in the CSV
+_MODE_SAMPLE_SIZE = {"tiny": 1, "smoke": 5, "sample": 100}  # "full" => all rows in the CSV
 
 # subset_key -> column layout, verified against the actual CSVs on HF
 _SUBSETS = {

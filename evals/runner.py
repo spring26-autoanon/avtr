@@ -3,7 +3,7 @@
 MoshiRAG eval runner.
 
 Run evals:
-  uv run evals/runner.py --config configs/baseline_with_retrieval.yaml [--mode smoke|sample|full]
+  uv run evals/runner.py --config configs/baseline_with_retrieval.yaml [--mode tiny|smoke|sample|full]
   uv run evals/runner.py --config configs/baseline_with_retrieval.yaml --spot-check
 
 Compare runs:
@@ -499,9 +499,13 @@ def main() -> None:
     parser.add_argument("--config", help="Path to YAML config file")
     parser.add_argument(
         "--mode",
-        choices=["smoke", "sample", "full"],
+        choices=["tiny", "smoke", "sample", "full"],
         default="sample",
-        help="Eval mode: smoke (~10min) | sample (~1-2h, default) | full (8-16h)",
+        help=(
+            "Eval mode: tiny (1/subset, rapid dev iteration) | "
+            "smoke (5/subset, ~10min) | sample (100/subset, ~1-2h, default) | "
+            "full (8-16h)"
+        ),
     )
     parser.add_argument(
         "--spot-check",
@@ -545,3 +549,16 @@ if __name__ == "__main__":
     # re-executing the file, so both sides see the same class objects.
     sys.modules.setdefault("evals.runner", sys.modules["__main__"])
     main()
+    # Confirmed on a real run: HF `datasets`' streaming mode (used by
+    # knowledge.halu_eval_audio) leaves a background thread alive that
+    # prevents normal process exit even though main() has already returned
+    # and every result/transcript file is already written and closed —
+    # `_load_rows(1)` on its own finished in ~7s but the process then hung
+    # indefinitely until force-killed. Not something we can fix from here
+    # (it's inside `datasets`' async HTTP filesystem client, not our code);
+    # os._exit() is the standard workaround once all our own work is
+    # provably done, and is safe here specifically because nothing after
+    # main() returning needs further Python-level cleanup (no open files,
+    # no pending writes — write_results()/write_transcripts() already
+    # closed their file handles before returning).
+    os._exit(0)
