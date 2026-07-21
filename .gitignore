@@ -16,6 +16,11 @@ checkpoint_cache/
 evals/results/
 demo/sessions/
 
+# standalone ground-truth check against unmodified moshi-rag upstream —
+# deliberately kept out of this project's git history and `make sync`;
+# deployed to the VM independently via prodcheck/sync.sh
+prodcheck/
+
 # editor
 .DS_Store
 .idea/

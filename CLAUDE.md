@@ -167,19 +167,53 @@ uv run --all-extras python -c "from core.checkpoint import resolve_checkpoint; r
 
 ## Running the demo
 
-`demo/server.py` is a thin FastAPI + WebSocket server serving `demo/client/` as
-static files. It loads `MoshiRAGAdapter` exactly as the eval runner does — same
-config files, so retrieval on/off is config-driven, not hardcoded. A single
-job spans the whole WebSocket connection and correctly supports open-ended
-multi-turn sessions — the model's own VAD/turn-taking (visible in server logs
-as `[VAD] User started speaking` / `[State] Switching to user`) drives turn
-boundaries, and the job only ever finalizes once the client actually
-disconnects. This is enforced directly: `core/model_interface.py` monkeypatches
-`InferenceJob._check_tail_silence` to always return `False` until
-`raw_job._client_done` is set (only happens on the WebSocket's audio stream
-actually ending) — confirmed necessary on a real run, where the underlying
-padding-token heuristic misfired mid-conversation with the client still
-connected (see the comment on that patch for the full mechanism).
+**Architecture note (see specs/moshirag-evals-requirements-v2.md's "New
+Marching Orders"):** the demo no longer runs through `MoshiRAGAdapter`/a
+custom FastAPI+WebSocket server. It launches kyutai-labs/moshi-rag's own,
+unmodified `moshi.server` + `moshi.server_conditioner` directly via
+`scripts/run_demo.sh` — the same production stack `prodcheck/` was built to
+A/B against, now promoted to the real thing. Reversibility is via git history
+(the prior in-process implementation is recoverable from before this change,
+same as this version is itself a revival of the pre-`5b3790e` launcher).
+`demo/server.py` and `demo/client/` are deleted; there is no Python code left
+in `demo/` and nothing here loads `MoshiRAGAdapter` anymore. The sections
+below (the two "Known issue" writeups, the `respond_stream()`-vs-`respond()`
+comparisons) describe the **old** in-process demo and are kept for their
+diagnostic history — see the update notes inline for what's confirmed to
+still apply post-pivot versus what's now historical. Full reconciliation of
+this file against the new architecture (a "Phase 3" cleanup) is still
+pending — treat anything below that references `respond_stream()`,
+`demo/server.py`, or `core/model_interface.py`'s streaming path as describing
+the old demo unless a note says otherwise.
+
+### Known issue (rare, unconfirmed root cause): reference-encoder `ConnectError` kills the session
+
+Observed once across 4 real-checkpoint sessions run against the pivoted
+`scripts/run_demo.sh` stack (2 via `prodcheck/`, 2 via the demo itself): a
+retrieval round-trip completed normally (real Gemini reference text came
+back), but the subsequent POST to `server_conditioner` at
+`http://localhost:8001/embed` failed outright with
+`httpx.ConnectError: All connection attempts failed` — not a timeout, a
+refused/failed connection. The conditioner process itself never crashed
+(confirmed via its own log and `nvidia-smi` afterward: still alive, no
+errors logged, in fact zero requests logged for the entire session). moshi-
+rag's `channel.py` has no exception handling around this call — unlike a
+retrieval-LLM timeout, which is caught and degrades gracefully to an empty
+reference, a conditioner-connection failure is unhandled and propagates up
+through the session's `TaskGroup`, killing the whole WebSocket connection
+mid-conversation, not just that one turn.
+
+A deliberate repro attempt (same checkpoint, same conversation shape,
+including a genuine double-retrieval-trigger case, GPU memory/utilization
+polled at 1s resolution throughout) did not reproduce it — memory stayed
+~13GB under the A100's 80GB, utilization fluctuated 54-85% during active
+generation with no obvious spike or starvation around the original failure.
+**Best current read: a rare, non-reproducible transient blip, not a
+systematic resource-contention or code defect** — but the underlying gap
+(no error handling around the conditioner call) is real regardless of how
+rarely it fires. Not blocking the demo (a human just reconnects), but worth
+carrying into Phase 2's design: an eval run is long and unattended, so the
+same rare event there wouldn't have a human around to notice and retry.
 
 ### Known issue (BACKLOGGED, not accepted long-term): ~6-10s pause on every retrieval trigger — both backends
 
@@ -225,6 +259,24 @@ question's `<ret>` trigger, no exception, exactly the predicted
 in `core/model_interface.py` and wired into `respond()`'s `_run()` the same
 way it was already wired into `respond_stream()` — both now get the same
 6-10s self-healing recovery instead of one of them hanging forever.
+
+**Phase 0 update (post-pivot investigation, see `prodcheck/`)**: re-ran this
+exact scenario — including back-to-back retrieval triggers in one session,
+which this section's original text never actually tested — against the real,
+unmodified `moshi.server` stack. Across 3 independent `<ret>` triggers over
+two sessions: **zero stalls, zero `_doing_retrieval`-style deadlocks.** Both
+retrievals completed cleanly inside a raised `--rag-timeout` budget (8s;
+`moshi.server`'s own default is 1.5s, confirmed too tight for real Gemini
+latency — see `prodcheck/README.md`'s finding). This is real evidence — small
+sample, not proof — that this specific stall is something
+`core/model_interface.py`'s reimplementation of `_output_loop`'s retrieval
+bookkeeping introduced, not a defect inherent to moshi-rag itself. Since the
+demo no longer runs that reimplementation at all (see the architecture note
+above), the demo should be structurally immune to this bug going forward —
+worth confirming directly against a real session rather than assuming. The
+`respond()`/evals path below still runs the old reimplementation and remains
+exposed until Phase 2 replaces it with the real `ServerState`/`InferenceJob`
+classes.
 
 **Second, separate bug found on the same run, after the watchdog fix**: with
 the hang resolved, the full 15-question smoke test completed but scored 0%
@@ -290,13 +342,17 @@ something about conditioning and generation sharing one CUDA context/process
 something moshi-rag's own reference architecture never has to handle since
 its encoder always runs in a genuinely separate process.
 
-**Critically, `respond_stream()` (the demo) does NOT have this bug.** A real
-two-question session (retrieval on, generous silence gap between questions)
-responded correctly both times, with genuine multi-turn memory (question 2's
-retrieval context correctly included question 1's full exchange). This makes
-sense structurally: the demo's one continuous session only ever does the
-`is_first` reset once, at true session start, and never re-exercises whatever
-`respond()`'s per-call fresh-job pattern hits. So this is scoped to
+**Critically, `respond_stream()` (the old demo) does NOT have this bug** —
+`respond_stream()` and the demo it served no longer exist post-pivot (see the
+architecture note above), so this is now historical context for *why* the bug
+is scoped to `respond()`, not a live comparison against the current demo.
+A real two-question session (retrieval on, generous silence gap between
+questions) responded correctly both times, with genuine multi-turn memory
+(question 2's retrieval context correctly included question 1's full
+exchange). This made sense structurally: the demo's one continuous session
+only ever did the
+`is_first` reset once, at true session start, and never re-exercised whatever
+`respond()`'s per-call fresh-job pattern hits. So this was scoped to
 `respond()`/evals specifically, not a general in-process-conditioning problem
 — and it should **stay** scoped there: making `respond()` session-like (to
 match how `respond_stream()` avoids the bug) would be wrong, since eval
@@ -318,13 +374,18 @@ process. See specs for the pending requirement update.
 
 ```bash
 cd /home/jupyter/moshirag-evals
-uv run --all-extras demo/server.py --config configs/baseline_with_retrieval.yaml
+bash scripts/run_demo.sh --checkpoint base
 ```
 
-Binds to `127.0.0.1:8998` only — reachable exclusively through an SSH tunnel,
-never directly on the VM's network. Model loading (checkpoint, ARC-Encoder,
-warmup) happens before the server starts accepting connections and can take a
-few minutes with no output in between — that's normal, not a hang.
+Or from your local machine: `make demo`. Launches `moshi.server_conditioner`
+(port 8001) and `moshi.server` (port 8998) in a detached tmux session named
+`demo` and returns immediately — see the script's own `--help`-equivalent
+header comment for `--stt` and `--rag-timeout` options. `moshi.server` binds
+to all interfaces on 8998 by default but is only reachable through an SSH
+tunnel in practice, since the VM has no external IP. Model loading
+(checkpoint, ARC-Encoder, warmup) happens before the server starts accepting
+connections and can take a few minutes with no output in between — that's
+normal, not a hang. `tmux attach -t demo` to watch both services' logs.
 
 ### Reaching it from a browser
 

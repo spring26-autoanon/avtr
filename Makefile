@@ -19,6 +19,7 @@ sync:
 	  --exclude 'checkpoint_cache' \
 	  --exclude 'evals/results' \
 	  --exclude 'demo/sessions' \
+	  --exclude 'prodcheck' \
 	  --exclude '*.pyc' \
 	  --exclude '.env' \
 	  --exclude '.git' \
@@ -44,4 +45,10 @@ remote:
 smoke:
 	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml --mode smoke"
 
-.PHONY: sync install ssh remote smoke
+# Launches moshi.server + moshi.server_conditioner in a detached tmux session
+# on the VM (see scripts/run_demo.sh) and returns immediately — tunnel port
+# 8998 yourself afterward: ssh -L 8998:localhost:8998 $(SSH_ALIAS)
+demo:
+	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && bash scripts/run_demo.sh"
+
+.PHONY: sync install ssh remote smoke demo
