@@ -303,7 +303,7 @@ related latent bug found in the same code path: `respond()`'s
 `"<pad>"` for every silent step straight into the returned answer text,
 polluting whatever the LLM judge sees — now filtered out.
 
-### Known issue: `respond()`-only silent-response bug when retrieval is enabled
+### RESOLVED (Phase 2): `respond()`-only silent-response bug when retrieval is enabled
 
 Third, separate bug, found once the above two were fixed and `open_audio_bench`
 was run **with retrieval enabled**: the first `respond()` call on a
@@ -361,14 +361,20 @@ prior questions' context into later ones' retrieval and generation (observed
 directly: question 2's retrieval context included question 1's Q&A verbatim
 in the demo test — correct there, would silently corrupt eval scores here).
 
-**Status**: root cause not fully pinned down (we know pointing at a separate
-process fixes it, not precisely why the in-process path breaks). The spec's
-blanket "no sidecar" requirement needs a scoped update — allow it for
-`respond()`/evals specifically, keep `respond_stream()`/the demo in-process
-(confirmed unaffected, no reason to change it). Not yet implemented as the
-default; `REFERENCE_ENCODER_URL` exists as an opt-in workaround in the
-meantime, requires manually running `server_conditioner.py` as a second
-process. See specs for the pending requirement update.
+**Status (Phase 2 update)**: separate-process conditioning is now
+**mandatory**, not an opt-in workaround — `MoshiRAGAdapter._load_models()`
+raises immediately if `REFERENCE_ENCODER_URL` is unset; the in-process
+ARC-Encoder loading path (`_load_arc_encoder`, `_patch_inprocess_conditioning`)
+has been deleted entirely, not just made optional. Root cause of *why* the
+in-process path broke is still not pinned down precisely (we know separate-
+process fixes it, not the exact mechanism) — but given the Phase 0/1 pivot
+findings (moshi-rag's real production architecture never runs the
+ARC-Encoder in-process for *any* path, `respond_stream()` included, now that
+the demo runs the unmodified stack directly), "always separate-process" is
+the permanent fix, not a stopgap pending one. Practical implication: every
+`respond()`/eval run now requires a `server_conditioner` process running
+alongside it — see "Retrieval-enabled runs" below, which now describes
+required setup, not an optional workaround.
 
 ### On the VM
 
@@ -477,17 +483,18 @@ uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yam
 
 Results are written to `evals/results/` tagged with checkpoint, timestamp, git hash, config, and mode.
 
-### Retrieval-enabled runs: `respond()`-only silent-response bug workaround
+### Required setup: `server_conditioner` process (Phase 2, no longer optional)
 
-See "Known issue: `respond()`-only silent-response bug when retrieval is
-enabled" above — any eval run against `baseline_with_retrieval.yaml` (or any
-config with retrieval enabled) currently only produces a real answer on the
-*first* retrieval-triggering question, then goes silent on every subsequent
-one. Until this has a permanent fix, work around it by pointing conditioning
-at a real, separate `server_conditioner.py` process:
+See "RESOLVED (Phase 2): `respond()`-only silent-response bug" above —
+`MoshiRAGAdapter` now **requires** `REFERENCE_ENCODER_URL` to be set and a
+real `server_conditioner` process reachable at that address; it raises at
+construction time otherwise. This applies to **every** eval run, not just
+ones with retrieval enabled in the config — `ServerState` itself needs a
+working `reference_encoder_url` regardless of whether any given eval's
+config turns retrieval on.
 
 ```bash
-# Terminal 1 — start the sidecar (adjust CKPT to your resolved checkpoint dir)
+# Terminal 1 — start the conditioner (adjust CKPT to your resolved checkpoint dir)
 CKPT=checkpoint_cache/adsp-s26-autoanon-bucket/checkpoints/base/moshirag-base-bf16
 uv run --all-extras python -m moshi.server_conditioner \
   --config "$CKPT/config.json" --moshi-weight "$CKPT/model.safetensors" \
@@ -498,9 +505,9 @@ export REFERENCE_ENCODER_URL=http://localhost:8001
 uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml
 ```
 
-`unset REFERENCE_ENCODER_URL` and stop the sidecar process to go back to
-normal (spec-default) in-process conditioning. Only needed for `respond()`
-(evals) — never needed for the demo (`respond_stream()`, confirmed unaffected).
+Same conditioner setup `scripts/run_demo.sh` uses for the demo (port 8001) —
+if the demo is already running on the same VM, evals can point at that same
+instance instead of starting a second one, GPU memory permitting.
 
 ---
 

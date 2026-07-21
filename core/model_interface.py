@@ -18,10 +18,6 @@ logger = logging.getLogger(__name__)
 # MoshiRAG outputs 24kHz audio
 _SAMPLE_RATE = 24000
 
-# Name of the conditioner subset loaded from config.json — matches the
-# --conditioner flag the now-removed server_conditioner.py sidecar used.
-_CONDITIONER_NAME = "reference_with_time"
-
 # Consecutive silent (<pad>) model-text steps after question_end_step before
 # InferenceJob._output_loop decides the model has finished responding and
 # finalizes the job (see _live_feed_loop). run_inference.py's own CLI default
@@ -677,43 +673,37 @@ class MoshiRAGAdapter(ModelInterface):
     All moshi imports are deferred to init so this module is importable locally.
 
     Conditioning:
-      - The ARC-Encoder (reference-text conditioner) is loaded in-process from
-        the checkpoint via moshi.server_conditioner.EncoderService — no HTTP
-        sidecar, no REFERENCE_ENCODER_URL. moshi-rag's InferenceJob normally
-        fetches the conditioning tensor via an HTTP call to a separately
-        launched server_conditioner.py process; that call site
-        (get_conditioning_remote_async) is monkeypatched in _load_models() to
-        call the local EncoderService directly instead. See
-        _patch_inprocess_conditioning().
-      - EVAL-ONLY ESCAPE HATCH, unset by default: if the REFERENCE_ENCODER_URL
-        env var is set, this in-process patching is skipped entirely and
-        moshi-rag's own unmodified get_conditioning_remote_async is left in
-        place, pointed at that URL (a real, separate `python -m
-        moshi.server_conditioner` process).
+      - MANDATORY separate-process conditioner. respond() requires a real,
+        separately launched `python -m moshi.server_conditioner` process,
+        pointed at via the REFERENCE_ENCODER_URL env var — raises at
+        construction time if unset. There is no in-process ARC-Encoder
+        loading path anymore.
 
-        Backstory: respond() has a confirmed bug — the first call on a
-        MoshiRAGAdapter instance produces a correct answer, but every
-        subsequent call goes completely silent (zero non-<pad> tokens, no
-        <ret> ever predicted) whenever retrieval is enabled. Three targeted
-        hypotheses were ruled out with real diagnostic evidence first: stale
-        streaming_sum state surviving into the next job (BatchRunner's own
-        is_first-triggered reset was confirmed correctly clearing it), a
-        cross-thread CUDA sync gap between the conditioning update and the
-        next generation step (an explicit torch.cuda.synchronize() there
-        made no difference), and per-call event-loop/step-task teardown
-        (switching respond() to a persistent loop, same as run_inference.py's
-        own structure, made no difference either). Pointing conditioning at
-        a real separate-process sidecar instead measurably fixed it in two
-        independent real-checkpoint tests. respond_stream() (the demo) was
-        separately confirmed NOT to have this bug at all — a real two-question
-        session with retrieval on responded correctly both times — so this is
-        scoped to respond()/evals specifically, not a general problem with
-        in-process conditioning. The spec's blanket "no sidecar" requirement
-        needs a scoped update to reflect this; until that's settled and a
-        permanent fix lands, this env var lets evals opt into the confirmed
-        workaround without changing default (spec-compliant, in-process)
-        behavior. respond_stream()/the demo should keep using in-process
-        conditioning regardless — it isn't affected by this bug.
+        Backstory / why this is mandatory rather than opt-in: respond() used
+        to have a confirmed bug — the first call on a MoshiRAGAdapter
+        instance produced a correct answer, but every subsequent call went
+        completely silent (zero non-<pad> tokens, no <ret> ever predicted)
+        whenever retrieval was enabled. Three targeted hypotheses were ruled
+        out with real diagnostic evidence first: stale streaming_sum state
+        surviving into the next job (BatchRunner's own is_first-triggered
+        reset was confirmed correctly clearing it), a cross-thread CUDA sync
+        gap between the conditioning update and the next generation step (an
+        explicit torch.cuda.synchronize() there made no difference), and
+        per-call event-loop/step-task teardown (switching respond() to a
+        persistent loop, same as run_inference.py's own structure, made no
+        difference either). Pointing conditioning at a real separate-process
+        conditioner instead measurably fixed it in two independent
+        real-checkpoint tests. This was originally kept opt-in pending a
+        "permanent fix" and a scoped spec update — see
+        specs/moshirag-evals-requirements-v2.md's "New Marching Orders" and
+        CLAUDE.md's Phase 0/1 findings: the broader pivot to targeting
+        moshi-rag's real production architecture (which has never used
+        in-process conditioning for *any* path, not just respond()) makes
+        "always separate-process" the actual permanent fix rather than a
+        workaround pending one. respond_stream() (the demo) was separately
+        confirmed to never have had this bug even when in-process
+        conditioning still existed as an option — moot now since the demo no
+        longer runs through MoshiRAGAdapter at all (see CLAUDE.md).
 
     Retrieval:
       - If retrieval_backend is NullBackend or None: moshi-rag's RAG path is
@@ -837,7 +827,12 @@ class MoshiRAGAdapter(ModelInterface):
             dtype=torch.bfloat16,
             init_active_speaker="user",
             stt_wait_time=0.5,
-            rag_timeout=2.0,
+            # Was 2.0 — raised to match scripts/run_demo.sh's own fix: real
+            # Gemini round-trip latency was directly observed at ~2.5-3s
+            # (see CLAUDE.md's Phase 0 prodcheck findings), reliably longer
+            # than a 2.0s budget. Same underlying defect, same fix, applied
+            # here too rather than leaving evals exposed to it.
+            rag_timeout=8.0,
             max_reference_tokens=64,
             vad_window_size=4,
             vad_threshold=0.5,
@@ -857,23 +852,29 @@ class MoshiRAGAdapter(ModelInterface):
         # LocalSpeechToText.__init__ asserts its mimi isn't already streaming.
         self._stt_template = LocalSpeechToText(deepcopy(self._mimi))
 
-        # See the class docstring's "Conditioning" section — unset in normal
-        # operation; opt-in workaround for a confirmed respond()-only bug,
-        # pending a scoped spec update and a permanent fix.
-        sidecar_url = os.environ.get("REFERENCE_ENCODER_URL")
-        if sidecar_url:
-            logger.warning(
-                "REFERENCE_ENCODER_URL=%s set — using an external sidecar "
-                "conditioner process instead of in-process ARC-Encoder. "
-                "Confirmed workaround for a respond()-only bug (see class "
-                "docstring); not yet the default (spec still requires "
-                "in-process conditioning as the normal architecture).",
-                sidecar_url,
+        # See the class docstring's "Conditioning" section — mandatory, not
+        # an opt-in workaround. Confirmed root cause of the respond()-only
+        # silent-response bug: in-process ARC-Encoder loading (the former
+        # default) broke every respond() call after the first one whenever
+        # retrieval was enabled. This also matches the real production
+        # architecture — moshi.server itself always calls a separate
+        # conditioner process; in-process conditioning was never how
+        # upstream does this for any path.
+        reference_encoder_url = os.environ.get("REFERENCE_ENCODER_URL")
+        if not reference_encoder_url:
+            raise RuntimeError(
+                "REFERENCE_ENCODER_URL must be set. MoshiRAGAdapter.respond() "
+                "requires a real, separate `python -m moshi.server_conditioner` "
+                "process — matching the demo's architecture (see "
+                "scripts/run_demo.sh) and the real moshi-rag production "
+                "server, which never runs the ARC-Encoder in-process either. "
+                "In-process loading was removed after being confirmed as the "
+                "root cause of a silent-response bug on every respond() call "
+                "after the first one (see this class's docstring). Start "
+                "server_conditioner and set REFERENCE_ENCODER_URL to its "
+                "address (e.g. http://localhost:8001) before running evals."
             )
-            self._arc_encoder = None
-        else:
-            self._arc_encoder = self._load_arc_encoder(args, ckpt_paths)
-            self._patch_inprocess_conditioning()
+        logger.info("Using separate-process conditioner at %s", reference_encoder_url)
 
         # See _DEFAULT_LLM_BASE_URL above — moshi's ServerState.__init__
         # requires these to exist even though its own LLM call is never
@@ -886,13 +887,7 @@ class MoshiRAGAdapter(ModelInterface):
             mimi=self._mimi,
             text_tokenizer=self._text_tokenizer,
             lm_gen=self._lm_gen,
-            # Vestigial after _patch_inprocess_conditioning() (the only code
-            # that ever read this attribute, get_conditioning_remote_async,
-            # is patched to call self._arc_encoder directly instead of
-            # making an HTTP request) — UNLESS sidecar_url is set, in which
-            # case that patch never happened and this URL is what the real,
-            # unmodified get_conditioning_remote_async actually calls.
-            reference_encoder_url=sidecar_url or "in-process",
+            reference_encoder_url=reference_encoder_url,
             stt_wait_time=args.stt_wait_time,
             gradium_stt=False,
             device=args.device,
@@ -907,96 +902,6 @@ class MoshiRAGAdapter(ModelInterface):
         logger.info("Warming up MoshiRAG model")
         self._state.warmup()
         logger.info("MoshiRAG ready")
-
-    def _load_arc_encoder(self, args: argparse.Namespace, ckpt_paths: dict[str, Path]):
-        """
-        Load the ARC-Encoder (reference-text conditioner) in-process from the
-        checkpoint directory — same config.json, model.safetensors, and
-        conditioner name the abandoned server_conditioner.py sidecar used to
-        load, but instantiated directly in this process instead of behind a
-        FastAPI /embed route.
-        """
-        from moshi.server_conditioner import EncoderService
-
-        logger.info("Loading ARC-Encoder in-process from %s", self.checkpoint_path)
-        return EncoderService(
-            config=str(ckpt_paths["config"]),
-            moshi_weight=str(ckpt_paths["moshi_weight"]),
-            conditioner=_CONDITIONER_NAME,
-            device=args.device,
-        )
-
-    def _patch_inprocess_conditioning(self) -> None:
-        """
-        moshi-rag's InferenceJob fetches the RAG conditioning tensor via
-        get_conditioning_remote_async(text, encoder_url), which POSTs to
-        {encoder_url}/embed on a separately-running server_conditioner.py
-        process. We run the ARC-Encoder in-process (self._arc_encoder), so
-        replace that call site with one that calls it directly — no HTTP, no
-        sidecar. Monkeypatched rather than forked, consistent with
-        _TimedInferenceJob._patch_rag_manager above.
-        """
-        import torch
-
-        import moshi.inference_utils.inference_job as inference_job_module
-
-        encoder = self._arc_encoder
-
-        def _encode_and_sync(text: str):
-            result = encoder.encode(text)
-            # encoder.encode() runs on a separate OS thread (via
-            # asyncio.to_thread below) from the main generation loop's
-            # thread. CUDA work dispatched from a different thread is not
-            # automatically synchronized with the consuming thread's stream
-            # — if this tensor crosses back into
-            # _async_update_reference/update_streaming_sum_tensors before
-            # its CUDA ops have actually completed, that's exactly the kind
-            # of cross-thread stream-ordering issue that silently deadlocks
-            # the main step loop rather than raising: no exception, no
-            # timeout, generation just never produces another step. Force
-            # completion here, inside this thread, before the tensor ever
-            # crosses the thread boundary.
-            torch.cuda.synchronize(encoder.device)
-            return result
-
-        async def _local_conditioning(text: str, encoder_url: str | None = None):
-            # _async_update_reference (moshi's own caller) passes reference_text
-            # through unconditionally, no special-casing for empty strings —
-            # confirmed against inference_job.py's source. Pass it through
-            # unmodified rather than substituting a placeholder: arc_encoder.py's
-            # _get_condition has its own native handling for empty text (it
-            # detects the empty case via the attention mask specifically to
-            # apply a learnt padding embedding — learnt_padding is a real,
-            # trained weight in this checkpoint's conditioner state dict, per
-            # the paper's dropout-training description, section 4.2). A
-            # substituted placeholder would bypass that intended path and go
-            # through normal (meaningless, out-of-distribution) encoding
-            # instead — likely worse, not safer.
-            try:
-                return await asyncio.wait_for(
-                    asyncio.to_thread(_encode_and_sync, text), timeout=15.0
-                )
-            except asyncio.TimeoutError:
-                logger.error(
-                    "In-process ARC-Encoder conditioning timed out after 15s "
-                    "for text=%r", text
-                )
-                raise
-            except Exception:
-                # This path has never been exercised with a real reference
-                # string until recently. Whatever calls
-                # get_conditioning_remote_async appears to swallow exceptions
-                # into a bare log line with no traceback (same pattern as
-                # _catch_reference_text's caller) — log the full traceback
-                # ourselves before it disappears, since audio generation going
-                # silent right around this point is exactly what an unhandled
-                # exception here would look like from the outside.
-                logger.exception(
-                    "In-process ARC-Encoder conditioning failed for text=%r", text
-                )
-                raise
-
-        inference_job_module.get_conditioning_remote_async = _local_conditioning
 
     def transcribe(self, audio: bytes) -> str:
         """Transcribe audio bytes via the streaming ASR component."""

@@ -103,13 +103,27 @@ def build_model(cfg: dict) -> ModelInterface:
     if adapter == "stub":
         return StubModelAdapter(retrieval_backend=backend)
 
-    # Try real adapter; fall back to stub with a warning until Phase 4 (MoshiRAGAdapter)
+    # ImportError only: torch/moshi genuinely not installed (local dev
+    # without the `gpu` extra) — fall back to stub so the pipeline is still
+    # exercisable. Anything else (RuntimeError from a missing
+    # REFERENCE_ENCODER_URL, FileNotFoundError from a bad checkpoint path,
+    # etc.) means the GPU environment IS present but something is actually
+    # misconfigured — that must fail the run loudly, not silently substitute
+    # fake stub data. The former `except (ImportError, Exception)` caught
+    # everything indiscriminately (Exception alone already covers
+    # ImportError, so the tuple never did what it looked like it did) —
+    # confirmed on a real VM run: MoshiRAGAdapter's new fail-fast
+    # REFERENCE_ENCODER_URL check (see core/model_interface.py) raised
+    # correctly after a real ~40s checkpoint load, but this handler
+    # swallowed it and ran the entire eval suite against StubModelAdapter
+    # instead, producing plausible-looking but entirely fake scores with no
+    # indication anything was wrong beyond one stderr line.
     try:
         from core.model_interface import MoshiRAGAdapter
         from core.checkpoint import resolve_checkpoint
         local_path = resolve_checkpoint(model_cfg.get("checkpoint", "base"))
         return MoshiRAGAdapter(local_path, backend)
-    except (ImportError, Exception) as e:
+    except ImportError as e:
         print(f"⚠  MoshiRAGAdapter unavailable ({e}) — using StubModelAdapter", file=sys.stderr)
         return StubModelAdapter(retrieval_backend=backend)
 

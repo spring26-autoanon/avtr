@@ -10,7 +10,7 @@
 #   Then open http://localhost:8998 in your browser.
 #
 # Usage:
-#   bash scripts/run_demo.sh [--checkpoint <alias>] [--stt local|gradium] [--rag-timeout <seconds>]
+#   bash scripts/run_demo.sh [--checkpoint <alias>] [--stt local|gradium] [--rag-timeout <seconds>] [--conditioner-only]
 #
 # Options:
 #   --checkpoint  Checkpoint alias from configs/checkpoints.yaml (default: base)
@@ -23,6 +23,15 @@
 #                 shorter than real Gemini round-trip latency (observed
 #                 2.5-3s) — the default here is raised accordingly. See
 #                 CLAUDE.md's retrieval-latency notes before lowering this.
+#   --conditioner-only  Launch only server_conditioner (port 8001), skip
+#                 moshi.server entirely. For pointing evals/runner.py at a
+#                 real conditioner without also loading the full model a
+#                 second time (MoshiRAGAdapter loads its own copy) — see
+#                 CLAUDE.md's Phase 2 "mandatory separate-process
+#                 conditioning" section. Also sidesteps having to hand-type
+#                 a long server_conditioner invocation into a terminal that
+#                 hard-wraps long pasted lines (confirmed to corrupt
+#                 multi-line commands on at least one real VM session).
 #
 # This is a straight revival of the production-server-based launcher this
 # repo used before 5b3790e switched the demo to a custom in-process
@@ -40,12 +49,14 @@ cd "$PROJECT_DIR"
 CHECKPOINT_ALIAS=base
 STT_MODE=local
 RAG_TIMEOUT=8
+CONDITIONER_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --checkpoint)   CHECKPOINT_ALIAS="$2"; shift 2 ;;
-        --stt)          STT_MODE="$2";         shift 2 ;;
-        --rag-timeout)  RAG_TIMEOUT="$2";       shift 2 ;;
+        --checkpoint)       CHECKPOINT_ALIAS="$2"; shift 2 ;;
+        --stt)              STT_MODE="$2";         shift 2 ;;
+        --rag-timeout)      RAG_TIMEOUT="$2";       shift 2 ;;
+        --conditioner-only) CONDITIONER_ONLY=1;     shift 1 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -101,6 +112,27 @@ CONDITIONER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server_conditio
   --conditioner reference_with_time \
   --port 8001"
 
+SESSION=demo
+
+if [[ "$CONDITIONER_ONLY" == "1" ]]; then
+    # ── Launch conditioner alone ────────────────────────────────────────────
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux new-session -d -s "$SESSION" -n conditioner
+    tmux send-keys -t "$SESSION:conditioner" "cd $PROJECT_DIR && $CONDITIONER_CMD" Enter
+
+    echo ""
+    echo "Conditioner-only launching in tmux session '$SESSION' (port 8001)."
+    echo ""
+    echo "  tmux attach -t $SESSION   — watch logs"
+    echo ""
+    echo "Once it prints 'Uvicorn running', point evals at it:"
+    echo ""
+    echo "  export REFERENCE_ENCODER_URL=http://localhost:8001"
+    echo ""
+    echo "To stop: tmux kill-session -t $SESSION"
+    exit 0
+fi
+
 SERVER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server \
   --moshi-weight '$MOSHI_WEIGHT' \
   --mimi-weight '$MIMI_WEIGHT' \
@@ -113,7 +145,6 @@ SERVER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server \
 [[ "$STT_MODE" == "gradium" ]] && SERVER_CMD+=" --gradium-stt"
 
 # ── Launch tmux session ───────────────────────────────────────────────────────
-SESSION=demo
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -n conditioner
 
