@@ -36,7 +36,7 @@ and won't miss one):
 
 ```bash
 uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml
-uv run --all-extras scripts/verify_respond_stream.py --checkpoint base --wav sample.wav
+uv run --all-extras python -c "from core.checkpoint import resolve_checkpoint; resolve_checkpoint('base')"
 ```
 
 ## Workflow
@@ -176,15 +176,17 @@ A/B against, now promoted to the real thing. Reversibility is via git history
 (the prior in-process implementation is recoverable from before this change,
 same as this version is itself a revival of the pre-`5b3790e` launcher).
 `demo/server.py` and `demo/client/` are deleted; there is no Python code left
-in `demo/` and nothing here loads `MoshiRAGAdapter` anymore. The sections
-below (the two "Known issue" writeups, the `respond_stream()`-vs-`respond()`
-comparisons) describe the **old** in-process demo and are kept for their
-diagnostic history — see the update notes inline for what's confirmed to
-still apply post-pivot versus what's now historical. Full reconciliation of
-this file against the new architecture (a "Phase 3" cleanup) is still
-pending — treat anything below that references `respond_stream()`,
-`demo/server.py`, or `core/model_interface.py`'s streaming path as describing
-the old demo unless a note says otherwise.
+in `demo/` and nothing here loads `MoshiRAGAdapter` anymore.
+
+Pivot status: Phase 0 (root-cause investigation), Phase 1 (this demo pivot),
+and Phase 2 (making separate-process conditioning mandatory for
+`respond()`/evals — see the "RESOLVED" section below) are all done. The
+sections below still carry real diagnostic history from before and during
+the pivot — kept because the investigation techniques and confirmed findings
+remain useful, trimmed of narrative that's now purely dead-code reference.
+Where something describes `respond_stream()` specifically: that method and
+the demo it served no longer exist — those mentions are historical context
+for *why* a given bug was scoped the way it was, not live behavior.
 
 ### Known issue (rare, unconfirmed root cause): reference-encoder `ConnectError` kills the session
 
@@ -215,68 +217,46 @@ rarely it fires. Not blocking the demo (a human just reconnects), but worth
 carrying into Phase 2's design: an eval run is long and unattended, so the
 same rare event there wouldn't have a human around to notice and retry.
 
-### Known issue (BACKLOGGED, not accepted long-term): ~6-10s pause on every retrieval trigger — both backends
+### `respond()`-only: `_doing_retrieval` step-loop stall, mitigated (root cause: self-inflicted, not upstream)
 
-Confirmed via a step-index watchdog (`_step_watchdog` in `respond_stream()`):
-whenever the model predicts `<ret>`, moshi's own `_output_loop` is supposed to
-set `self._doing_retrieval = True` via an exact
-`step_index == self._retrieval_start_step` equality check — a separate,
-independently-timed mechanism from `RAGManager.trigger()`'s own `wait_steps`
-timer. In every single retrieval trigger observed so far, across *both*
-`NullBackend` (`baseline_no_retrieval.yaml`, near-instant, no network call)
-and `GeminiAPIBackend` (`baseline_with_retrieval.yaml`, real API latency,
-observed ~2s) — that equality check never fires before our own retrieval
-callback completes, so `_doing_retrieval` either never gets set at all or gets
-set *after* our callback already ran and finished, permanently stalling the
-whole step loop (not just retrieval) with nothing left to clear it. Real API
-latency does not reliably avoid this, contrary to what was first assumed here
-— treat this as a universal cost of any `<ret>` trigger, not a `NullBackend`-
-specific one. `_step_watchdog` polls every 3s and force-clears
-`_doing_retrieval` if it's stuck `True` for two consecutive checks, reliably
-recovering the session at the cost of a ~6-10s pause each time `<ret>` fires
-(exact duration depends on poll alignment relative to when the stall began).
-This is a workaround for what looks like a genuine race in moshi-rag's own
-step-loop bookkeeping, not something fixed at the root — `run_inference.py`
-(the one script in moshi-rag that batch-evaluates from a real checkpoint) has
-no no-retrieval mode at all and processes one full utterance per job rather
-than our continuous multi-turn session shape, so this exact condition may
-simply be untested upstream. Root-causing the actual step_index mismatch was
-considered and **backlogged, not permanently accepted** — the workaround is
-reliable enough to keep working on other things, but this still needs a real
-root-cause pass, not just a "good enough" writeoff. Deferred because it was
-assessed as a deep, uncertain investigation into moshi's own step-loop
-internals, and lower priority than getting the eval suite built out. Revisit
-once the eval suite is further along. Confirmed via the demo turn-2
-investigation below that this pause affects **both** `respond()` and
-`respond_stream()` equally (a real two-question demo session needed the
-watchdog on both retrieval triggers) — unlike the silent-response bug below,
-which is `respond()`-only, this one is a shared, cross-cutting issue.
+`core/model_interface.py`'s `_TimedInferenceJob._patch_output_loop()` and
+`_step_watchdog` are still live code, still applied to every `respond()`
+call — this section documents why they exist and stays current, unlike most
+of this file's other historical notes. The demo no longer needs either
+(see below); `respond()`/evals still do.
 
-**Update**: confirmed on the first real eval run against a real checkpoint —
-`knowledge.open_audio_bench`'s smoke test hung indefinitely on the 4th
-question's `<ret>` trigger, no exception, exactly the predicted
-`_doing_retrieval` deadlock. `_step_watchdog` was extracted to module scope
-in `core/model_interface.py` and wired into `respond()`'s `_run()` the same
-way it was already wired into `respond_stream()` — both now get the same
-6-10s self-healing recovery instead of one of them hanging forever.
+**The original bug**: `InferenceJob`'s own `_output_loop` gates output on
+`self._doing_retrieval`, set via an exact `step_index ==
+self._retrieval_start_step` equality check that doesn't reliably fire before
+the retrieval callback completes — this stalls the whole step loop (not just
+retrieval) with nothing left to clear it, observed on every real `<ret>`
+trigger regardless of retrieval backend or latency. `_patch_output_loop()`
+replaces `InferenceJob._output_loop` wholesale with a version matching
+`Channel`'s (moshi-rag's real WebSocket server class) simpler logic, which
+has no such gate at all — see that method's docstring for the full
+root-cause chain. `_step_watchdog` is a defensive fallback on top: polls
+`step_index` every 3s and force-clears `_doing_retrieval` if stuck, in case
+some other stall mechanism `_patch_output_loop` doesn't cover ever surfaces.
+Both were applied to `respond()` and the old `respond_stream()` identically
+when this was found — `respond()` was never "missing" this fix at any point
+relevant to the pivot.
 
 **Phase 0 update (post-pivot investigation, see `prodcheck/`)**: re-ran this
-exact scenario — including back-to-back retrieval triggers in one session,
-which this section's original text never actually tested — against the real,
-unmodified `moshi.server` stack. Across 3 independent `<ret>` triggers over
-two sessions: **zero stalls, zero `_doing_retrieval`-style deadlocks.** Both
-retrievals completed cleanly inside a raised `--rag-timeout` budget (8s;
-`moshi.server`'s own default is 1.5s, confirmed too tight for real Gemini
-latency — see `prodcheck/README.md`'s finding). This is real evidence — small
-sample, not proof — that this specific stall is something
-`core/model_interface.py`'s reimplementation of `_output_loop`'s retrieval
-bookkeeping introduced, not a defect inherent to moshi-rag itself. Since the
-demo no longer runs that reimplementation at all (see the architecture note
-above), the demo should be structurally immune to this bug going forward —
-worth confirming directly against a real session rather than assuming. The
-`respond()`/evals path below still runs the old reimplementation and remains
-exposed until Phase 2 replaces it with the real `ServerState`/`InferenceJob`
-classes.
+exact scenario against the real, unmodified `moshi.server` stack (which has
+no `_doing_retrieval` gate at all, by construction). Across 5 independent
+`<ret>` triggers over four sessions, including back-to-back triggers in one
+turn: **zero stalls, zero deadlocks.** Real evidence — small sample, not
+proof — that this bug was introduced by `core/model_interface.py`'s
+reimplementation, not an upstream defect. Since the demo now runs the
+unmodified stack directly, it doesn't need `_patch_output_loop`/
+`_step_watchdog` at all — `respond()`/evals still does, since it still
+drives `InferenceJob` (the batch-shaped class, correctly — `moshi.server`'s
+`Channel` has no batch/resumable concept, see Phase 2 investigation notes
+in [[project_moshirag_production_pivot]] memory) rather than `Channel`
+directly. Not revisited as part of Phase 2 — that phase fixed a different,
+unrelated bug (conditioning, below) and left this patch untouched. Whether
+it's still strictly necessary for `respond()` given everything else learned
+during the pivot is an open question, not yet tested.
 
 **Second, separate bug found on the same run, after the watchdog fix**: with
 the hang resolved, the full 15-question smoke test completed but scored 0%
@@ -373,8 +353,8 @@ ARC-Encoder in-process for *any* path, `respond_stream()` included, now that
 the demo runs the unmodified stack directly), "always separate-process" is
 the permanent fix, not a stopgap pending one. Practical implication: every
 `respond()`/eval run now requires a `server_conditioner` process running
-alongside it — see "Retrieval-enabled runs" below, which now describes
-required setup, not an optional workaround.
+alongside it — see "Required setup: `server_conditioner` process" under
+"Running evals" below.
 
 ### On the VM
 
@@ -493,21 +473,29 @@ ones with retrieval enabled in the config — `ServerState` itself needs a
 working `reference_encoder_url` regardless of whether any given eval's
 config turns retrieval on.
 
+Easiest: `scripts/run_demo.sh --conditioner-only` launches just the
+conditioner (skips loading the full model a second time) via a synced
+script file, not a hand-typed command — avoids a real, confirmed failure
+mode where long multi-line commands get corrupted pasting into some VM
+terminals (JupyterLab's web terminal hard-wraps long lines, breaking both
+`\`-continuations and single long lines):
+
 ```bash
-# Terminal 1 — start the conditioner (adjust CKPT to your resolved checkpoint dir)
-CKPT=checkpoint_cache/adsp-s26-autoanon-bucket/checkpoints/base/moshirag-base-bf16
-uv run --all-extras python -m moshi.server_conditioner \
-  --config "$CKPT/config.json" --moshi-weight "$CKPT/model.safetensors" \
-  --conditioner reference_with_time --cuda-device 0 --port 8001
+# Terminal 1 — start the conditioner
+bash scripts/run_demo.sh --checkpoint base --conditioner-only
 
 # Terminal 2 — run the eval pointed at it
 export REFERENCE_ENCODER_URL=http://localhost:8001
 uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml
 ```
 
-Same conditioner setup `scripts/run_demo.sh` uses for the demo (port 8001) —
-if the demo is already running on the same VM, evals can point at that same
-instance instead of starting a second one, GPU memory permitting.
+If the demo (the full `scripts/run_demo.sh`, not `--conditioner-only`) is
+already running on the same VM, evals can point at that same conditioner
+instance instead of starting a second one — same port 8001 — but note that
+also means a second full model load for the eval process itself, GPU memory
+permitting (a single model + conditioner already uses ~66-69GB of the A100's
+80GB, observed during Phase 1 verification — two full model loads at once
+likely won't fit).
 
 ---
 

@@ -11,9 +11,6 @@ dependencies = [
     "python-dotenv",
     "numpy",
     "datasets",
-    "fastapi>=0.139.0",
-    "uvicorn>=0.51.0",
-    "websockets>=16.1",
 ]
 
 [project.optional-dependencies]
@@ -55,7 +52,7 @@ build-backend = "hatchling.build"
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["core", "evals", "demo"]
+packages = ["core", "evals"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
