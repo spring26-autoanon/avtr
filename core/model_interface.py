@@ -243,9 +243,72 @@ class _TimedInferenceJob:
         # retrieval is off. NullBackend.retrieve() already does the right
         # thing (instant empty return, no network call), so patching it in
         # too is what actually makes retrieval.enabled: false true.
+        # Diagnostic for the "model produces zero speech at all" investigation
+        # (rag_trigger_count=0, response='' turns) — applies regardless of
+        # retrieval_backend, since a no-retrieval control run needs it too.
+        self._patch_audio_power_diagnostics()
+
+        # One-time-per-turn log of what the "pad-like" token ids actually
+        # mean, so pad_token_ids_seen (below) is interpretable rather than
+        # just "0 vs 3" with no context — e.g. distinguishing genuine
+        # padding from an end-of-word marker that (if it turns out to be
+        # one of these ids) would only appear once the model's text stream
+        # has some real internal structure, not during a truly degenerate/
+        # stuck generation.
+        try:
+            lm_model = base_job.server.runner.lm_gen.lm_model
+            logger.info(
+                "[TokenIDs] text_padding_token_id=%s end_of_text_padding_id=%s "
+                "text_initial_token_id=%s rag_token_id=%s",
+                lm_model.text_padding_token_id,
+                lm_model.end_of_text_padding_id,
+                lm_model.text_initial_token_id,
+                lm_model.rag_token_id,
+            )
+        except Exception:
+            logger.exception("[TokenIDs] failed to read token id meanings")
+
         if retrieval_backend is not None:
             self._patch_rag_manager()
-            self._patch_catch_reference_text()
+            self._patch_output_loop()
+
+    def _patch_audio_power_diagnostics(self):
+        """
+        Diagnostic for turns where rag_trigger_count=0 and response='' —
+        the model never predicts <ret> and never produces a single real
+        token, even though STT (fed the *unfiltered* chunk directly in
+        _feed_loop, one line before audio_processor.filter_by_power() is
+        called on the copy that actually reaches the LM) transcribes the
+        question correctly. Testing whether filter_by_power's power gate
+        is occasionally zeroing an entire utterance before the LM ever sees
+        it — which would explain correct STT + total LM silence together,
+        and would be consistent with non-determinism (gate result depends
+        on each specific recording's loudness, not question content).
+        """
+        job = self._job
+        original_filter = job.audio_processor.filter_by_power
+        state = {"frames": 0, "zeroed": 0}
+
+        def _wrapped_filter_by_power(chunk):
+            result = original_filter(chunk)
+            rms_in = chunk.detach().float().pow(2).mean().sqrt().item()
+            rms_out = result.detach().float().pow(2).mean().sqrt().item()
+            state["frames"] += 1
+            if rms_out <= 1e-8 and rms_in > 1e-6:
+                state["zeroed"] += 1
+                logger.info(
+                    "[AudioPower] frame=%d GATED TO ZERO rms_in=%.6f rms_out=%.6f",
+                    state["frames"], rms_in, rms_out,
+                )
+            else:
+                logger.debug(
+                    "[AudioPower] frame=%d rms_in=%.6f rms_out=%.6f",
+                    state["frames"], rms_in, rms_out,
+                )
+            return result
+
+        job.audio_processor.filter_by_power = _wrapped_filter_by_power
+        self._audio_power_state = state
 
     def _patch_rag_manager(self):
         """
@@ -296,66 +359,178 @@ class _TimedInferenceJob:
 
         self._job.rag_manager.get_reference_text = _patched_get_reference_text
 
-    def _patch_catch_reference_text(self):
+    def _patch_output_loop(self):
         """
-        Work around a race in moshi-rag's own step-loop bookkeeping —
-        confirmed against inference_job.py's actual source, not guessed.
+        Replace InferenceJob._output_loop with a version matching Channel's
+        (moshi-rag's real production WebSocket server class,
+        inference_utils/channel.py) simpler, confirmed-working
+        retrieval-trigger handling — removes InferenceJob's own "pause
+        output during retrieval" mechanism entirely, rather than continuing
+        to patch around its bugs one at a time.
 
-        When a <ret> token is predicted, _output_loop immediately sets
-        self._retrieval_start_step = step_index + wait_steps and calls
-        rag_manager.trigger(...). _retrieval_start_time (a *different*
-        attribute) is only set later, via an exact equality check inside
-        the per-step loop: `if self.step_index == self._retrieval_start_step`.
-        RAGManager.trigger()'s own internal wait_steps timer is a separate,
-        independent counting mechanism from that step_index check — nothing
-        guarantees they stay in lockstep. If handle_reference_fn
-        (InferenceJob._catch_reference_text) fires before that equality
-        check has ever hit, self._retrieval_start_time is still None, and
-        _catch_reference_text's second line is a bare `assert
-        self._retrieval_start_time is not None` with no message — crashing
-        the whole reference-generation task. moshi's own _background_task
-        catches this into a one-line log with no traceback
-        ("[Reference] Error generating reference: "), which is what
-        surfaced this in the first place.
+        Root-caused by reading Channel directly, prompted by a user's real
+        test of the actual unmodified prod path (moshi.server, which uses
+        Channel) showing no unnatural pauses on retrieval triggers: Channel
+        is a SEPARATE, PARALLEL implementation from InferenceJob within
+        moshi-rag's own codebase (live WebSocket server vs. offline/batch
+        inference), and it has NO self._doing_retrieval gate, no
+        _retrieval_start_step, no _retrieval_done_step at all. When the
+        model emits <ret>, Channel._output_loop calls
+        rag_manager.trigger(...) and immediately loops back to `await
+        self.output_queue.get()` for the next token — no pausing.
+        RAGManager.trigger() (shared by both classes, confirmed against
+        rag_manager.py's real source) is already fully async/non-blocking
+        on its own — task_group.create_task(...), returns immediately; the
+        actual retrieval and conditioning update happen in a background
+        task, entirely independent of the output loop. So InferenceJob's
+        _doing_retrieval gate was never load-bearing for "let retrieval
+        happen in the background" — that already worked via RAGManager
+        alone, unconditionally. The gate's only unique effect was pausing
+        the output loop's own token-forwarding while waiting, via an exact
+        `step_index == self._retrieval_start_step` equality check that
+        doesn't reliably fire — a real, confirmed bug in this specific
+        InferenceJob mechanism (previously patched around here and by
+        _step_watchdog's self-healing clear), not something moshi-rag's
+        own live server exercises at all, and not something we introduced.
 
-        UPDATE, confirmed via a step-index watchdog on a real run: this is
-        NOT harmless bookkeeping — self._doing_retrieval staying True
-        forever silently deadlocks the whole step loop (step_index stops
-        advancing entirely, no exception, no timeout). _catch_reference_text
-        sets self._retrieval_done_step = self.step_index + retrieval_steps
-        as *another* future step target, checked via the same kind of exact
-        step_index == ... equality comparison as _retrieval_start_step —
-        and our own defaulting of _retrieval_start_time to "now" above makes
-        retrieval_elapsed compute to ~0, so _retrieval_done_step resolves to
-        essentially "whatever step it is right now" — a target the main
-        step loop, running concurrently in the background, has very
-        plausibly already advanced past by the time this callback finishes,
-        for the exact same missed-equality-check reason as the first race.
-        Rather than trust that mechanism a second time, set
-        self._doing_retrieval = False ourselves once we know
-        handle_reference_fn has actually completed.
+        Replaces _output_loop wholesale (matching the existing
+        _live_feed_loop/_feed_loop pattern) rather than hooking a smaller
+        seam, since the gate is woven through the method: the top-of-loop
+        wait, the step_index target computed at the <ret> branch, and the
+        step-index-triggered deferred handle_reference_fn call at the
+        bottom. Also matches Channel's IMMEDIATE conditioning application
+        (handle_reference_fn called directly from RAGManager's own
+        background task, no step-based deferral) rather than
+        InferenceJob's _retrieval_done_step deferral — that deferral was
+        never itself buggy (it compares with >=, not exact equality), but
+        a hybrid (Channel's gate removal plus InferenceJob's deferral)
+        would be a novel, untested combination neither class actually
+        runs; matching Channel exactly is the configuration with real
+        evidence behind it.
+
+        Supersedes the former _patch_catch_reference_text (removed) —
+        that patched InferenceJob._catch_reference_text, which this no
+        longer calls at all (handle_reference_fn is replaced outright, not
+        layered on top of it).
         """
-        original = self._job._catch_reference_text
+        job = self._job
 
-        async def _safe_catch_reference_text(reference_text, lm_label: str = "") -> None:
-            if self._job._retrieval_start_time is None:
-                logger.warning(
-                    "moshi's _retrieval_start_time was still None when "
-                    "handle_reference_fn fired (known step-index race) — "
-                    "defaulting to now rather than crashing retrieval"
-                )
-                self._job._retrieval_start_time = time.monotonic()
-            await original(reference_text, lm_label)
-            if self._job._doing_retrieval:
-                logger.warning(
-                    "moshi's _doing_retrieval was still True after "
-                    "handle_reference_fn completed (known step-index race, "
-                    "same root cause as _retrieval_start_time above) — "
-                    "clearing it directly rather than deadlocking the step loop"
-                )
-                self._job._doing_retrieval = False
+        async def _immediate_handle_reference_text(reference_text, lm_label: str = "") -> None:
+            # Channel's _handle_reference_text does both of these in one
+            # step (storing for its UI history and applying conditioning
+            # immediately) — we do the same, combining what
+            # _catch_reference_text (trace bookkeeping, for our own
+            # metadata["retrieval_text"]) and _handle_reference_text
+            # (the actual conditioning update) used to split across a
+            # step-index-deferred handoff.
+            job.trace["reference_text"] = reference_text or ""
+            await job._async_update_reference(reference_text or "")
 
-        self._job._catch_reference_text = _safe_catch_reference_text
+        rag_trigger_count = 0
+        # Diagnostic: _decode_text_token() treats any of {0,1,2,3} as "pad"
+        # and collapses them all to the same "<pad>" display string — this
+        # records which raw ids actually showed up, so a silent turn can be
+        # told apart between "genuinely the single pad token, repeated" vs.
+        # "some other/varying special token being emitted", which would
+        # point at a different bug than plain non-engagement.
+        pad_token_ids_seen: set[int] = set()
+        # Raw ordered sequence (not just the set above) — the set alone
+        # can't distinguish "degenerate, stuck repeating a single id from
+        # step 0" from "the usual mix, just never transitioning to real
+        # speech": e.g. [3,3,3,3,3,...] throughout vs [3,3,0,3,0,0,3,...].
+        # Capped so a long, fully-silent tail-timeout turn doesn't blow up
+        # the log line.
+        pad_token_sequence: list[int] = []
+        _PAD_SEQUENCE_CAP = 40
+
+        async def _patched_output_loop() -> None:
+            nonlocal rag_trigger_count
+            assert job._task_group is not None
+            while not job._shutdown_event.is_set():
+                if job.stop_on_end_of_input and job._feed_finished.is_set():
+                    try:
+                        out = await asyncio.wait_for(job.output_queue.get(), timeout=1.0)
+                    except TimeoutError:
+                        await job._finalize()
+                        return
+                else:
+                    out = await job.output_queue.get()
+
+                if out.pcm is not None:
+                    job._model_pcm_chunks.append(out.pcm.detach().cpu().float().numpy().reshape(-1))
+
+                text_token = out.text_token
+
+                if text_token == job.server.runner.lm_gen.lm_model.rag_token_id:
+                    rag_trigger_count += 1
+                    job.trace["rag_trigger_step"] = job.step_index
+                    job.trace["rag_trigger_count"] = rag_trigger_count
+                    job.model_text.append(job.server.text_tokenizer.id_to_piece(text_token))  # type: ignore[arg-type]
+                    # Channel logs this explicitly (channel.py: "[RAG] model
+                    # emitted RAG token, triggering reference generation") —
+                    # our patch didn't carry that over, so there was no direct
+                    # way to tell how many times <ret> fired per turn versus
+                    # just "at least once" (trace["rag_trigger_step"] gets
+                    # silently overwritten on every occurrence).
+                    logger.info(
+                        "[RAG] model emitted RAG token (occurrence #%d this turn) "
+                        "at step_index=%d, triggering reference generation",
+                        rag_trigger_count, job.step_index,
+                    )
+                    try:
+                        await job.rag_manager.trigger(
+                            task_group=job._task_group,
+                            wait_steps=int(job.turn_manager.stt_wait_steps),
+                            handle_reference_fn=_immediate_handle_reference_text,
+                            context_provider=job.turn_manager.get_context,
+                        )
+                    except Exception:
+                        # rag_manager.trigger() itself should only ever raise
+                        # RuntimeError if called outside its `async with`
+                        # scope — everything past that point (the actual
+                        # retrieval fetch) runs in a background task that
+                        # already catches its own exceptions (see
+                        # RAGManager._background_task). If *this* call raises,
+                        # it's happening somewhere we don't expect; log the
+                        # full traceback rather than let it propagate
+                        # silently or crash the whole output loop.
+                        logger.exception(
+                            "job.rag_manager.trigger() raised — this should "
+                            "be near-impossible per rag_manager.py's own "
+                            "source; investigate directly rather than assume"
+                        )
+                        raise
+                else:
+                    decoded = job._decode_text_token(text_token)
+                    job.turn_manager.handle_spoken_text(model_text=decoded)
+                    if decoded is None:
+                        pad_token_ids_seen.add(text_token)
+                        job.trace["pad_token_ids_seen"] = sorted(pad_token_ids_seen)
+                        if len(pad_token_sequence) < _PAD_SEQUENCE_CAP:
+                            pad_token_sequence.append(text_token)
+                            job.trace["pad_token_sequence"] = list(pad_token_sequence)
+                        job.model_text.append("<pad>")
+                    else:
+                        job.model_text.append(job.server.text_tokenizer.id_to_piece(text_token))  # type: ignore[arg-type]
+
+                if job._user_id_buffer:
+                    uid = job._user_id_buffer.popleft()
+                    job.user_text.append(job.stt.text_tokenizer.id_to_piece(uid))  # type: ignore[arg-type]
+                else:
+                    job.user_text.append("<pad>")
+
+                job.rag_manager.step()
+
+                async with job._pcm_one_step_cv:
+                    job.step_index += 1
+                    job._pcm_one_step_cv.notify_all()
+
+                if job.trace.get("question_end_step", -1) >= 0 and job.max_tail_silence is not None:
+                    if job._check_tail_silence():
+                        await job._finalize()
+                        return
+
+        job._output_loop = _patched_output_loop
 
     async def run(self, task_group):
         """Delegate to the underlying InferenceJob, hooking timing."""
@@ -423,9 +598,22 @@ async def _step_watchdog(raw_job) -> None:
     model's own step loop is still advancing — a true deadlock here raises no
     exception and hits no timeout on its own, confirmed on a real run.
 
-    Also a safety net for a confirmed race: _patch_catch_reference_text's own
-    fix (clearing _doing_retrieval right after handle_reference_fn completes)
-    only works if _output_loop's step loop has already set _doing_retrieval =
+    UPDATE: _TimedInferenceJob._patch_output_loop() removed the
+    self._doing_retrieval gate this watchdog's intervention branch below was
+    built to unstick — root-caused instead of patched around further, see
+    that method's docstring. raw_job._doing_retrieval should now be
+    permanently False (nothing sets it True anymore), so the `if not
+    advancing and raw_job._doing_retrieval:` branch is expected to be dead
+    code — kept as-is for now, deliberately not removed, as a defensive
+    safety net until the fix has been validated against a real checkpoint
+    across enough retrieval triggers to be confident no *other* stall
+    mechanism exists. Revisit once confirmed — the general step_index
+    staleness logging above is still useful independent of this.
+
+    Original rationale, kept for context: also a safety net for a confirmed
+    race: the former _patch_catch_reference_text's own fix (clearing
+    _doing_retrieval right after handle_reference_fn completes) only worked
+    if _output_loop's step loop has already set _doing_retrieval =
     True by the time that callback runs. With NullBackend, retrieval is
     near-instant (no network call), so the callback can complete *before*
     _output_loop's own step_index == self._retrieval_start_step check ever
@@ -547,6 +735,12 @@ class MoshiRAGAdapter(ModelInterface):
         # then kept alive for this adapter's whole lifetime.
         self._loop: asyncio.AbstractEventLoop | None = None
         self._step_task: asyncio.Task | None = None
+        # See respond()'s gap-timing log: wall-clock end of the previous
+        # respond() call, used to measure the fully-synchronous gap (judge
+        # call + next-row data loading, both blocking, run while self._loop
+        # is not being driven at all) between calls — the current lead on
+        # why some turns come back with rag_trigger_count=0 and response=''.
+        self._last_respond_end_ts: float | None = None
 
     def _ensure_step_loop(self) -> None:
         """
@@ -825,6 +1019,19 @@ class MoshiRAGAdapter(ModelInterface):
         import numpy as np
         from moshi.inference_utils.inference_job import InferenceJob
 
+        # Gap-timing diagnostic: the synchronous work between calls (the
+        # judge's blocking API call, next-row/next-subset data loading) all
+        # happens while self._loop is not being driven at all — testing
+        # whether the two known "rag_trigger_count=0, response=''" turns
+        # correlate with an unusually long gap here versus the 18 calls
+        # that responded normally.
+        call_start_ts = time.monotonic()
+        if self._last_respond_end_ts is not None:
+            logger.info(
+                "[respond] gap since previous respond() call finished: %.3fs",
+                call_start_ts - self._last_respond_end_ts,
+            )
+
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as fin:
             fin.write(audio_in)
             in_path = Path(fin.name)
@@ -919,9 +1126,28 @@ class MoshiRAGAdapter(ModelInterface):
                 "retrieval_context": job.retrieval_context,
                 "retrieval_text": trace.get("reference_text", ""),
                 "retrieval_latency_s": job.retrieval_latency_s,
-                "rag_triggered": "rag_trigger_step" in trace,
+                # BUG FIX: "rag_trigger_step" in trace was always True — moshi's
+                # own InferenceJob.__init__ pre-populates trace with
+                # {"rag_trigger_step": -1, ...} as a sentinel default, before
+                # anything happens, so the key's mere presence never meant
+                # <ret> actually fired. Confirmed on a real run: rag_triggered
+                # showed True even when rag_trigger_count (below) was 0 and no
+                # "[RAG] model emitted..."/"[Reference]" logging appeared at
+                # all for that turn. rag_trigger_count is the accurate signal;
+                # derive this flag from it instead of the sentinel-populated key.
+                "rag_triggered": trace.get("rag_trigger_count", 0) > 0,
                 "rag_trigger_step": trace.get("rag_trigger_step"),
+                # How many times <ret> fired this turn, not just whether it
+                # fired at least once — rag_trigger_step alone gets silently
+                # overwritten on every occurrence, so "1" and "5" looked
+                # identical before this.
+                "rag_trigger_count": trace.get("rag_trigger_count", 0),
                 "question_end_step": trace.get("question_end_step"),
+                # See _patch_audio_power_diagnostics()/pad_token_ids_seen above.
+                "audio_zeroed_frames": job._audio_power_state["zeroed"],
+                "audio_total_frames": job._audio_power_state["frames"],
+                "pad_token_ids_seen": trace.get("pad_token_ids_seen", []),
+                "pad_token_sequence": trace.get("pad_token_sequence", []),
             }
 
             # One clear, greppable line per question — everything else about
@@ -929,8 +1155,11 @@ class MoshiRAGAdapter(ModelInterface):
             # lines ("[Reference] Triggering retrieval...", "[Buffer]
             # buffering model text...", etc). Search logs for "[respond]".
             logger.info(
-                "[respond] rag_triggered=%s ttfat=%.3fs response=%r",
-                metadata["rag_triggered"], metadata["ttfat_s"], inner_text[:200],
+                "[respond] rag_triggered=%s rag_trigger_count=%d ttfat=%.3fs "
+                "audio_zeroed=%d/%d pad_ids=%s pad_seq=%s response=%r",
+                metadata["rag_triggered"], metadata["rag_trigger_count"], metadata["ttfat_s"],
+                metadata["audio_zeroed_frames"], metadata["audio_total_frames"],
+                metadata["pad_token_ids_seen"], metadata["pad_token_sequence"], inner_text[:200],
             )
 
             return audio_out, inner_text, metadata
@@ -939,6 +1168,7 @@ class MoshiRAGAdapter(ModelInterface):
             in_path.unlink(missing_ok=True)
             out_path.unlink(missing_ok=True)
             out_path.with_suffix(".wav").unlink(missing_ok=True)
+            self._last_respond_end_ts = time.monotonic()
 
     async def respond_stream(
         self, audio_chunks: AsyncIterator[bytes]

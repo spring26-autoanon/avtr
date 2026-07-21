@@ -1,5 +1,7 @@
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from core.model_interface import ModelInterface, StubModelAdapter, _TimedInferenceJob, _clean_model_text, _silent_wav
 from core.retrieval_backend import NullBackend
@@ -162,3 +164,115 @@ def test_patch_rag_manager_backend_failure_still_records_context():
 
     assert timed.retrieval_context == "context that triggered a failure"
     assert ref_text == ""
+
+
+# ── _patch_output_loop — no _doing_retrieval gate, immediate conditioning ──────
+
+
+def _make_output_loop_job() -> MagicMock:
+    """A fake InferenceJob with just enough real asyncio primitives
+    (_shutdown_event, _pcm_one_step_cv) for one _output_loop iteration to
+    run for real, everything else mocked."""
+    job = MagicMock()
+    job._task_group = MagicMock()
+    job._shutdown_event = asyncio.Event()
+    job._pcm_one_step_cv = asyncio.Condition()
+    job.trace = {}
+    job.model_text = []
+    job.user_text = []
+    job._user_id_buffer = []
+    job.step_index = 0
+    job.max_tail_silence = None  # disables the unrelated tail-silence finalize path
+    job.stop_on_end_of_input = False
+    job._model_pcm_chunks = []
+    job.turn_manager.stt_wait_steps = 6  # must be a real int: int(job.turn_manager.stt_wait_steps)
+    job.server.runner.lm_gen.lm_model.rag_token_id = 999
+    job.rag_manager = MagicMock()
+    job.rag_manager.trigger = AsyncMock()
+    job._async_update_reference = AsyncMock()
+
+    rag_output = MagicMock(text_token=999, pcm=None)
+
+    async def _get_once():
+        job._shutdown_event.set()  # so the loop exits after this one iteration
+        return rag_output
+
+    job.output_queue.get = AsyncMock(side_effect=_get_once)
+    return job
+
+
+def test_patch_output_loop_replaces_output_loop():
+    timed = _make_timed_job(MagicMock())
+    assert asyncio.iscoroutinefunction(timed._job._output_loop)
+
+
+def test_patch_output_loop_never_touches_doing_retrieval():
+    """The whole point of this patch: Channel (the real production
+    WebSocket server class) has no _doing_retrieval gate at all, so neither
+    should our replacement _output_loop."""
+    job = _make_output_loop_job()
+    job._doing_retrieval = "sentinel-should-stay-untouched"
+
+    _TimedInferenceJob(job, MagicMock())
+    asyncio.run(job._output_loop())
+
+    assert job._doing_retrieval == "sentinel-should-stay-untouched"
+    job.rag_manager.trigger.assert_awaited_once()
+    assert job.trace["rag_trigger_step"] == 0
+    assert job.trace["rag_trigger_count"] == 1
+
+
+def test_patch_output_loop_counts_multiple_rag_triggers_in_one_turn():
+    """The diagnostic this investigation needed: distinguishing "<ret> fired
+    once" from "<ret> fired repeatedly, re-cancelling retrieval each time"
+    (RAGManager.trigger() cancels any pending task on every call) —
+    trace["rag_trigger_step"] alone can't tell these apart since it's
+    silently overwritten on every occurrence."""
+    job = _make_output_loop_job()
+    calls = {"n": 0}
+    rag_output = MagicMock(text_token=999, pcm=None)
+
+    async def _get_three_times():
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            job._shutdown_event.set()
+        return rag_output
+
+    job.output_queue.get = AsyncMock(side_effect=_get_three_times)
+
+    _TimedInferenceJob(job, MagicMock())
+    asyncio.run(job._output_loop())
+
+    assert job.trace["rag_trigger_count"] == 3
+    assert job.rag_manager.trigger.await_count == 3
+
+
+def test_patch_output_loop_logs_and_reraises_trigger_exception(caplog):
+    """rag_manager.trigger() should be near-impossible to raise per its own
+    source — if it ever does, we want the full traceback surfaced, not a
+    silently swallowed/hung turn."""
+    job = _make_output_loop_job()
+    job.rag_manager.trigger = AsyncMock(side_effect=RuntimeError("boom"))
+
+    _TimedInferenceJob(job, MagicMock())
+    with caplog.at_level("ERROR", logger="core.model_interface"):
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(job._output_loop())
+
+    assert any("rag_manager.trigger() raised" in r.message for r in caplog.records)
+
+
+def test_patch_output_loop_handle_reference_fn_applies_conditioning_immediately():
+    """No step-index deferral (unlike the old _catch_reference_text /
+    _retrieval_done_step handoff) — matches Channel's _handle_reference_text,
+    called directly from RAGManager's own background task."""
+    job = _make_output_loop_job()
+
+    _TimedInferenceJob(job, MagicMock())
+    asyncio.run(job._output_loop())
+
+    handle_reference_fn = job.rag_manager.trigger.await_args.kwargs["handle_reference_fn"]
+    asyncio.run(handle_reference_fn("Paris is the capital of France.", lm_label="test-lm"))
+
+    assert job.trace["reference_text"] == "Paris is the capital of France."
+    job._async_update_reference.assert_awaited_once_with("Paris is the capital of France.")
