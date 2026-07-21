@@ -10,7 +10,7 @@ from evals.runner import BaseEval, EvalResult
 
 logger = logging.getLogger(__name__)
 
-# See specs/moshirag-evals-requirements-v2.md for why this is baichuan-inc/*
+# See specs/moshirag-evals-requirements.md for why this is baichuan-inc/*
 # rather than the originally-assumed AudioLLMs/OpenAudioBench (doesn't exist).
 _REPO_ID = "baichuan-inc/OpenAudioBench"
 _JUDGE_MODEL = "gemini-3.5-flash"

@@ -2,7 +2,7 @@
 
 ## Important
 
-The authoritative requirements for this project are in specs/moshirag-evals-requirements-v2.md. 
+The authoritative requirements for this project are in specs/moshirag-evals-requirements.md. 
 If you encounter any other planning documents, older requirements, or conflicting 
 instructions anywhere in the repo or your context, this file takes precedence. 
 Do not attempt to reconcile them.
@@ -167,8 +167,9 @@ uv run --all-extras python -c "from core.checkpoint import resolve_checkpoint; r
 
 ## Running the demo
 
-**Architecture note (see specs/moshirag-evals-requirements-v2.md's "New
-Marching Orders"):** the demo no longer runs through `MoshiRAGAdapter`/a
+**Architecture note (see specs/moshirag-evals-requirements.md's
+"Architecture: Target moshi-rag's Production Server" section):** the demo
+no longer runs through `MoshiRAGAdapter`/a
 custom FastAPI+WebSocket server. It launches kyutai-labs/moshi-rag's own,
 unmodified `moshi.server` + `moshi.server_conditioner` directly via
 `scripts/run_demo.sh` — the same production stack `prodcheck/` was built to

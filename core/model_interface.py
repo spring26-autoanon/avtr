@@ -667,8 +667,9 @@ class MoshiRAGAdapter(ModelInterface):
         conditioner instead measurably fixed it in two independent
         real-checkpoint tests. This was originally kept opt-in pending a
         "permanent fix" and a scoped spec update — see
-        specs/moshirag-evals-requirements-v2.md's "New Marching Orders" and
-        CLAUDE.md's Phase 0/1 findings: the broader pivot to targeting
+        specs/moshirag-evals-requirements.md's "Architecture: Target
+        moshi-rag's Production Server" section and CLAUDE.md's Phase 0/1
+        findings: the broader pivot to targeting
         moshi-rag's real production architecture (which has never used
         in-process conditioning for *any* path, not just respond()) makes
         "always separate-process" the actual permanent fix rather than a
