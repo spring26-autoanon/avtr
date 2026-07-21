@@ -172,8 +172,12 @@ uv run --all-extras python -c "from core.checkpoint import resolve_checkpoint; r
 no longer runs through `MoshiRAGAdapter`/a
 custom FastAPI+WebSocket server. It launches kyutai-labs/moshi-rag's own,
 unmodified `moshi.server` + `moshi.server_conditioner` directly via
-`scripts/run_demo.sh` — the same production stack `prodcheck/` was built to
-A/B against, now promoted to the real thing. Reversibility is via git history
+`scripts/run_demo.sh` — the same production stack a now-retired local
+ground-truth harness (`prodcheck/`, gitignored, never part of this repo's
+history) was built to A/B against, now promoted to the real thing.
+`prodcheck/` served its purpose once the pivot's findings were confirmed and
+implemented, and was deleted — its evidence lives on in this file's Phase 0
+notes below, not in a directory to go re-run. Reversibility is via git history
 (the prior in-process implementation is recoverable from before this change,
 same as this version is itself a revival of the pre-`5b3790e` launcher).
 `demo/server.py` and `demo/client/` are deleted; there is no Python code left
@@ -192,7 +196,8 @@ for *why* a given bug was scoped the way it was, not live behavior.
 ### Known issue (rare, unconfirmed root cause): reference-encoder `ConnectError` kills the session
 
 Observed once across 4 real-checkpoint sessions run against the pivoted
-`scripts/run_demo.sh` stack (2 via `prodcheck/`, 2 via the demo itself): a
+`scripts/run_demo.sh` stack (2 via the now-retired `prodcheck/` harness, 2
+via the demo itself): a
 retrieval round-trip completed normally (real Gemini reference text came
 back), but the subsequent POST to `server_conditioner` at
 `http://localhost:8001/embed` failed outright with
@@ -242,8 +247,9 @@ Both were applied to `respond()` and the old `respond_stream()` identically
 when this was found — `respond()` was never "missing" this fix at any point
 relevant to the pivot.
 
-**Phase 0 update (post-pivot investigation, see `prodcheck/`)**: re-ran this
-exact scenario against the real, unmodified `moshi.server` stack (which has
+**Phase 0 update (post-pivot investigation, via the now-retired `prodcheck/`
+ground-truth harness)**: re-ran this exact scenario against the real,
+unmodified `moshi.server` stack (which has
 no `_doing_retrieval` gate at all, by construction). Across 5 independent
 `<ret>` triggers over four sessions, including back-to-back triggers in one
 turn: **zero stalls, zero deadlocks.** Real evidence — small sample, not

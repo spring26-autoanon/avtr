@@ -18,8 +18,6 @@ sync:
 	  --exclude '__pycache__' \
 	  --exclude 'checkpoint_cache' \
 	  --exclude 'evals/results' \
-	  --exclude 'demo/sessions' \
-	  --exclude 'prodcheck' \
 	  --exclude '*.pyc' \
 	  --exclude '.env' \
 	  --exclude '.git' \
