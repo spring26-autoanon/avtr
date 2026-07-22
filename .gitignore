@@ -10,10 +10,16 @@ build/
 
 # secrets
 .env
+.env.local
+*.env.local
 
 # runtime artifacts
 checkpoint_cache/
 evals/results/
+demo/sessions/
+
+# demo/client/ (forked web client) build tooling
+node_modules/
 
 # editor
 .DS_Store

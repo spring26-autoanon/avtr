@@ -180,8 +180,14 @@ implemented, and was deleted — its evidence lives on in this file's Phase 0
 notes below, not in a directory to go re-run. Reversibility is via git history
 (the prior in-process implementation is recoverable from before this change,
 same as this version is itself a revival of the pre-`5b3790e` launcher).
-`demo/server.py` and `demo/client/` are deleted; there is no Python code left
-in `demo/` and nothing here loads `MoshiRAGAdapter` anymore.
+`demo/server.py` (the old in-process adapter's FastAPI server) is deleted,
+and nothing here loads `MoshiRAGAdapter` in this path. `demo/client/` has
+since returned in a different form: not the old in-process adapter's
+client, but a maintained fork of moshi-rag's own client used for live
+instrumentation UX, alongside a new `scripts/instrumented_server.py` — a
+narrow, logging-only wrapper around `moshi.server`, not a reimplementation
+of it. See specs/moshirag-evals-requirements.md's "Demo" section for
+details.
 
 Pivot status: Phase 0 (root-cause investigation), Phase 1 (this demo pivot),
 and Phase 2 (making separate-process conditioning mandatory for

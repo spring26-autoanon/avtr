@@ -59,6 +59,25 @@ for any path.
   `checkpoint.py`, `config.py`) as the shared abstraction layer evals
   build on — `MoshiRAGAdapter` drives real `ServerState`/`InferenceJob`
   classes directly, not a WebSocket client of `moshi.server`
+- Apply the same narrow, documented, logging-only patch technique already
+  used for `respond()`'s `RAGManager` instrumentation
+  (`model_interface.py`'s `_patch_rag_manager`) to the demo's
+  `moshi.server` process too, via `scripts/instrumented_server.py` — for
+  eval-parity session logging and to feed the live client UI (see "Demo"
+  below). This is additive logging only; it does not touch
+  `trigger()`/step-loop/`Channel` control flow, so it fits the same
+  allowance as the bullet above, not an exception to it
+- Align the demo's per-turn instrumentation with the same three latency
+  definitions specified for evals/registry/latency (`ttfat`, `e2ekd`,
+  `retrieval_breakdown`), rather than inventing new ones — see "Session
+  instrumentation" below for how each maps onto a live session. As of this
+  writing none of the three eval files exist yet (only `knowledge/` evals
+  are implemented) — `ttfat_s` and the `retrieval_breakdown_s` stages have
+  no external methodology dependency and are built directly in the demo;
+  `e2ekd_s`/`keyword_delay_s` require the MoshiRAG paper's Table 17
+  keyword-extraction prompt and are deliberately deferred (see "Session
+  instrumentation") until `evals/registry/latency/e2ekd.py` implements and
+  proves that methodology first — the demo then mirrors it, not the reverse
 
 ---
 
@@ -89,6 +108,11 @@ moshirag-evals/
     results/
   scripts/
     run_demo.sh
+    instrumented_server.py
+    summarize_demo_session.py
+  demo/
+    client/          # forked, rebranded moshi-rag client, built via npm/vite
+    sessions/         # per-session turns.jsonl + raw_events.jsonl + raw conditioner/server logs
   configs/
     baseline_no_retrieval.yaml
     baseline_with_retrieval.yaml
@@ -321,11 +345,21 @@ class EvalResult:
 ## Demo
 
 The demo provides a browser-based full-duplex voice interface for ad-hoc
-testing, edge-case probing, and stakeholder demos. It runs entirely on the
-VM as kyutai-labs/moshi-rag's own, unmodified `moshi.server` +
-`moshi.server_conditioner` — not custom code. macOS (or any machine with a
-browser) connects via SSH tunnel — no Python, no model weights on the
-client side.
+testing, edge-case probing, and stakeholder demos. It runs on the VM as
+kyutai-labs/moshi-rag's `moshi.server` + `moshi.server_conditioner` — the
+main server process is wrapped by a thin, narrow, logging-only
+instrumentation layer (`scripts/instrumented_server.py`, see below), not
+reimplemented or forked; `server_conditioner` remains fully unmodified.
+macOS (or any machine with a browser) connects via SSH tunnel — no Python,
+no model weights on the client side.
+
+Every session persists a structured log and both processes' raw output to
+`demo/sessions/<session_id>/`, and drives a maintained fork of the web
+client that surfaces retrieval/latency instrumentation live — see
+"Session instrumentation" and "Web client" below. Neither of these existed
+prior to this instrumentation work: earlier iterations of this demo had no
+persisted logs at all, so a session's console output was lost once its
+tmux session ended or scrolled past the pane's buffer.
 
 Access pattern:
 ```
@@ -338,23 +372,141 @@ access works without TLS certificates.
 
 ### `scripts/run_demo.sh`
 
-- Resolves a checkpoint alias via `core/checkpoint.py`, then launches
-  `moshi.server_conditioner` (port 8001) and `moshi.server` (port 8998) in
-  a detached tmux session — both real, unmodified moshi-rag processes
+- Resolves a checkpoint alias via `core/checkpoint.py`, generates a
+  session id (same `%Y-%m-%dT%H-%M-%SZ` timestamp format eval run ids use)
+  and creates `demo/sessions/<session_id>/`
+- Builds `demo/client/` (npm/vite build — see "Web client") and launches
+  `moshi.server_conditioner` (port 8001, unmodified) and
+  `scripts/instrumented_server.py` (port 8998, wraps `moshi.server`) in a
+  detached tmux session, pointed at the built client via `--static`
+- Tees both processes' stdout/stderr into
+  `demo/sessions/<session_id>/{conditioner,server}.log` so raw logs
+  survive independent of tmux's lifecycle/scrollback, and prints the
+  session dir path in its final instructions (mirroring the eval console's
+  "results written to: ..." line)
 - `--checkpoint`, `--stt`, `--rag-timeout`, `--conditioner-only` flags —
   see the script's own header comment
-- No Python code of ours runs in this path at all; retrieval on/off and
-  everything else about session behavior is moshi.server's own, unmodified
-  behavior
+- Retrieval on/off and everything else about session *behavior* remains
+  moshi.server's own, unmodified logic — only logging/instrumentation is
+  additive
+
+### Session instrumentation
+
+**`scripts/instrumented_server.py`** forwards all CLI args through to
+moshi-rag's real `moshi.server` entrypoint unchanged, then, before
+invoking its serve function:
+
+- Patches `RAGManager.get_reference_text` for logging — same technique
+  and signature as `core/model_interface.py`'s `_patch_rag_manager`
+  (`context: str -> (context, ref_text, elapsed, backend_label)`). moshi's
+  own logging does not print the retrieved reference text at all, and
+  only prints a truncated context snippet at trigger time — this patch is
+  what makes full-fidelity capture possible; log-scraping stdout alone
+  cannot recover it
+- Reuses the same `<ret>`-token detection already validated for
+  `respond()`, applied to the live `Channel`/`RAGManager` objects — but
+  `rag_triggered`/`rag_trigger_count`/`retrieval_context`/
+  `retrieved_reference_text`/`retrieval_breakdown_s` are **not** computed
+  live, in-process, at all. Confirmed against real moshi-rag source: the
+  model frequently predicts the RAG token *before* our own VAD-based turn
+  boundary has caught up to the user having already finished the next
+  question (two real `await` points sit between detecting the token and
+  the trigger actually firing, during which a concurrent task can advance
+  the boundary first) — so at the moment a trigger or its retrieval result
+  would be logged, the live process cannot yet know which turn it truly
+  belongs to. Every `<ret>` trigger, retrieval completion (full context/
+  reference text/breakdown, not a lump `retrieval_latency_s`), and turn
+  boundary is instead logged to `raw_events.jsonl` with whatever turn is
+  live at that instant — a deliberately best-effort tag, not a final
+  answer — and `scripts/summarize_demo_session.py` computes the correct
+  attribution afterward, once the full session (every trigger and every
+  boundary) is known. `turns.jsonl`'s own `turn` records therefore carry
+  no retrieval fields at all; see "Demo session log" below for the actual
+  schema and the reattribution rule
+- `ttfat_s` here means the same thing it does in
+  `evals/registry/latency/ttfat.py` — time from end-of-user-utterance
+  (VAD) to first audio token — since a live full-duplex session has no
+  fixed "generation complete" boundary, only a first-token one. This one
+  *is* computed live and stored directly on the turn record — it isn't
+  subject to the same cross-turn attribution ambiguity as retrieval,
+  since it's always about whichever turn is currently pending
+- Breaks retrieval timing into the same three stages as
+  `evals/registry/latency/retrieval_breakdown.py` — ASR transcription
+  wait, Gemini API call, context injection — captured via patches at the
+  equivalent points in moshi's own reference-generation call path (not
+  `GeminiAPIBackend.retrieve()`, since the demo doesn't go through our
+  `RetrievalBackend` — the exact hook points are confirmed against real
+  source during implementation, same discipline as the `RAGManager` patch)
+- **`e2ekd_s`/`keyword_delay_s` are deferred, not implemented in this
+  pass** — every turn record carries them as `null`. `e2ekd.py` doesn't
+  exist yet anywhere in this repo (only `knowledge/` evals are
+  implemented), and its methodology (Gemini keyword extraction using the
+  MoshiRAG paper's Table 17 prompt, then `nvidia/parakeet-tdt-0.6b-v2` for
+  the keyword's onset timestamp) must not be approximated — see this
+  spec's Context section. The demo mirrors that implementation once it
+  exists and is proven in the eval path, rather than prototyping it here
+  first. The schema already reserves a `turn_e2ekd_update` record type
+  (keyed by `turn_index`) for when this is wired up: computed
+  asynchronously as a background task per turn even then, since a
+  synchronous extra LLM call plus a full parakeet forward pass on the
+  critical path of every live turn is a cost the batch eval path can
+  absorb but a live conversation cannot
+- Writes two JSONL files per session, both **appended incrementally** (not
+  atomic-at-end like eval's `run-*.json` — a demo session has no defined
+  completion point and can be killed at any time via
+  `tmux kill-session`), to `demo/sessions/<session_id>/`:
+  `turns.jsonl` (one record per completed turn — question, response,
+  `ttfat_s` only) and `raw_events.jsonl` (one record per raw user/model
+  text chunk and RAG event, un-turn-scoped) — see "Demo session log" under
+  Output Format for both schemas
+- Additionally pushes a live, best-effort version of the same fields over
+  the existing client WebSocket message that already carries
+  `isRetrieving`/reference text to the browser (additive fields on an
+  existing message, not a new message-passing scheme) — see "Web client"
+  below. Since the browser only ever needs "most recently known state,"
+  not a final, correctly-attributed answer, it doesn't need the same
+  post-hoc reattribution `scripts/summarize_demo_session.py` does
+- Does not suppress moshi.server's normal stdout logging — the JSONL files
+  and the WebSocket fields are all additive, not a replacement
+
+**`scripts/summarize_demo_session.py <session_dir>`** reads both
+`turns.jsonl` and `raw_events.jsonl` and prints a console report for
+reviewing a session after the fact, mirroring `evals/runner.py`'s existing
+conventions (`_print_header`-style
+header, `SEP` separator, `⚠` warning prefix): session header, a per-turn
+table, and aggregate stats (mean/p95 per retrieval-breakdown stage,
+mean/p95 `ttfat_s`, `<ret>` trigger rate) computed on the fly — `e2ekd_s`
+is not yet implemented (see "Session instrumentation"), so its column
+reads "—" until `evals/registry/latency/e2ekd.py` exists. No precomputed
+summary file, matching the existing "no pre-computation in individual run
+files" philosophy already used by the eval comparison CLI. A `--json` flag
+switches output to one pretty-printed (`indent=2`) JSON document instead of
+the console report — see "Demo session log" below for why `turns.jsonl`
+itself is deliberately not pretty-printed and needs this flag to get an
+eval-style browsable view. This is a CLI tool only — there is no web-based
+viewer for historical sessions (see Explicitly Out of Scope).
 
 ### Web client
 
-Served by `moshi.server` itself from a static build — either the default
-downloaded artifact or a custom fork of moshi-rag's own `client/`
-(TypeScript/React/Vite, editable, Apache-2.0/MIT licensed) pointed at via
-`moshi.server --static <dir>`. Already implements retrieval-visibility UI
-(`SearchPanel`, `isRetrieving`, reference text display) — no custom client
-code needed by default.
+Served by `moshi.server` (via `scripts/instrumented_server.py`) from a
+static build at `demo/client/` — a fork of moshi-rag's own `client/`
+(TypeScript/React/Vite, Apache-2.0/MIT licensed) vendored into this repo
+and built via `moshi.server --static <dir>`. This repo owns and maintains
+this fork rather than depending on the default downloaded artifact, and
+extends it beyond the stock retrieval-visibility UI (`SearchPanel`,
+`isRetrieving`, reference text display) to also show, live during a
+session: whether `<ret>` fired and how many times, the retrieval backend,
+the retrieval breakdown (asr wait / API call / context injection), and
+`ttfat_s` — reading the added WebSocket fields described in "Session
+instrumentation" above. `e2ekd_s` is deferred (not yet implemented — see
+"Session instrumentation") and is not shown in the UI in this pass; once
+`evals/registry/latency/e2ekd.py` exists, it would appear a moment after
+the rest of the turn's fields, computed asynchronously so it never blocks
+the live conversation. The UI shell (title, header,
+footer, metadata/favicon, any about/info panels) is rebranded to
+unambiguously identify this as an internal eval tool — e.g. "MoshiRAG Eval
+Demo" — with moshi-rag's own product branding and disclaimers removed.
+Building it requires Node/npm on the VM (see Dependencies).
 
 ### Makefile demo target
 
@@ -581,6 +733,162 @@ summary
   gate       : retrieval p95 exceeds 1500ms in both runs — review infrastructure
 ```
 
+### Demo session log
+
+Written incrementally to two files under `demo/sessions/<session_id>/` by
+`scripts/instrumented_server.py` — both appended as the session progresses,
+not written atomically at the end, since a live session has no defined
+completion point.
+
+**`turns.jsonl`** — one record per completed turn. First line is a
+`session_start` record; one `turn` record follows per turn. Deliberately
+carries **no retrieval fields at all** — see the note below for why.
+
+```json
+{"type": "session_start", "session_id": "2026-07-13T09-32-11Z", "checkpoint": "base", "git_hash": "a3f9c12", "timestamp": "2026-07-13T09:32:11Z", "retrieval_backend": {"model": "gemini-3.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"}, "rag_timeout_s": 8, "stt_mode": "local"}
+{"type": "turn", "turn_index": 1, "timestamp": "2026-07-13T09:32:45Z", "user_question_text": "What's the capital of France?", "model_response_text": "Paris.", "ttfat_s": 0.05, "e2ekd_s": null, "keyword_delay_s": null}
+{"type": "turn", "turn_index": 2, "timestamp": "2026-07-13T09:33:20Z", "user_question_text": "What did the Q3 earnings report say about revenue growth?", "model_response_text": "Revenue grew twelve percent year over year.", "ttfat_s": 1.42, "e2ekd_s": null, "keyword_delay_s": null}
+```
+
+**`raw_events.jsonl`** — one record per raw user/model text chunk and RAG
+event, un-turn-scoped. This is the *only* source of retrieval data. Each
+event's `turn_index` is a live, best-effort tag (whatever turn is current
+in `instrumented_server.py` at write time) — confirmed against real
+moshi-rag source, the model frequently predicts the `<ret>` token *before*
+the demo's own VAD-based turn boundary has caught up to the user having
+already finished the next question, so this tag cannot be trusted as a
+final answer at write time.
+
+```json
+{"type": "raw_event", "event": "ret_triggered", "timestamp": "2026-07-13T09:33:18Z", "t_rel_s": 67.104, "turn_index": 1}
+{"type": "raw_event", "event": "utterance_end", "timestamp": "2026-07-13T09:33:19Z", "t_rel_s": 68.330, "turn_index": 2}
+{"type": "raw_event", "event": "retrieval_complete", "timestamp": "2026-07-13T09:33:20Z", "t_rel_s": 69.790, "turn_index": 1, "retrieval_context": "User asked about Q3 earnings report revenue growth...", "retrieved_reference_text": "According to the Q3 report, revenue grew 12% year over year...", "retrieval_breakdown_s": {"asr_wait_s": 0.12, "api_call_s": 0.71, "context_injection_s": 0.02, "total_s": 0.85}}
+```
+
+**Why retrieval data lives only in `raw_events.jsonl`, reconstructed by
+`scripts/summarize_demo_session.py`'s `compute_retrievals_from_raw_events()`,
+rather than being written directly into each `turn` record:** an
+already-appended JSONL line can't be retroactively edited, and the live
+process genuinely cannot know at write time whether a `<ret>` trigger it
+just tagged with turn N actually belongs to turn N or N+1 — only after the
+full session is over, with every trigger and turn boundary known, can that
+be decided correctly. The rule: for each turn_index a `<ret>` trigger was
+tagged with, all but the *last* trigger sharing that tag stay exactly
+where they're tagged (same-turn re-triggers — e.g. the model correcting
+itself mid-monologue, no new user input); the last one moves forward to
+turn_index + 1 if that next turn's boundary actually happened in the
+session. A turn can end up with more than one retrieval this way (0, 1, or
+more), not a single slot — see "Demo session summary (console)" below for
+how that's rendered.
+
+`e2ekd_s`/`keyword_delay_s` are always `null` in this pass — deferred
+until `evals/registry/latency/e2ekd.py` exists (see "Session
+instrumentation"). The `turn_e2ekd_update` record type (keyed by
+`turn_index`, carrying `keyword`/`keyword_delay_s`/`e2ekd_s`, written to
+`turns.jsonl` alongside `turn` records) is reserved schema for that future
+wiring, not emitted today — readers should join on `turn_index`, not
+assume a single record per turn.
+
+**This file is intentionally compact JSONL, not pretty-printed, unlike
+`run-*.json`.** The eval path's JSON is pretty-printed
+(`json.dump(..., indent=2)`) because it's one document written once,
+atomically, at the end. `turns.jsonl` has to stay one compact JSON value
+per line because that's what makes it safely appendable mid-session — a
+session killed mid-turn (`tmux kill-session`, disconnect, crash) shouldn't
+corrupt or require rewriting the whole file. Practical consequence:
+browsers auto-pretty-print a `.json` file because it's a single JSON
+document, but won't do that for `.jsonl` (multiple documents) — opened
+directly, it reads as a wall of minified lines. `scripts/
+summarize_demo_session.py --json <session_dir>` closes that gap on
+demand: it reads `turns.jsonl`, joins each turn with its
+`turn_e2ekd_update` by `turn_index`, computes its retrievals from
+`raw_events.jsonl` (see above), and prints one `indent=2` JSON document —
+same convention as `run-*.json`, for whoever wants a browsable artifact
+instead of (or alongside) the console summary. Not precomputed/stored,
+matching the "no pre-computation in individual run files" philosophy
+already used elsewhere in this doc.
+
+### Demo session summary (console)
+
+Printed by `scripts/summarize_demo_session.py demo/sessions/<session_id>/`,
+mirroring the eval console conventions above. `[turns]`'s `<ret>` column
+shows `yes ×N` and `ret.total` lists every value comma-separated (not
+summed/averaged) when a turn ends up with more than one retrieval (see
+"Demo session log" above); `[aggregate]`'s retrieval breakdown counts
+every individual retrieval, not one per turn. `[full transcript]` numbers
+each retrieval block `retrieval i/N (...)` when a turn has more than one.
+`[raw stream]` shows the same events un-reattributed — its `turnN` tags
+are the raw, live-tagged values, deliberately not corrected, since its
+whole purpose is showing what literally happened:
+
+```
+MoshiRAG Demo Session
+session id : 2026-07-13T09-32-11Z
+checkpoint : base
+git hash   : a3f9c12
+retrieval  : gemini-3.5-flash (rag_timeout: 8s)
+─────────────────────────────────────────────────────────
+
+[turns]
+  #   time      question                                    <ret>  ret.total  ttfat   e2ekd
+  1   09:32:45  What's the capital of France?               no     —          0.05s   —
+  2   09:33:20  What did the Q3 earnings report say abo...  yes    0.85s      1.42s   —
+
+─────────────────────────────────────────────────────────
+[aggregate]
+  turns              : 2
+  <ret> trigger rate : 50.0%   (1/2)
+  retrieval breakdown  asr_wait  mean 0.12s   p95 0.12s   (n=1)
+                       api_call  mean 0.71s   p95 0.71s   (n=1)
+                       ctx_inj   mean 0.02s   p95 0.02s   (n=1)
+                       total     mean 0.85s   p95 0.85s   (n=1)
+  ttfat                          mean 0.73s   p95 1.35s   (n=2)
+  ⚠ e2ekd not yet implemented — evals/registry/latency/e2ekd.py doesn't
+    exist yet; this column stays "—" until that eval lands and the demo
+    mirrors it
+
+─────────────────────────────────────────────────────────
+
+[full transcript]
+  #1 user : What's the capital of France?
+  #1 moshi: Paris.
+
+  #2 user : What did the Q3 earnings report say about revenue growth?
+  #2 moshi: Revenue grew twelve percent year over year.
+
+        retrieval (what the model asked with):
+          user: What did the Q3 earnings report say about revenue growth?
+        retrieval (what came back):
+          According to the Q3 report, revenue grew 12% year over year.
+
+─────────────────────────────────────────────────────────
+
+[raw stream]
+  Chronological, un-turn-scoped view of exactly what streamed in from the
+  user and out from the model — use this, not the turn table above, to see
+  <ret> firing too early, too late, or unprompted: turn boundaries here are
+  just one more timestamped event, not an assumed structure on the data.
+
+  +  33.201s  turn0   USER   What's the capital of France?
+  +  34.010s  turn1   · · · turn boundary (utterance end / VAD) · · ·
+  +  34.060s  turn1   first audio (ttfat 0.05s)
+  +  34.100s  turn1   MOSHI  Paris.
+  +  67.001s  turn1   USER   What did the Q3 earnings report say about revenue growth?
+  +  67.104s  turn1   <ret> triggered
+  +  68.330s  turn2   · · · turn boundary (utterance end / VAD) · · ·
+  +  68.380s  turn2   first audio (ttfat 1.42s)
+  +  69.790s  turn1   retrieval complete (0.85s)
+  +  69.850s  turn2   MOSHI  Revenue grew twelve percent year over year.
+
+raw logs: demo/sessions/2026-07-13T09-32-11Z/{server,conditioner}.log
+```
+
+Note the raw stream tags the `<ret>` trigger and its retrieval completion
+`turn1` throughout (the live, best-effort tag at write time), while
+`[turns]`/`[full transcript]` correctly show it grounding turn 2 instead —
+this is `compute_retrievals_from_raw_events()`'s reattribution at work,
+not an inconsistency between the two sections.
+
 ---
 
 ## Configs
@@ -643,6 +951,12 @@ execution target. This list is illustrative, not authoritative — see
 (`fastapi`/`uvicorn`/`websockets`) — the demo is now real `moshi.server`,
 which brings its own web stack; nothing here needs to.
 
+Building `demo/client/` (the forked, rebranded web client — see "Demo")
+requires Node/npm on the VM. This is the one non-Python, non-`uv` build
+tool this project depends on; it is a build-time dependency only,
+`moshi.server` serves the built static output at runtime and needs nothing
+further from Node.
+
 Local dev (Ubuntu VM): `uv venv && uv sync`
 Vertex AI VM: `make sync && make install` (install only needed when dependencies change)
 
@@ -702,3 +1016,10 @@ demo:
 - Production serving for real end users — this repo's use of `moshi.server`/`moshi.server_conditioner` is for evals and an internal demo tool, not a production deployment; real production deployment of validated fine-tuned weights is a separate concern, still out of scope here
 - Multi-user demo access — the demo server is single-session by design
 - TLS / HTTPS for the demo — SSH tunnel provides the secure context; certificates are not needed
+- Web-based viewer for *historical* demo sessions — review is CLI-only via
+  `scripts/summarize_demo_session.py`; the client fork (`demo/client/`)
+  covers *live* in-session visibility only, not browsing past sessions
+- Instrumenting `server_conditioner` beyond raw log persistence — none of
+  the six tracked fields (question, `<ret>`, retrieval context/reference
+  text, backend, retrieval/generation latency) originate there; it stays
+  fully unmodified

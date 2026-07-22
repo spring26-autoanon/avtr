@@ -3,7 +3,19 @@
 #
 # Launches two services in a tmux session "demo":
 #   window 0 (conditioner): reference encoder conditioner on port 8001
-#   window 1 (server):      moshi-rag main server on port 8998
+#   window 1 (server):      moshi-rag main server on port 8998, wrapped by
+#                            scripts/instrumented_server.py (narrow,
+#                            logging-only patch — see that file's own
+#                            docstring), serving the built demo/client/ fork
+#
+# Each launch (except --conditioner-only) creates a fresh session directory
+# at demo/sessions/<session_id>/, tees both processes' raw stdout/stderr into
+# {conditioner,server}.log there (so logs survive independent of tmux's
+# lifecycle/scrollback), and points instrumented_server.py at it via
+# DEMO_SESSION_DIR to write turns.jsonl — see specs/
+# moshirag-evals-requirements.md's "Session instrumentation" section. Review
+# a session afterward with:
+#   uv run scripts/summarize_demo_session.py demo/sessions/<session_id>/
 #
 # Connect from macOS once the server is ready:
 #   ssh -L 8998:localhost:8998 wb-gpu-a1ultra
@@ -133,14 +145,28 @@ if [[ "$CONDITIONER_ONLY" == "1" ]]; then
     exit 0
 fi
 
-SERVER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server \
+# ── Session directory ─────────────────────────────────────────────────────────
+SESSION_ID=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+SESSION_DIR="$PROJECT_DIR/demo/sessions/$SESSION_ID"
+mkdir -p "$SESSION_DIR"
+echo "Session log directory: $SESSION_DIR"
+
+# ── Build the web client (demo/client/, forked + rebranded moshi-rag client) ──
+echo "Building web client (demo/client/)..."
+(cd "$PROJECT_DIR/demo/client" && npm install --no-audit --no-fund && npm run build)
+CLIENT_DIST="$PROJECT_DIR/demo/client/dist"
+[[ -f "$CLIENT_DIST/index.html" ]] || { echo "Client build did not produce $CLIENT_DIST/index.html" >&2; exit 1; }
+
+SERVER_CMD="$ENV_PREFIX DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKPOINT_ALIAS' \
+  uv run --all-extras python scripts/instrumented_server.py \
   --moshi-weight '$MOSHI_WEIGHT' \
   --mimi-weight '$MIMI_WEIGHT' \
   --tokenizer '$TOKENIZER' \
   --device cuda \
   --port 8998 \
   --init-active-speaker model \
-  --rag-timeout $RAG_TIMEOUT"
+  --rag-timeout $RAG_TIMEOUT \
+  --static '$CLIENT_DIST'"
 
 [[ "$STT_MODE" == "gradium" ]] && SERVER_CMD+=" --gradium-stt"
 
@@ -148,13 +174,14 @@ SERVER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server \
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 tmux new-session -d -s "$SESSION" -n conditioner
 
-# Window 0: reference encoder conditioner
-tmux send-keys -t "$SESSION:conditioner" "cd $PROJECT_DIR && $CONDITIONER_CMD" Enter
+# Window 0: reference encoder conditioner — raw log tee'd, unpatched otherwise
+tmux send-keys -t "$SESSION:conditioner" \
+    "cd $PROJECT_DIR && $CONDITIONER_CMD 2>&1 | tee '$SESSION_DIR/conditioner.log'" Enter
 
 # Window 1: main server — wait 20s for conditioner to finish loading
 tmux new-window -t "$SESSION" -n server
 tmux send-keys -t "$SESSION:server" \
-    "cd $PROJECT_DIR && echo 'Waiting 20s for conditioner to load...' && sleep 20 && $SERVER_CMD" Enter
+    "cd $PROJECT_DIR && echo 'Waiting 20s for conditioner to load...' && sleep 20 && $SERVER_CMD 2>&1 | tee '$SESSION_DIR/server.log'" Enter
 
 # ── Instructions ─────────────────────────────────────────────────────────────
 echo ""
@@ -169,5 +196,11 @@ echo ""
 echo "  ssh -L 8998:localhost:8998 wb-gpu-a1ultra"
 echo ""
 echo "  Then open: http://localhost:8998"
+echo ""
+echo "Session logs: $SESSION_DIR"
+echo "  turns.jsonl, conditioner.log, and server.log persist there regardless"
+echo "  of tmux's lifecycle. Review with:"
+echo ""
+echo "  uv run scripts/summarize_demo_session.py $SESSION_DIR"
 echo ""
 echo "To stop: tmux kill-session -t $SESSION"
