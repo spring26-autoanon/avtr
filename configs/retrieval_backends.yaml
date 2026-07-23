@@ -1,0 +1,49 @@
+backends:
+  gemini_api:
+    type: gemini_api
+    model: gemini-3.5-flash
+    api_key_env: GEMINI_API_KEY
+    prompt_template: configs/prompts/retrieval_reference_simple.txt
+    context_formatting:
+      drop_leading_incomplete_turn: false
+      drop_trailing_incomplete_turn: false
+      thread_reference_history: false
+      history_max_entries: null
+      role_labels: {user: "Human", model: "moshi"}
+
+  # Alternate starting point, not the shipped default — demonstrates the
+  # full moshi-defaults pairing described in core/retrieval_backend.py's
+  # "On prompt parity" note. Select it explicitly
+  # (model.retrieval.backend: gemini_api_moshi_style) rather than editing
+  # the entry above in place, so the existing baseline configs' behavior
+  # doesn't change silently underneath anyone already relying on it.
+  gemini_api_moshi_style:
+    type: gemini_api
+    model: gemini-3.5-flash
+    api_key_env: GEMINI_API_KEY
+    prompt_template: configs/prompts/retrieval_reference_moshi_style.txt
+    context_formatting:
+      drop_leading_incomplete_turn: true
+      drop_trailing_incomplete_turn: true
+      thread_reference_history: true
+      history_max_entries: null   # true parity with moshi's own real
+                                  # (unbounded) behavior — set a number
+                                  # instead if long-session growth becomes
+                                  # a real problem; moshi itself doesn't
+                                  # cap this either
+      role_labels: {user: "Human", model: "moshi"}
+
+  "null":
+    type: null_backend
+
+  # Extension point, not implemented yet — no closed/local retrieval
+  # backend exists to build or test against today. A future entry would
+  # look something like this and become selectable purely via config, with
+  # a new RetrievalBackend subclass registered in BACKEND_REGISTRY:
+  #
+  # local_llm:
+  #   type: openai_compatible
+  #   base_url: http://localhost:8080/v1
+  #   model: llama-3-8b-instruct
+  #   api_key_env: LOCAL_LLM_API_KEY
+  #   prompt_template: configs/prompts/retrieval_reference_simple.txt

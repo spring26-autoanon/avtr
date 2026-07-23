@@ -24,7 +24,36 @@ _SAMPLE_RATE = 24000
 # there's no reference value to copy — this is a judgment call, not a
 # measured constant. Mimi/Moshi steps at 12.5Hz, so 25 steps ≈ 2s of
 # continuous silence. Tune if real audio shows premature/late cutoffs.
+# Default for generation["tail_silence_steps"] — see _DEFAULT_GENERATION.
 _TAIL_SILENCE_STEPS = 25
+
+# Every generation-affecting InferenceJob parameter MoshiRAGAdapter builds,
+# previously hardcoded directly into _load_models()'s argparse.Namespace —
+# now a config["model"]["generation"] dict (see core/config.py,
+# configs/baseline_*.yaml), merged over these defaults so a config omitting
+# the block (or a bare StubModelAdapter/tiny run) keeps working unchanged.
+# Field names match moshi.server's own CLI flag names (underscores vs.
+# hyphens) exactly — confirmed directly against kyutai-labs/moshi-rag's
+# server.py argparse block — so scripts/print_demo_env.py can translate
+# this same dict into the demo's CLI flags with a pure name transform.
+# batch_size/init_active_speaker are deliberately NOT here — see specs/
+# moshirag-evals-requirements.md's "Generation parameters" section for why
+# those two stay hardcoded/path-specific rather than shared config.
+_DEFAULT_GENERATION = {
+    "cfg_coef": 1.0,
+    "stt_wait_time": 0.5,
+    # Was 2.0 — raised to match scripts/run_demo.sh's own fix: real
+    # Gemini round-trip latency was directly observed at ~2.5-3s (see
+    # CLAUDE.md's Phase 0 prodcheck findings), reliably longer than a 2.0s
+    # budget. Same underlying defect, same fix, applied here too rather
+    # than leaving evals exposed to it.
+    "rag_timeout": 8.0,
+    "max_reference_tokens": 64,
+    "vad_window_size": 4,
+    "vad_threshold": 0.5,
+    "power_threshold": -65,
+    "tail_silence_steps": _TAIL_SILENCE_STEPS,
+}
 
 # moshi-rag's ServerState unconditionally constructs its own built-in
 # LLMReferenceGenerator (reads LLM_BASE_URL/LLM_API_KEY/LLM_MODEL_NAME env
@@ -690,9 +719,17 @@ class MoshiRAGAdapter(ModelInterface):
     processing latency (~1 inference step at 12.5Hz ≈ 80ms minimum).
     """
 
-    def __init__(self, checkpoint_path: str, retrieval_backend: RetrievalBackend | None = None):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        retrieval_backend: RetrievalBackend | None = None,
+        generation: dict | None = None,
+    ):
         self.checkpoint_path = checkpoint_path
         self.retrieval_backend = retrieval_backend or NullBackend()
+        # Any field omitted from `generation` falls back to the same
+        # default that was previously hardcoded — see _DEFAULT_GENERATION.
+        self._generation = {**_DEFAULT_GENERATION, **(generation or {})}
         self._load_models()
         # See _ensure_step_loop() — lazily created on first respond() call,
         # then kept alive for this adapter's whole lifetime.
@@ -787,10 +824,14 @@ class MoshiRAGAdapter(ModelInterface):
         checkpoint_dir = Path(self.checkpoint_path)
         ckpt_paths = self._resolve_checkpoint_paths(checkpoint_dir)
 
-        # Build the args namespace that load_models() expects
+        # Build the args namespace that load_models() expects. Every
+        # generation-affecting field below comes from self._generation (see
+        # _DEFAULT_GENERATION) — device/batch_size/init_active_speaker stay
+        # hardcoded, not config-driven (see that constant's own comment for
+        # why those three are path-specific rather than shared).
         args = argparse.Namespace(
             device="cuda:0",
-            cfg_coef=1.0,
+            cfg_coef=self._generation["cfg_coef"],
             batch_size=1,
             hf_repo=None,
             moshi_weight=str(ckpt_paths["moshi_weight"]),
@@ -799,17 +840,12 @@ class MoshiRAGAdapter(ModelInterface):
             config=str(ckpt_paths["config"]),
             dtype=torch.bfloat16,
             init_active_speaker="user",
-            stt_wait_time=0.5,
-            # Was 2.0 — raised to match scripts/run_demo.sh's own fix: real
-            # Gemini round-trip latency was directly observed at ~2.5-3s
-            # (see CLAUDE.md's Phase 0 prodcheck findings), reliably longer
-            # than a 2.0s budget. Same underlying defect, same fix, applied
-            # here too rather than leaving evals exposed to it.
-            rag_timeout=8.0,
-            max_reference_tokens=64,
-            vad_window_size=4,
-            vad_threshold=0.5,
-            power_threshold=-65,
+            stt_wait_time=self._generation["stt_wait_time"],
+            rag_timeout=self._generation["rag_timeout"],
+            max_reference_tokens=self._generation["max_reference_tokens"],
+            vad_window_size=self._generation["vad_window_size"],
+            vad_threshold=self._generation["vad_threshold"],
+            power_threshold=self._generation["power_threshold"],
         )
 
         logger.info("Loading MoshiRAG models from %s", self.checkpoint_path)
@@ -957,7 +993,7 @@ class MoshiRAGAdapter(ModelInterface):
                     # out — a natural pause SHOULD end the job.
                     stop_on_end_of_input=False,
                     use_gt_reference=False,
-                    max_tail_silence=_TAIL_SILENCE_STEPS,
+                    max_tail_silence=self._generation["tail_silence_steps"],
                     sidecar={},
                 )
                 timed = _TimedInferenceJob(raw_job, retrieval_backend)

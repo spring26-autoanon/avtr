@@ -1,0 +1,4 @@
+You are a knowledge retrieval system. Based on the following conversation context, provide a concise factual reference passage that would help answer the implied question. Respond with only the reference text, no preamble.
+
+Context:
+{context}

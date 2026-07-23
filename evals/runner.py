@@ -29,7 +29,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.config import load_config
 from core.model_interface import ModelInterface, StubModelAdapter
-from core.retrieval_backend import GeminiAPIBackend, NullBackend
+from core.retrieval_backend import build_backend_from_retrieval_config
+
+DEFAULT_JUDGE_MODEL = "gemini-3.5-flash"
 
 RESULTS_DIR = Path(__file__).parent / "results"
 SEP = "─" * 57  # ─────...
@@ -91,14 +93,13 @@ def build_model(cfg: dict) -> ModelInterface:
     model_cfg = cfg.get("model", {})
     adapter = model_cfg.get("adapter", "auto")
     retrieval_cfg = model_cfg.get("retrieval", {})
+    generation_cfg = model_cfg.get("generation", {})
 
-    if retrieval_cfg.get("enabled"):
-        backend = GeminiAPIBackend(
-            model=retrieval_cfg.get("model", "gemini-3.5-flash"),
-            latency_gate_ms=retrieval_cfg["latency_gate_ms"],
-        )
-    else:
-        backend = NullBackend()
+    # core/config.py's load_config() already resolved model.retrieval.backend
+    # against configs/retrieval_backends.yaml and attached the definition —
+    # this is what makes the `backend:` field actually take effect, rather
+    # than always constructing GeminiAPIBackend regardless of what it said.
+    backend = build_backend_from_retrieval_config(retrieval_cfg)
 
     if adapter == "stub":
         return StubModelAdapter(retrieval_backend=backend)
@@ -122,7 +123,7 @@ def build_model(cfg: dict) -> ModelInterface:
         from core.model_interface import MoshiRAGAdapter
         from core.checkpoint import resolve_checkpoint
         local_path = resolve_checkpoint(model_cfg.get("checkpoint", "base"))
-        return MoshiRAGAdapter(local_path, backend)
+        return MoshiRAGAdapter(local_path, backend, generation=generation_cfg)
     except ImportError as e:
         print(f"⚠  MoshiRAGAdapter unavailable ({e}) — using StubModelAdapter", file=sys.stderr)
         return StubModelAdapter(retrieval_backend=backend)

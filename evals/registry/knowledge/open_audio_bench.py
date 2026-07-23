@@ -6,14 +6,13 @@ from huggingface_hub import hf_hub_download
 
 from core.llm_judge import call_gemini
 from core.model_interface import ModelInterface
-from evals.runner import BaseEval, EvalResult
+from evals.runner import BaseEval, DEFAULT_JUDGE_MODEL, EvalResult
 
 logger = logging.getLogger(__name__)
 
 # See specs/moshirag-evals-requirements.md for why this is baichuan-inc/*
 # rather than the originally-assumed AudioLLMs/OpenAudioBench (doesn't exist).
 _REPO_ID = "baichuan-inc/OpenAudioBench"
-_JUDGE_MODEL = "gemini-3.5-flash"
 
 _MODE_SAMPLE_SIZE = {"tiny": 1, "smoke": 5, "sample": 100}  # "full" => all rows in the CSV
 
@@ -116,10 +115,10 @@ def _load_audio_bytes(subset_cfg: dict, row: dict) -> bytes:
         return f.read()
 
 
-def _judge(question: str, valid_answers: list[str], model_answer: str) -> bool:
+def _judge(question: str, valid_answers: list[str], model_answer: str, judge_model: str) -> bool:
     formatted_answers = "[" + ", ".join(f'"{a}"' for a in valid_answers) + "]"
     prompt = _JUDGE_PROMPT.format(question=question, valid_answers=formatted_answers, answer=model_answer)
-    verdict_text = call_gemini(_JUDGE_MODEL, prompt)
+    verdict_text = call_gemini(judge_model, prompt)
     m = _VERDICT_RE.search(verdict_text)
     if not m:
         raise ValueError(f"Judge response had no parseable verdict: {verdict_text!r}")
@@ -135,6 +134,7 @@ class OpenAudioBenchEval(BaseEval):
 
     def run(self, model: ModelInterface, config: dict, mode: str) -> EvalResult:
         limit = _MODE_SAMPLE_SIZE.get(mode)  # None => full dataset
+        judge_model = config.get("judge", {}).get("model", DEFAULT_JUDGE_MODEL)
 
         prior = config.get("_prior_result")
         progress: dict[str, dict] = {}
@@ -162,7 +162,7 @@ class OpenAudioBenchEval(BaseEval):
                     audio_in = _load_audio_bytes(subset_cfg, row)
                     _, text_out, resp_metadata = model.respond(audio_in)
                     valid_answers = _valid_answers(subset_cfg, row)
-                    correct = _judge(question, valid_answers, text_out)
+                    correct = _judge(question, valid_answers, text_out, judge_model)
                     entry.update({
                         "valid_answers": valid_answers,
                         "model_response": text_out,
@@ -182,7 +182,7 @@ class OpenAudioBenchEval(BaseEval):
                     state["correct"] += 1
 
         scores = {}
-        metadata: dict = {"judge_model": _JUDGE_MODEL, "_progress": progress}
+        metadata: dict = {"judge_model": judge_model, "_progress": progress}
         for subset_key in _SUBSETS:
             state = progress[subset_key]
             if state["total"]:

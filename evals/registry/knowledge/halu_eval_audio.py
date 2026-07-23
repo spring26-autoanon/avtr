@@ -7,12 +7,11 @@ from datasets.features import Audio
 
 from core.llm_judge import call_gemini
 from core.model_interface import ModelInterface
-from evals.runner import BaseEval, EvalResult
+from evals.runner import BaseEval, DEFAULT_JUDGE_MODEL, EvalResult
 
 logger = logging.getLogger(__name__)
 
 _REPO_ID = "kyutai/HaluEvalAudio_1000"
-_JUDGE_MODEL = "gemini-3.5-flash"
 
 _MODE_SAMPLE_SIZE = {"tiny": 1, "smoke": 5, "sample": 100}  # "full" => all 1000 rows
 
@@ -53,10 +52,10 @@ The answer is incorrect and does not match the standard answer, the score is [In
 _VERDICT_RE = re.compile(r"the score is \[(correct|incorrect)\]", re.IGNORECASE)
 
 
-def _judge(question: str, ground_truth_answer: str, candidate: str) -> bool:
+def _judge(question: str, ground_truth_answer: str, candidate: str, judge_model: str) -> bool:
     formatted_answers = f'["{ground_truth_answer}"]'
     prompt = _JUDGE_PROMPT.format(question=question, valid_answers=formatted_answers, answer=candidate)
-    verdict_text = call_gemini(_JUDGE_MODEL, prompt)
+    verdict_text = call_gemini(judge_model, prompt)
     m = _VERDICT_RE.search(verdict_text)
     if not m:
         raise ValueError(f"Judge response had no parseable verdict: {verdict_text!r}")
@@ -81,6 +80,7 @@ class HaluEvalAudioEval(BaseEval):
 
     def run(self, model: ModelInterface, config: dict, mode: str) -> EvalResult:
         limit = _MODE_SAMPLE_SIZE.get(mode)  # None => full dataset
+        judge_model = config.get("judge", {}).get("model", DEFAULT_JUDGE_MODEL)
 
         prior = config.get("_prior_result")
         progress = (
@@ -113,11 +113,11 @@ class HaluEvalAudioEval(BaseEval):
                 _, text_out, resp_metadata = model.respond(audio_bytes)
                 retrieval_text = resp_metadata.get("retrieval_text", "")
 
-                resp_correct = _judge(question, answer, text_out)
+                resp_correct = _judge(question, answer, text_out, judge_model)
                 # Empty retrieval text can never be judged "Correct" — skip
                 # the API call rather than spend one confirming the obvious
                 # (always true under NullBackend / retrieval-disabled runs).
-                ref_correct = bool(retrieval_text.strip()) and _judge(question, answer, retrieval_text)
+                ref_correct = bool(retrieval_text.strip()) and _judge(question, answer, retrieval_text, judge_model)
 
                 entry.update({
                     "model_response": text_out,
@@ -147,7 +147,7 @@ class HaluEvalAudioEval(BaseEval):
 
         metadata = {
             "n": progress["total"],
-            "judge_model": _JUDGE_MODEL,
+            "judge_model": judge_model,
             "_progress": progress,
         }
 

@@ -1,7 +1,19 @@
 model:
   checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
   retrieval:
     enabled: false
+
+judge:
+  model: gemini-3.5-flash
 
 evals:
   - knowledge.open_audio_bench

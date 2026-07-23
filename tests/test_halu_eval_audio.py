@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from evals.registry.knowledge import halu_eval_audio as hea
-from evals.runner import EvalResult
+from evals.runner import DEFAULT_JUDGE_MODEL, EvalResult
 
 
 # ── _judge ────────────────────────────────────────────────────────────────────
@@ -17,18 +17,18 @@ from evals.runner import EvalResult
 
 def test_judge_parses_correct_verdict():
     with patch.object(hea, "call_gemini", return_value="reasoning... the score is [Correct]"):
-        assert hea._judge("q", "paris", "Paris") is True
+        assert hea._judge("q", "paris", "Paris", DEFAULT_JUDGE_MODEL) is True
 
 
 def test_judge_parses_incorrect_verdict():
     with patch.object(hea, "call_gemini", return_value="reasoning... the score is [Incorrect]"):
-        assert hea._judge("q", "paris", "London") is False
+        assert hea._judge("q", "paris", "London", DEFAULT_JUDGE_MODEL) is False
 
 
 def test_judge_raises_on_unparseable_response():
     with patch.object(hea, "call_gemini", return_value="no verdict here"):
         with pytest.raises(ValueError, match="no parseable verdict"):
-            hea._judge("q", "paris", "London")
+            hea._judge("q", "paris", "London", DEFAULT_JUDGE_MODEL)
 
 
 # ── HaluEvalAudioEval.run() ───────────────────────────────────────────────────
@@ -68,11 +68,21 @@ def test_run_smoke_mode_scores_ref_and_resp():
     assert result.scores["resp_acc"] == 1.0
     assert result.scores["ref_acc"] == 1.0
     assert result.metadata["n"] == 5
-    assert result.metadata["judge_model"] == hea._JUDGE_MODEL
+    assert result.metadata["judge_model"] == DEFAULT_JUDGE_MODEL
     assert result.last_completed_index == 5
     assert result.completed is True
     assert result.errors == []
     assert model.calls == 5
+
+
+def test_run_uses_judge_model_from_config():
+    model = _FakeModel()
+    with patch.object(hea, "_load_rows", side_effect=_fake_rows), \
+         patch.object(hea, "call_gemini", return_value="the score is [Correct]") as mock_call:
+        result = hea.HaluEvalAudioEval().run(model, {"judge": {"model": "custom-judge"}}, "tiny")
+
+    assert result.metadata["judge_model"] == "custom-judge"
+    assert mock_call.call_args[0][0] == "custom-judge"
 
 
 def test_run_tiny_mode_limits_to_one():
@@ -142,7 +152,7 @@ def test_run_resumes_without_recalling_model_for_done_items():
         scores={"ref_acc": 1.0, "resp_acc": 1.0},
         metadata={
             "n": 3,
-            "judge_model": hea._JUDGE_MODEL,
+            "judge_model": DEFAULT_JUDGE_MODEL,
             "_progress": {"total": 3, "correct_ref": 3, "correct_resp": 3},
         },
         completed=False,

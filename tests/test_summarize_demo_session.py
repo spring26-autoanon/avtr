@@ -25,7 +25,7 @@ SESSION_START = {
     "checkpoint": "base",
     "git_hash": "abc1234",
     "timestamp": "2026-01-01T00:00:00Z",
-    "retrieval_backend": {"model": "gemini-3.5-flash", "base_url": "https://example.com"},
+    "retrieval_backend": {"name": "gemini_api", "type": "gemini_api", "model": "gemini-3.5-flash"},
     "rag_timeout_s": 8,
     "stt_mode": "local",
 }

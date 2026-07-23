@@ -4,22 +4,36 @@ _push_instrumentation — pure turn-tracking logic with no moshi/torch
 dependency (those imports are lazy, inside the _patch_* functions and
 main(), so this module imports cleanly without moshi-rag installed).
 
-Does NOT test the six monkeypatches themselves (_patch_server_state,
+Does NOT test five of the six monkeypatches (_patch_server_state,
 _patch_channel, _patch_rag_manager_trigger, _patch_turn_manager,
-_patch_process_reference_text, _patch_rag_manager_background_task) — those
-attach to real moshi-rag classes that aren't available here, and mocking
-them would just encode assumptions about their behavior rather than verify
-against it. That's what VM verification is for (see specs/
-moshirag-evals-requirements.md's Demo section, item 8 of the work plan).
+_patch_rag_manager_background_task) — those attach to real moshi-rag
+classes that aren't available here, and mocking them would just encode
+assumptions about their behavior rather than verify against it. That's
+what VM verification is for (see specs/moshirag-evals-requirements.md's
+Demo section, item 8 of the work plan).
+
+_patch_rag_manager_get_reference_text IS tested below, unlike the other
+five — it attaches to a plain, duck-typed RAGManager-shaped object and
+imports no moshi-rag module at all (only core/retrieval_backend.py's
+format_context()), so it's genuinely exercisable without a real moshi-rag
+install, same discipline as core/model_interface.py's _TimedInferenceJob
+tests. _build_retrieval_backend_for_demo() is tested for the same reason —
+pure core.config/core.retrieval_backend, no moshi import.
 """
 
 import asyncio
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from scripts.instrumented_server import SessionLog, _ChannelState, _push_instrumentation
+from scripts.instrumented_server import (
+    SessionLog,
+    _ChannelState,
+    _build_retrieval_backend_for_demo,
+    _patch_rag_manager_get_reference_text,
+    _push_instrumentation,
+)
 
 
 class _FakeSession:
@@ -500,3 +514,174 @@ def test_push_instrumentation_swallows_send_failures():
         await asyncio.sleep(0)  # must not raise / crash the event loop
 
     asyncio.run(run())
+
+
+# ── _patch_rag_manager_get_reference_text ───────────────────────────────────
+
+
+def _fake_rag_manager():
+    rag_manager = MagicMock()
+    rag_manager._history = []
+    return rag_manager
+
+
+def test_patch_rag_manager_get_reference_text_routes_through_backend(tmp_path):
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.return_value = ("Paris is the capital of France.", 0.02)
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    context, ref_text, elapsed, label = asyncio.run(
+        rag_manager.get_reference_text("user: what is the capital of France?")
+    )
+
+    assert context == "user: what is the capital of France?"
+    assert ref_text == "Paris is the capital of France."
+    assert label == "RetrievalBackend"
+    backend.retrieve.assert_called_once_with(
+        "user: what is the capital of France?", history=rag_manager._history
+    )
+
+
+def test_patch_rag_manager_get_reference_text_appends_to_history(tmp_path):
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.return_value = ("some reference", 0.01)
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    asyncio.run(rag_manager.get_reference_text("user: hello"))
+
+    assert rag_manager._history == [(1, "some reference")]
+
+
+def test_patch_rag_manager_get_reference_text_skips_history_append_on_empty_context(tmp_path):
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.return_value = ("", 0.0)
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    asyncio.run(rag_manager.get_reference_text("no recognizable turn prefix"))
+
+    assert rag_manager._history == []
+
+
+def test_patch_rag_manager_get_reference_text_sets_context_injection_s(tmp_path):
+    """This is what restores a genuine context_injection_s measurement now
+    that the former LLMReferenceGenerator.process_reference_text patch is
+    gone — session.last_context_injection_s is what
+    _patch_rag_manager_background_task reads for retrieval_breakdown_s."""
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.return_value = ("ref", 0.01)
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+
+    assert session.last_context_injection_s is None
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    asyncio.run(rag_manager.get_reference_text("user: hi"))
+
+    assert session.last_context_injection_s is not None
+    assert session.last_context_injection_s >= 0.0
+
+
+def test_patch_rag_manager_get_reference_text_backend_failure_returns_empty(tmp_path):
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.side_effect = RuntimeError("boom")
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    context, ref_text, elapsed, label = asyncio.run(rag_manager.get_reference_text("user: hi"))
+
+    assert ref_text == ""
+    assert rag_manager._history == []
+
+
+def test_patch_rag_manager_get_reference_text_respects_context_formatting(tmp_path):
+    """context_formatting on the backend instance is what makes
+    core/retrieval_backend.py's format_context() drops actually apply here
+    too — a leading moshi: turn is dropped, leaving one real turn (so
+    num_turns == 1 and the history append proceeds)."""
+    session = SessionLog(tmp_path)
+    backend = MagicMock()
+    backend.retrieve.return_value = ("ref", 0.01)
+    backend.context_formatting = {"drop_leading_incomplete_turn": True}
+    rag_manager = _fake_rag_manager()
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    asyncio.run(rag_manager.get_reference_text("moshi: hi there\nuser: what's up"))
+
+    assert rag_manager._history == [(1, "ref")]
+
+
+def test_patch_rag_manager_get_reference_text_threads_history_into_retrieve(tmp_path):
+    """rag_manager._history is a mutable list appended to *after* retrieve()
+    is called — capture a copy at call time, or the later append would also
+    (wrongly) show up in what retrieve() appears to have been called with."""
+    session = SessionLog(tmp_path)
+    captured_history: list = []
+
+    def _fake_retrieve(context, history=None):
+        captured_history.append(list(history) if history is not None else None)
+        return ("new ref", 0.01)
+
+    backend = MagicMock()
+    backend.retrieve.side_effect = _fake_retrieve
+    backend.context_formatting = {}
+    rag_manager = _fake_rag_manager()
+    rag_manager._history.append((1, "prior ref"))
+
+    _patch_rag_manager_get_reference_text(session, rag_manager, backend)
+    asyncio.run(rag_manager.get_reference_text("user: follow-up question"))
+
+    assert captured_history == [[(1, "prior ref")]]
+
+
+# ── _build_retrieval_backend_for_demo ───────────────────────────────────────
+
+
+def test_build_retrieval_backend_for_demo_requires_demo_config(monkeypatch):
+    monkeypatch.delenv("DEMO_CONFIG", raising=False)
+    with pytest.raises(SystemExit):
+        _build_retrieval_backend_for_demo()
+
+
+def test_build_retrieval_backend_for_demo_builds_from_real_config(tmp_path, monkeypatch):
+    from core.retrieval_backend import GeminiAPIBackend
+
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "model:\n  checkpoint: local/whatever\n  retrieval:\n"
+        "    enabled: true\n    backend: gemini_api\n    latency_gate_ms: 5000\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    monkeypatch.setenv("DEMO_CONFIG", str(cfg))
+
+    backend, display = _build_retrieval_backend_for_demo()
+
+    assert isinstance(backend, GeminiAPIBackend)
+    assert display == {"name": "gemini_api", "type": "gemini_api", "model": "gemini-3.5-flash"}
+
+
+def test_build_retrieval_backend_for_demo_disabled_retrieval_returns_null_backend(tmp_path, monkeypatch):
+    from core.retrieval_backend import NullBackend
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "model:\n  checkpoint: local/whatever\n  retrieval:\n    enabled: false\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    monkeypatch.setenv("DEMO_CONFIG", str(cfg))
+
+    backend, display = _build_retrieval_backend_for_demo()
+
+    assert isinstance(backend, NullBackend)
+    assert display == {"name": "null", "type": "null_backend"}

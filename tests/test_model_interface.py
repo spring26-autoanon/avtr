@@ -3,7 +3,15 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from core.model_interface import ModelInterface, StubModelAdapter, _TimedInferenceJob, _clean_model_text, _silent_wav
+from core.model_interface import (
+    ModelInterface,
+    MoshiRAGAdapter,
+    StubModelAdapter,
+    _DEFAULT_GENERATION,
+    _TimedInferenceJob,
+    _clean_model_text,
+    _silent_wav,
+)
 from core.retrieval_backend import NullBackend
 
 
@@ -102,6 +110,33 @@ def test_stub_respond_with_null_backend():
 
 def test_stub_is_model_interface():
     assert isinstance(StubModelAdapter(), ModelInterface)
+
+
+# ── MoshiRAGAdapter generation dict ─────────────────────────────────────────
+# _load_models() needs a real GPU/moshi environment — patched to a no-op so
+# these exercise only the config-merging behavior, not model loading.
+
+
+def test_moshi_rag_adapter_generation_defaults(monkeypatch):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    adapter = MoshiRAGAdapter("some/checkpoint")
+    assert adapter._generation == _DEFAULT_GENERATION
+
+
+def test_moshi_rag_adapter_generation_overrides_merge_over_defaults(monkeypatch):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    adapter = MoshiRAGAdapter("some/checkpoint", generation={"rag_timeout": 12.0})
+    assert adapter._generation["rag_timeout"] == 12.0
+    # Every other field keeps its default — a config omitting a field
+    # doesn't need to specify all of them.
+    assert adapter._generation["cfg_coef"] == _DEFAULT_GENERATION["cfg_coef"]
+    assert adapter._generation["tail_silence_steps"] == _DEFAULT_GENERATION["tail_silence_steps"]
+
+
+def test_moshi_rag_adapter_generation_none_uses_defaults(monkeypatch):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    adapter = MoshiRAGAdapter("some/checkpoint", generation=None)
+    assert adapter._generation == _DEFAULT_GENERATION
 
 
 # ── _TimedInferenceJob retrieval diagnostics ──────────────────────────────────

@@ -146,6 +146,28 @@ def test_build_model_stub_with_null_backend(tmp_path):
     assert isinstance(text, str)
 
 
+def test_build_model_stub_with_retrieval_enabled_uses_resolved_backend(tmp_path, monkeypatch):
+    """build_model() must actually respect model.retrieval.backend, not
+    always construct GeminiAPIBackend directly regardless of what it said —
+    the dead-field bug this factory fixes."""
+    from core.config import load_config
+    from core.retrieval_backend import GeminiAPIBackend
+
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key-for-test")
+    cfg_file = tmp_path / "cfg.yaml"
+    cfg_file.write_text(
+        "model:\n  checkpoint: stub\n  adapter: stub\n  retrieval:\n"
+        "    enabled: true\n    backend: gemini_api\n    latency_gate_ms: 5000\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    cfg = load_config(str(cfg_file))
+    model = build_model(cfg)
+    assert isinstance(model, StubModelAdapter)
+    assert isinstance(model.retrieval_backend, GeminiAPIBackend)
+    assert model.retrieval_backend.model == "gemini-3.5-flash"
+    assert model.retrieval_backend.latency_gate_ms == 5000
+
+
 # ── write_results / find_partial_result ───────────────────────────────────────
 
 

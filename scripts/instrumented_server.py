@@ -1,11 +1,13 @@
-"""Thin, logging-only instrumentation wrapper around moshi-rag's real
-`moshi.server` — see specs/moshirag-evals-requirements.md's "Session
-instrumentation" section.
+"""Instrumentation wrapper around moshi-rag's real `moshi.server` — see
+specs/moshirag-evals-requirements.md's "Session instrumentation" section.
 
 Forwards every CLI arg through to moshi.server.main() unchanged (that
 function reads sys.argv itself via argparse; this script never touches
 sys.argv). Before calling it, patches a handful of moshi-rag classes to
-observe and log per-turn instrumentation — none of this touches
+observe/log per-turn instrumentation and — one deliberate, bounded
+exception to "logging only", see _patch_rag_manager_get_reference_text
+below — to actually redirect retrieval through the same
+core/retrieval_backend.py RetrievalBackend evals use. None of this touches
 Channel.run()/_output_loop()/_recv_loop() or RAGManager.trigger()'s control
 flow. Patches, in order of "how invasive":
 
@@ -16,7 +18,17 @@ flow. Patches, in order of "how invasive":
                                      patch's own docstring for why this
                                      replaced an initial attempt to wrap
                                      Channel.opus_writer.append_pcm directly
-  - Channel.__init__                leaf wrap: per-connection state
+  - Channel.__init__                leaf wrap: per-connection state, plus
+                                     installs the per-RAGManager-instance
+                                     get_reference_text patch below, right
+                                     where self.rag_manager becomes available
+  - RAGManager.get_reference_text   per-instance replacement (NOT a wrap):
+                                     routes real retrieval through the same
+                                     RetrievalBackend evals use, bypassing
+                                     moshi's native LLMReferenceGenerator
+                                     entirely — see
+                                     _patch_rag_manager_get_reference_text's
+                                     own docstring for the full rationale
   - RAGManager.trigger              leaf wrap: detect <ret> -> rag_triggered
                                      (every real call site — Channel's own
                                      output loop and InferenceJob/respond()'s
@@ -29,7 +41,6 @@ flow. Patches, in order of "how invasive":
   - TurnManager._update_active_speaker  leaf wrap: detect end-of-user-utterance
                                      (this is the ttfat clock start and the
                                      turn boundary)
-  - LLMReferenceGenerator.process_reference_text  leaf wrap: context_injection_s
   - RAGManager._background_task     whole-method patch (same class of change
                                      as model_interface.py's _patch_output_loop):
                                      needs internal timestamps (asr_wait_s
@@ -39,6 +50,15 @@ flow. Patches, in order of "how invasive":
                                      body below is a verbatim copy of the
                                      real one with three time.perf_counter()
                                      calls and one session callback added.
+                                     context_injection_s now comes from the
+                                     get_reference_text patch's own timed,
+                                     redundant format_context() call (see
+                                     that patch's docstring) rather than a
+                                     separate LLMReferenceGenerator.process_reference_text
+                                     patch — that patch is removed entirely,
+                                     since process_reference_text is never
+                                     reached once get_reference_text bypasses
+                                     LLMReferenceGenerator for real retrieval.
 
 Each _ChannelState hook (on_ret_triggered/on_retrieval_complete/
 on_first_audio) also pushes the newly-known fields to the browser as they
@@ -103,6 +123,13 @@ Required environment variables (set by scripts/run_demo.sh):
   DEMO_SESSION_DIR   directory to write turns.jsonl/raw_events.jsonl into
                       (must already exist)
   DEMO_CHECKPOINT    checkpoint alias/name, for the session_start record
+  DEMO_CONFIG        path to the same YAML config shape evals/runner.py
+                      uses — loaded directly in Python (unlike
+                      LLM_BASE_URL/LLM_MODEL_NAME/generation CLI flags,
+                      which scripts/print_demo_env.py translates into shell
+                      env/CLI args ahead of time) to build the one
+                      RetrievalBackend instance _patch_rag_manager_get_reference_text
+                      routes retrieval through
 """
 
 import asyncio
@@ -337,11 +364,14 @@ class SessionLog:
         # registers both under the same _ChannelState.
         self._by_rag_manager_id: dict[int, _ChannelState] = {}
         self._by_turn_manager_id: dict[int, _ChannelState] = {}
-        # process_reference_text runs inside the same asyncio task as the
-        # _background_task call that invoked it, so — since this demo is
+        # Set by _patch_rag_manager_get_reference_text's timed, redundant
+        # format_context() call, read by _patch_rag_manager_background_task
+        # for retrieval_breakdown_s.context_injection_s. Both run inside the
+        # same asyncio task (the get_reference_text call happens directly
+        # inside _background_task's body), so — since this demo is
         # single-session by design (see spec's Explicitly Out of Scope) and
         # asyncio is single-threaded/cooperative — a plain module-level slot
-        # is enough to hand its timing back without a contextvar. Would need
+        # is enough to hand the timing back without a contextvar. Would need
         # revisiting if concurrent multi-channel retrieval is ever supported.
         self.last_context_injection_s: float | None = None
 
@@ -410,7 +440,15 @@ class SessionLog:
         return self._channel_states.get(id(channel))
 
 
-def _patch_server_state(session: SessionLog, checkpoint: str) -> None:
+def _patch_server_state(session: SessionLog, checkpoint: str, retrieval_backend_display: dict) -> None:
+    """
+    retrieval_backend_display (core/retrieval_backend.py's describe_backend()
+    output) is computed once in main() and passed in here — NOT read from
+    LLM_MODEL_NAME/LLM_BASE_URL env vars, which are otherwise-vestigial
+    (see scripts/print_demo_env.py's own docstring on why they're still set
+    at all) and don't necessarily reflect the real backend answering
+    retrieval once _patch_rag_manager_get_reference_text is active.
+    """
     from moshi.server import ServerState
 
     original_init = ServerState.__init__
@@ -419,10 +457,7 @@ def _patch_server_state(session: SessionLog, checkpoint: str) -> None:
         original_init(self, *args, **kwargs)
         session.write_session_start(
             checkpoint=checkpoint,
-            retrieval_backend={
-                "model": os.environ.get("LLM_MODEL_NAME", ""),
-                "base_url": os.environ.get("LLM_BASE_URL", ""),
-            },
+            retrieval_backend=retrieval_backend_display,
             rag_timeout_s=self.rag_timeout,
             stt_mode="gradium" if self.gradium_stt else "local",
         )
@@ -461,7 +496,83 @@ def _patch_deliver_step_row(session: SessionLog) -> None:
     ServerState._deliver_step_row = patched
 
 
-def _patch_channel(session: SessionLog) -> None:
+def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retrieval_backend) -> None:
+    """
+    Per-instance replacement (not a wrap) of one RAGManager's
+    get_reference_text — routes the demo's actual retrieval call through
+    the same core/retrieval_backend.py RetrievalBackend evals use, ported
+    near-verbatim from core/model_interface.py's _patch_rag_manager (same
+    signature: context: str -> (context, ref_text, elapsed, backend_label)).
+
+    Why a real behavioral patch, not just logging: moshi-rag's own
+    LLMReferenceGenerator only ever offers a choice between two bundled
+    canned prompt templates (original/simplified, via prompt_style) — there
+    is no way to point it at our own prompt_template file or
+    context_formatting settings without forking it. Routing the demo
+    through the exact same RetrievalBackend instance (same registry-selected
+    backend, same prompt file) evals use is the only way to get genuine
+    prompt/backend parity between the two paths — not an equivalent
+    mechanism, the literal same code path. See specs/
+    moshirag-evals-requirements.md's "On prompt parity with the demo path"
+    note for the full rationale and what's given up (moshi's native
+    multi-provider live-switching UI, MOSHI_RETRIEVAL_LLMS_JSON — a
+    documented future extension point on core/retrieval_backend.py's
+    registry instead, not implemented here).
+
+    RAGManager is a plain Python object, not the PyO3-native kind
+    instance-patching can't touch (see _patch_deliver_step_row's docstring
+    for that lesson), and Channel constructs its own fresh RAGManager per
+    connection exactly like InferenceJob does — confirmed directly against
+    real inference_utils/channel.py and inference_utils/rag_manager.py
+    source. Installed from _patch_channel's patched_init, right where
+    self.rag_manager becomes available.
+
+    Reference-history bookkeeping, mirroring moshi's own unpatched
+    RAGManager.get_reference_text: after retrieval_backend.retrieve()
+    returns, this calls core/retrieval_backend.py's format_context() a
+    second, redundant time with the same inputs retrieve() already used
+    internally — pure and stateless, so recomputing costs the same as the
+    original call — purely to recover num_turns, then does
+    rag_manager._history.append((num_turns, reference_text)) exactly like
+    moshi's real source does. That redundant call is timed and reported as
+    session.last_context_injection_s — the same field
+    _patch_rag_manager_background_task already reads for
+    retrieval_breakdown_s.context_injection_s, restoring a genuine
+    measurement now that the former LLMReferenceGenerator.process_reference_text
+    patch (removed — never reached anymore) no longer sets it.
+    """
+    from core.retrieval_backend import format_context
+
+    async def _patched_get_reference_text(context: str) -> tuple[str, str, float, str]:
+        t0 = time.perf_counter()
+        try:
+            ref_text, latency = retrieval_backend.retrieve(context, history=rag_manager._history)
+        except Exception as exc:
+            logger.warning("RetrievalBackend.retrieve() failed: %s", exc)
+            ref_text, latency = "", 0.0
+        elapsed = time.perf_counter() - t0
+
+        t_fmt0 = time.perf_counter()
+        context_formatting = getattr(retrieval_backend, "context_formatting", {})
+        _, num_turns = format_context(context, rag_manager._history, **context_formatting)
+        session.last_context_injection_s = time.perf_counter() - t_fmt0
+        if num_turns > 0 and ref_text:
+            rag_manager._history.append((num_turns, ref_text))
+
+        # Distinct "[RetrievalBackend]" tag so this doesn't get confused
+        # with moshi's own "[Reference] Triggering retrieval with
+        # context_len=N snippet='...'" line — that one only shows a
+        # truncated tail of context and never logs what came back.
+        logger.info(
+            "[RetrievalBackend] context=%r -> reference_text=%r (backend_latency=%.3fs)",
+            context, ref_text, latency,
+        )
+        return context, ref_text, elapsed, "RetrievalBackend"
+
+    rag_manager.get_reference_text = _patched_get_reference_text
+
+
+def _patch_channel(session: SessionLog, retrieval_backend, retrieval_backend_display: dict) -> None:
     from moshi.inference_utils.channel import Channel
 
     original_init = Channel.__init__
@@ -470,14 +581,9 @@ def _patch_channel(session: SessionLog) -> None:
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         session.register_channel(self)
+        _patch_rag_manager_get_reference_text(session, self.rag_manager, retrieval_backend)
 
-        _push_session_info(
-            self,
-            retrieval_backend={
-                "model": os.environ.get("LLM_MODEL_NAME", ""),
-                "base_url": os.environ.get("LLM_BASE_URL", ""),
-            },
-        )
+        _push_session_info(self, retrieval_backend=retrieval_backend_display)
         # ttfat_s's first-audio-frame signal comes from a separate patch on
         # ServerState._deliver_step_row (see _patch_deliver_step_row below),
         # not from wrapping self.opus_writer.append_pcm here — that was tried
@@ -584,20 +690,6 @@ def _patch_turn_manager(session: SessionLog) -> None:
     TurnManager.handle_spoken_text = patched_handle_spoken_text
 
 
-def _patch_process_reference_text(session: SessionLog) -> None:
-    from moshi.reference.llm_reference_generator import LLMReferenceGenerator
-
-    original = LLMReferenceGenerator.process_reference_text
-
-    def patched(self, context, history):
-        t0 = time.perf_counter()
-        result = original(self, context, history)
-        session.last_context_injection_s = time.perf_counter() - t0
-        return result
-
-    LLMReferenceGenerator.process_reference_text = patched
-
-
 def _patch_rag_manager_background_task(session: SessionLog) -> None:
     """Whole-method patch, not a wrap — same class of change as
     core/model_interface.py's _patch_output_loop, and for the same reason:
@@ -653,14 +745,47 @@ def _patch_rag_manager_background_task(session: SessionLog) -> None:
     RAGManager._background_task = patched_background_task
 
 
-def apply_patches(session: SessionLog, checkpoint: str) -> None:
-    _patch_server_state(session, checkpoint)
+def apply_patches(
+    session: SessionLog,
+    checkpoint: str,
+    retrieval_backend,
+    retrieval_backend_display: dict,
+) -> None:
+    _patch_server_state(session, checkpoint, retrieval_backend_display)
     _patch_deliver_step_row(session)
-    _patch_channel(session)
+    _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
-    _patch_process_reference_text(session)
     _patch_rag_manager_background_task(session)
+
+
+def _build_retrieval_backend_for_demo() -> tuple[object, dict]:
+    """
+    Loads DEMO_CONFIG (same YAML shape evals/runner.py uses) and builds the
+    one RetrievalBackend instance + describe_backend() display dict shared
+    across every connection/turn in this server process — see module
+    docstring and core/retrieval_backend.py's build_backend_from_retrieval_config().
+    """
+    config_path = os.environ.get("DEMO_CONFIG")
+    if not config_path:
+        print("DEMO_CONFIG must be set (run via scripts/run_demo.sh)", file=sys.stderr)
+        sys.exit(1)
+
+    from core.config import load_config
+    from core.retrieval_backend import build_backend_from_retrieval_config, describe_backend
+
+    config = load_config(config_path)
+    retrieval_cfg = config.get("model", {}).get("retrieval", {})
+    retrieval_backend = build_backend_from_retrieval_config(retrieval_cfg)
+
+    backend_name = retrieval_cfg.get("backend")
+    backend_def = retrieval_cfg.get("_resolved_backend")
+    if backend_name and backend_def is not None:
+        retrieval_backend_display = describe_backend(backend_name, backend_def)
+    else:
+        retrieval_backend_display = {"name": "null", "type": "null_backend"}
+
+    return retrieval_backend, retrieval_backend_display
 
 
 def main() -> None:
@@ -673,9 +798,11 @@ def main() -> None:
         print(f"DEMO_SESSION_DIR does not exist: {session_dir}", file=sys.stderr)
         sys.exit(1)
 
+    retrieval_backend, retrieval_backend_display = _build_retrieval_backend_for_demo()
+
     checkpoint = os.environ.get("DEMO_CHECKPOINT", "unknown")
     session = SessionLog(session_dir)
-    apply_patches(session, checkpoint)
+    apply_patches(session, checkpoint, retrieval_backend, retrieval_backend_display)
 
     import torch
     import moshi.server

@@ -4,8 +4,9 @@
 # Launches two services in a tmux session "demo":
 #   window 0 (conditioner): reference encoder conditioner on port 8001
 #   window 1 (server):      moshi-rag main server on port 8998, wrapped by
-#                            scripts/instrumented_server.py (narrow,
-#                            logging-only patch — see that file's own
+#                            scripts/instrumented_server.py (mostly a narrow
+#                            logging patch, plus one deliberate retrieval-
+#                            routing exception — see that file's own
 #                            docstring), serving the built demo/client/ fork
 #
 # Each launch (except --conditioner-only) creates a fresh session directory
@@ -22,18 +23,25 @@
 #   Then open http://localhost:8998 in your browser.
 #
 # Usage:
-#   bash scripts/run_demo.sh [--checkpoint <alias>] [--stt local|gradium] [--rag-timeout <seconds>] [--conditioner-only]
+#   bash scripts/run_demo.sh [--checkpoint <alias>] [--stt local|gradium] [--config <path>] [--rag-timeout <seconds>] [--conditioner-only]
 #
 # Options:
 #   --checkpoint  Checkpoint alias from configs/checkpoints.yaml (default: base)
 #   --stt         local  = moshi built-in STT, no credentials needed (default)
 #                 gradium = Gradium streaming ASR, lower latency, requires
 #                           STT_URL and STT_API_KEY in .env
-#   --rag-timeout Seconds to wait for the retrieval LLM before giving up
-#                 (default: 8). moshi.server's own default is 1.5s, which
-#                 CLAUDE.md's Phase 0 prodcheck investigation confirmed is
-#                 shorter than real Gemini round-trip latency (observed
-#                 2.5-3s) — the default here is raised accordingly. See
+#   --config      Path to the same YAML config shape evals/runner.py uses
+#                 (default: configs/baseline_with_retrieval.yaml). Derives
+#                 the retrieval backend's env vars and the model.generation
+#                 block's CLI flags via scripts/print_demo_env.py — see
+#                 specs/moshirag-evals-requirements.md's "Config-derived
+#                 environment" section under "Demo" for the full design.
+#   --rag-timeout Explicit override for the retrieval-LLM timeout, layered
+#                 on top of whatever --config's model.generation.rag_timeout
+#                 produced (default: unset, config value wins). moshi.server's
+#                 own hardcoded default is 1.5s, which CLAUDE.md's Phase 0
+#                 prodcheck investigation confirmed is shorter than real
+#                 Gemini round-trip latency (observed 2.5-3s) — see
 #                 CLAUDE.md's retrieval-latency notes before lowering this.
 #   --conditioner-only  Launch only server_conditioner (port 8001), skip
 #                 moshi.server entirely. For pointing evals/runner.py at a
@@ -60,15 +68,17 @@ cd "$PROJECT_DIR"
 # ── Defaults ─────────────────────────────────────────────────────────────────
 CHECKPOINT_ALIAS=base
 STT_MODE=local
-RAG_TIMEOUT=8
+CONFIG_PATH=configs/baseline_with_retrieval.yaml
+RAG_TIMEOUT_OVERRIDE=""
 CONDITIONER_ONLY=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --checkpoint)       CHECKPOINT_ALIAS="$2"; shift 2 ;;
-        --stt)              STT_MODE="$2";         shift 2 ;;
-        --rag-timeout)      RAG_TIMEOUT="$2";       shift 2 ;;
-        --conditioner-only) CONDITIONER_ONLY=1;     shift 1 ;;
+        --checkpoint)       CHECKPOINT_ALIAS="$2";       shift 2 ;;
+        --stt)              STT_MODE="$2";               shift 2 ;;
+        --config)           CONFIG_PATH="$2";            shift 2 ;;
+        --rag-timeout)      RAG_TIMEOUT_OVERRIDE="$2";   shift 2 ;;
+        --conditioner-only) CONDITIONER_ONLY=1;           shift 1 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -105,11 +115,21 @@ TOKENIZER=$(ls "$CKPT"/*.model 2>/dev/null | head -1)
 [[ -f "$MIMI_WEIGHT"  ]] || { echo "tokenizer safetensors not found at $CKPT" >&2; exit 1; }
 [[ -f "$TOKENIZER"    ]] || { echo "tokenizer .model not found at $CKPT" >&2; exit 1; }
 
+# ── Config-derived environment (LLM_BASE_URL/LLM_MODEL_NAME/LLM_API_KEY,
+# DEMO_GENERATION_FLAGS) ───────────────────────────────────────────────────
+# See scripts/print_demo_env.py's own docstring and specs/
+# moshirag-evals-requirements.md's "Config-derived environment" section for
+# why LLM_BASE_URL/LLM_MODEL_NAME/LLM_API_KEY are needed at all (vestigial —
+# only to keep ServerState.warmup() from raising) and why
+# MOSHI_RETRIEVAL_LLMS_JSON is deliberately never set.
+echo "Deriving environment from '$CONFIG_PATH'..."
+eval "$(uv run --all-extras python scripts/print_demo_env.py --config "$CONFIG_PATH")"
+
 # ── Build env prefix (passed into each tmux window) ──────────────────────────
 ENV_PREFIX="REFERENCE_ENCODER_URL=http://localhost:8001"
-ENV_PREFIX+=" LLM_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/"
-ENV_PREFIX+=" LLM_API_KEY=$GEMINI_API_KEY"
-ENV_PREFIX+=" LLM_MODEL_NAME=gemini-3.5-flash"
+ENV_PREFIX+=" LLM_BASE_URL=$LLM_BASE_URL"
+ENV_PREFIX+=" LLM_API_KEY=$LLM_API_KEY"
+ENV_PREFIX+=" LLM_MODEL_NAME=$LLM_MODEL_NAME"
 ENV_PREFIX+=" OPENAI_API_KEY=$GEMINI_API_KEY"
 
 if [[ "$STT_MODE" == "gradium" ]]; then
@@ -157,7 +177,7 @@ echo "Building web client (demo/client/)..."
 CLIENT_DIST="$PROJECT_DIR/demo/client/dist"
 [[ -f "$CLIENT_DIST/index.html" ]] || { echo "Client build did not produce $CLIENT_DIST/index.html" >&2; exit 1; }
 
-SERVER_CMD="$ENV_PREFIX DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKPOINT_ALIAS' \
+SERVER_CMD="$ENV_PREFIX DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKPOINT_ALIAS' DEMO_CONFIG='$CONFIG_PATH' \
   uv run --all-extras python scripts/instrumented_server.py \
   --moshi-weight '$MOSHI_WEIGHT' \
   --mimi-weight '$MIMI_WEIGHT' \
@@ -165,9 +185,13 @@ SERVER_CMD="$ENV_PREFIX DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKP
   --device cuda \
   --port 8998 \
   --init-active-speaker model \
-  --rag-timeout $RAG_TIMEOUT \
+  $DEMO_GENERATION_FLAGS \
   --static '$CLIENT_DIST'"
 
+# Explicit --rag-timeout, if given, is appended last so it wins over
+# whatever $DEMO_GENERATION_FLAGS produced (argparse: later flag wins) —
+# an ad-hoc override layered on top of the config, not the sole source.
+[[ -n "$RAG_TIMEOUT_OVERRIDE" ]] && SERVER_CMD+=" --rag-timeout $RAG_TIMEOUT_OVERRIDE"
 [[ "$STT_MODE" == "gradium" ]] && SERVER_CMD+=" --gradium-stt"
 
 # ── Launch tmux session ───────────────────────────────────────────────────────
@@ -184,8 +208,10 @@ tmux send-keys -t "$SESSION:server" \
     "cd $PROJECT_DIR && echo 'Waiting 20s for conditioner to load...' && sleep 20 && $SERVER_CMD 2>&1 | tee '$SESSION_DIR/server.log'" Enter
 
 # ── Instructions ─────────────────────────────────────────────────────────────
+RAG_TIMEOUT_NOTE="from $CONFIG_PATH"
+[[ -n "$RAG_TIMEOUT_OVERRIDE" ]] && RAG_TIMEOUT_NOTE="${RAG_TIMEOUT_OVERRIDE}s (--rag-timeout override)"
 echo ""
-echo "Demo launching in tmux session '$SESSION' (STT: $STT_MODE, rag-timeout: ${RAG_TIMEOUT}s)."
+echo "Demo launching in tmux session '$SESSION' (STT: $STT_MODE, config: $CONFIG_PATH, rag-timeout: $RAG_TIMEOUT_NOTE)."
 echo ""
 echo "  tmux attach -t $SESSION              — watch all logs"
 echo "  tmux select-window -t $SESSION:0     — conditioner (port 8001)"

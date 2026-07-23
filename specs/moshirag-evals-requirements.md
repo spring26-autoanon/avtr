@@ -59,14 +59,28 @@ for any path.
   `checkpoint.py`, `config.py`) as the shared abstraction layer evals
   build on — `MoshiRAGAdapter` drives real `ServerState`/`InferenceJob`
   classes directly, not a WebSocket client of `moshi.server`
-- Apply the same narrow, documented, logging-only patch technique already
-  used for `respond()`'s `RAGManager` instrumentation
+- Apply the same narrow, documented, evidence-backed `RAGManager` patch
+  technique already used for `respond()`'s retrieval routing
   (`model_interface.py`'s `_patch_rag_manager`) to the demo's
-  `moshi.server` process too, via `scripts/instrumented_server.py` — for
-  eval-parity session logging and to feed the live client UI (see "Demo"
-  below). This is additive logging only; it does not touch
-  `trigger()`/step-loop/`Channel` control flow, so it fits the same
-  allowance as the bullet above, not an exception to it
+  `moshi.server` process too, via `scripts/instrumented_server.py`. Most of
+  `instrumented_server.py`'s patches are additive logging only (see
+  "Session instrumentation" below) — but its `RAGManager.get_reference_text`
+  patch is a **deliberate, bounded exception to "logging only"**: it
+  redirects the demo's actual retrieval call through the same
+  `core/retrieval_backend.py` `RetrievalBackend` (same registry-selected
+  backend, same prompt template) evals use, bypassing moshi's native
+  `LLMReferenceGenerator` for real retrieval entirely — the only way to get
+  genuine prompt/backend parity between the demo and evals, since
+  `LLMReferenceGenerator` only ever offers a choice between two bundled
+  canned templates, not arbitrary prompt text (confirmed against real
+  `kyutai-labs/moshi-rag` source — see "Session instrumentation" below for
+  the full rationale and what's given up). It still does not touch
+  `trigger()`/step-loop/`Channel` control flow — only what happens one call
+  deeper, inside `RAGManager._background_task`'s existing call to
+  `get_reference_text` — so it fits the same "narrow, documented,
+  evidence-backed patch" allowance as the bullet above, just not the
+  "additive logging only" framing that used to describe every
+  `instrumented_server.py` patch uniformly
 - Align the demo's per-turn instrumentation with the same three latency
   definitions specified for evals/registry/latency (`ttfat`, `e2ekd`,
   `retrieval_breakdown`), rather than inventing new ones — see "Session
@@ -108,6 +122,7 @@ moshirag-evals/
     results/
   scripts/
     run_demo.sh
+    print_demo_env.py
     instrumented_server.py
     summarize_demo_session.py
   demo/
@@ -117,6 +132,10 @@ moshirag-evals/
     baseline_no_retrieval.yaml
     baseline_with_retrieval.yaml
     checkpoints.yaml
+    retrieval_backends.yaml
+    prompts/
+      retrieval_reference_simple.txt
+      retrieval_reference_moshi_style.txt
   pyproject.toml
   uv.lock
   Makefile
@@ -164,23 +183,216 @@ aliases:
 - Concrete class `MoshiRAGAdapter(ModelInterface)` that:
   - Accepts a checkpoint path or GCS URI resolved via `core/checkpoint.py`
   - Accepts a retrieval backend instance or `None`
+  - Accepts a `generation: dict` of the model/inference-behavior parameters
+    listed under "Generation parameters" below — any field omitted falls
+    back to the same default that was previously hardcoded, so configs
+    written before this existed (or a bare `StubModelAdapter`/`tiny` run)
+    keep working unchanged
   - Requires a real, separately launched `server_conditioner` process — conditioning is never in-process. Raises at construction if `REFERENCE_ENCODER_URL` is unset
   - Exposes timing metadata in the returned `metadata` dict including first audio token timestamp
   - **Important:** MoshiRAG runs two parallel token streams simultaneously — an inner monologue text channel and an audio output channel. The adapter must capture both. Read the MoshiRAG repo `run_inference.py` before implementing this class — that script is the ground-truth inference path the paper used, and the adapter must match it exactly before adding instrumentation on top
   - `respond(audio_in: bytes) -> tuple[bytes, str, dict]` is batch mode only (complete audio bytes in, complete audio bytes out) — used by evals. There is no streaming variant: the demo is served entirely by moshi.server directly, not through this adapter
 - No eval logic lives here — this is purely model I/O
 
+#### Generation parameters
+
+Every parameter below directly affects MoshiRAG's generation behavior and
+was previously hardcoded inside `MoshiRAGAdapter._load_models()`'s
+`argparse.Namespace` construction — invisible from any config file. They
+now live in a config's `model.generation` block (see "Configs" below) and
+are passed through to `MoshiRAGAdapter` as a `dict`. Field names match
+`moshi.server`'s own CLI flag names (underscores vs. hyphens) exactly —
+confirmed directly against `kyutai-labs/moshi-rag`'s `server.py` argparse
+block — so `scripts/print_demo_env.py` (see "Demo" below) can translate
+this same block into the demo's CLI flags with a pure name transform, no
+per-field mapping table:
+
+| Config field | Maps to (eval) | Maps to (demo CLI flag) | Default |
+|---|---|---|---|
+| `cfg_coef` | `InferenceJob` args | `--cfg-coef` | `1.0` |
+| `stt_wait_time` | `InferenceJob` args | `--stt-wait-time` | `0.5` |
+| `rag_timeout` | `InferenceJob` args | `--rag-timeout` | `8.0` |
+| `max_reference_tokens` | `InferenceJob` args | `--max-reference-tokens` | `64` |
+| `vad_window_size` | `InferenceJob` args | `--vad-window-size` | `4` |
+| `vad_threshold` | `InferenceJob` args | `--vad-threshold` | `0.5` |
+| `power_threshold` | `InferenceJob` args | `--power-threshold` | `-65` |
+| `tail_silence_steps` | `_TAIL_SILENCE_STEPS` (eval-only) | n/a | `25` |
+
+`batch_size` and `init_active_speaker` are deliberately **not** part of
+this shared block — they're structural/path-specific, not
+performance-affecting knobs comparable across paths: evals always run
+`batch_size=1` (one question at a time, offline) while the demo needs
+headroom for concurrent live sessions (moshi's own default is `16`), and
+evals start `init_active_speaker="user"` (immediately feeding a question)
+while the demo starts `init_active_speaker="model"` (model greets first).
+Both stay hardcoded/CLI-only per path, same as today.
+
+`tail_silence_steps` has no demo equivalent — it's `respond()`'s own
+silence-based turn-termination mechanism (see CLAUDE.md's `_TAIL_SILENCE_STEPS`
+notes), not something `moshi.server`'s live, continuous session model needs.
+
 ### `core/retrieval_backend.py`
 
 - Abstract base class `RetrievalBackend` with method:
-  `retrieve(context: str) -> tuple[str, float]` returning `(reference_text, latency_seconds)`
+  `retrieve(context: str, history: list[tuple[int, str]] | None = None) -> tuple[str, float]`
+  returning `(reference_text, latency_seconds)`. `history` is optional and
+  defaults to `None` — see "Context formatting" below for what it's for and
+  why the eval path never passes one
+- `BACKEND_REGISTRY: dict[str, type[RetrievalBackend]]` and
+  `build_retrieval_backend(name: str, backend_def: dict, latency_gate_ms: int | None) -> RetrievalBackend`
+  — a factory keyed by the `type` field of a resolved entry from
+  `configs/retrieval_backends.yaml` (see "Configs" below). This is what
+  makes a config's `model.retrieval.backend` selection actually take
+  effect — previously `evals/runner.py`'s `build_model()` always
+  constructed `GeminiAPIBackend` directly whenever retrieval was enabled,
+  regardless of what `backend:` said, a dead field. Raises on an unknown
+  `type`. Called from **both** `evals/runner.py`'s `build_model()` and
+  `scripts/instrumented_server.py`'s `main()` (see "Session
+  instrumentation" below) — the same factory, the same
+  `configs/retrieval_backends.yaml`, builds the backend instance for
+  whichever path is running, which is what makes eval and demo retrieval
+  genuinely the same code rather than independently-configured
+  approximations of each other. This registry is also the intended
+  extension point for a future closed/local backend (e.g. an
+  OpenAI-compatible HTTP endpoint for a self-hosted LLM, or a RAG server
+  over raw markdown) — not implemented now, since no such backend exists
+  yet to build or test against, but any future backend registers here and
+  becomes selectable purely via config, with no changes needed to either
+  caller. It's also the natural place to eventually add live,
+  user-switchable backend selection for production (mirroring moshi-rag's
+  own native multi-provider mechanism and its already-built, currently
+  dormant client UI — see "Not emitted, deliberately:
+  `MOSHI_RETRIEVAL_LLMS_JSON`" under `scripts/run_demo.sh` above) — also
+  not implemented now
+- `describe_backend(name: str, backend_def: dict) -> dict` — a small,
+  pure helper returning a display-safe summary of a resolved backend
+  definition (`{"name": ..., "type": ..., "model": ...}`, plus
+  `"base_url"` only if the backend definition has one — `gemini_api`
+  entries don't). Never includes a secret value (`api_key_env` only names
+  an env var, never its value, so it's already safe, but isn't included
+  either since it's not identifying information). Exists specifically so
+  `scripts/instrumented_server.py` has **one** place to compute "what
+  backend is this session using" for display, instead of two independent
+  copies — see "Session instrumentation" below for the bug this fixes
 - Concrete class `GeminiAPIBackend(RetrievalBackend)` that:
   - Calls Gemini API with conversation context
   - Records and returns latency of every call
   - Raises `LatencyGateError` if latency exceeds configurable `latency_gate_ms`
   - Logs every call duration regardless of whether gate is breached
   - Retries failed calls up to 3 times with exponential backoff before raising
-- `NullBackend(RetrievalBackend)` that returns empty string immediately, used for Config A (no retrieval)
+  - Reads its prompt template from the file named by its backend
+    definition's `prompt_template` field (defaults to
+    `configs/prompts/retrieval_reference_simple.txt`, the current
+    hardcoded prompt text extracted verbatim) rather than a string literal
+    in the class — same file-based-template convention moshi-rag's own
+    `LLMReferenceGenerator` uses for its bundled prompts
+  - Before formatting the prompt, passes `context`/`history` through
+    `format_context()` (see "Context formatting" below) using its own
+    backend definition's `context_formatting` settings, then substitutes
+    the result into the template's `{context}` placeholder. If the
+    resulting `num_turns` is `0` (nothing left after the configured
+    drops — e.g. a lone greeting), skips the Gemini call entirely and
+    returns `("", 0.0)` — the same short-circuit moshi's own
+    `generate_reference_text()` does on an empty context, not new
+    behavior invented here
+  - Shares its Gemini call-tuning (`thinking_config.thinking_level="low"`,
+    `max_output_tokens=1024` — both workarounds for a real Gemini 3.x quirk,
+    not experiment variables) with `core/llm_judge.py`'s `call_gemini()`
+    via one shared helper, rather than the two independent copies that
+    exist today
+- `NullBackend(RetrievalBackend)` that returns empty string immediately
+  regardless of `history` (ignored), used for Config A (no retrieval)
+
+#### Context formatting
+
+Three of the behaviors moshi-rag's own `LLMReferenceGenerator.process_reference_text()`
+performs before ever calling its retrieval LLM (see the "On prompt parity"
+note below for the full background) are available, independently
+config-gated, to any `RetrievalBackend` via a shared, pure, module-level
+function:
+
+```python
+def format_context(
+    context: str,
+    history: list[tuple[int, str]] | None,
+    *,
+    drop_leading_incomplete_turn: bool = False,
+    drop_trailing_incomplete_turn: bool = False,
+    thread_reference_history: bool = False,
+    history_max_entries: int | None = None,
+    role_labels: dict[str, str] = {"user": "Human", "model": "moshi"},
+) -> tuple[str, int]:
+    """Returns (formatted_context, num_turns) — num_turns is the post-drop
+    turn count, mirroring process_reference_text()'s identical return
+    shape, needed by any caller doing reference-history bookkeeping."""
+```
+
+Not backend-specific — any current or future `RetrievalBackend` subclass
+can call it. Its keyword arguments are exactly the fields of a backend's
+`context_formatting` block in `configs/retrieval_backends.yaml` (see
+"Configs" below), spread in directly:
+
+| Field | Type | Default | Effect |
+|---|---|---|---|
+| `drop_leading_incomplete_turn` | bool | `false` | Drops a leading `moshi:`-role turn (a model-initiated greeting) before formatting |
+| `drop_trailing_incomplete_turn` | bool | `false` | Drops a trailing `moshi:`-role turn — moshi's real fix for `<ret>` firing mid-utterance, since the model is still speaking when retrieval triggers and the raw context would otherwise end mid-sentence |
+| `thread_reference_history` | bool | `false` | Re-inserts prior turns' retrieved reference text back into the formatted context, at the point in the transcript where each was originally retrieved |
+| `history_max_entries` | int \| null | `null` | Caps how many prior history entries `thread_reference_history` re-inserts (oldest dropped first). `null` matches moshi's own real behavior (unbounded growth) — a known, disclosed latent risk on long-running demo sessions that moshi itself doesn't guard against either; set a number to cap it |
+| `role_labels` | dict | `{user: "Human", model: "moshi"}` | Labels used when reformatting turns into a transcript — moshi's own choice by default; a new `prompt_template` expecting different labels (e.g. `"User:"/"Assistant:"`) can override these without touching Python |
+
+**History threading is structurally a no-op on the eval path, not a
+symmetric toggle.** `thread_reference_history` re-inserts *this session's*
+prior retrieved reference text — but eval's `respond()` calls are
+deliberately isolated per question (see the "RESOLVED (Phase 2)" section
+above: making `respond()` session-like was explicitly rejected, since a
+shared session would leak one eval question's retrieval context into
+another's and corrupt scores). `core/model_interface.py`'s
+`_patch_rag_manager` (eval path) never has a `history` list to pass —
+`RetrievalBackend.retrieve()`'s `history` parameter defaults to `None`
+there and stays `None`. Setting `thread_reference_history: true` on a
+backend used only for evals has no observable effect; it only does
+something real on the demo path, where one `RAGManager` instance's
+`self._history` genuinely accumulates across a session's turns, same as
+moshi's own unpatched behavior — see "Session instrumentation" below for
+how the demo path wires this up.
+
+**On prompt parity with the demo path (resolved at two levels, not just
+documented):** an earlier direction here considered making the eval-path
+prompt independently tunable via `prompt_template` while leaving the demo
+on moshi-rag's own native `LLMReferenceGenerator` (bundled
+`original`/`simplified` templates only, selected via `prompt_style`), and
+explicitly accepting that the two paths would ask the retrieval LLM for
+differently-shaped reference text. That direction was dropped: there is no
+point tuning a retrieval prompt in eval configs if the result can never be
+observed in the demo. Two things now make that a non-issue instead of a
+disclosed gap:
+
+1. **Code-path parity.** `scripts/instrumented_server.py` patches
+   `RAGManager.get_reference_text` (see "Session instrumentation" below)
+   so the demo's actual retrieval call goes through this same
+   `GeminiAPIBackend`/`RetrievalBackend`, built from this same registry —
+   not an equivalent mechanism, the literal same code path. moshi's own
+   `LLMReferenceGenerator` is only ever invoked once more, for its
+   unavoidable startup `warmup()` call (see `scripts/run_demo.sh`'s
+   "Config-derived environment" note on why `LLM_BASE_URL`/`LLM_MODEL_NAME`/
+   `LLM_API_KEY` are still required despite being otherwise unused) — real
+   retrieval never reaches it again.
+2. **Formatting parity, opt-in.** "Context formatting" above makes
+   `process_reference_text()`'s own behaviors (turn-trimming,
+   reference-history threading) available to `GeminiAPIBackend` directly,
+   config-gated per backend definition. Two starting `prompt_template`
+   files are shipped, meant to be paired with matching
+   `context_formatting` settings rather than mixed arbitrarily —
+   `configs/prompts/retrieval_reference_simple.txt` (today's flat
+   `"Context:\n{context}"` prompt, pairs with every `context_formatting`
+   field at its default/off) and `configs/prompts/retrieval_reference_moshi_style.txt`
+   (a completion-style prompt ending in a bare trailing `Reference:` cue
+   with moshi's own length/formatting guidelines, modeled on its bundled
+   template, pairs with the three boolean toggles on) — see "Configs"
+   below for both. New prompt files, differently named as experimentation
+   proceeds, are expected; each should note in a comment which
+   `context_formatting` settings it assumes, since the two layers only
+   reproduce a coherent result when authored together.
 
 ### `core/checkpoint.py`
 
@@ -195,6 +407,16 @@ aliases:
 - Loads `.env` via `python-dotenv`
 - Interpolates environment variables into config values
 - Resolves checkpoint aliases
+- Resolves `model.retrieval.backend` against `configs/retrieval_backends.yaml`
+  (same alias-file pattern as checkpoints — loaded once, looked up by
+  name), attaching the resolved backend definition at
+  `config["model"]["retrieval"]["_resolved_backend"]` so callers
+  (`evals/runner.py`'s `build_model()`, `scripts/instrumented_server.py`'s
+  `main()` — not `scripts/print_demo_env.py`, which only translates
+  `model.generation` into demo CLI flags, see "Demo" below) don't each
+  re-read the file or re-implement the lookup. Raises if
+  `model.retrieval.backend` names an entry that doesn't exist in
+  `retrieval_backends.yaml`
 - Validates required fields including `latency_gate_ms`
 
 ---
@@ -241,6 +463,16 @@ and purpose are unchanged.
 
 **Direction of improvement is hardcoded per metric inside each eval class** (lower is better for TOR and latency, higher for accuracy and GPT scores) and used by the comparison CLI to render `✓` and `↓` indicators.
 
+**Judge model configuration:** the LLM judge model name comes from a
+config's top-level `judge.model` field (see "Configs" below), read by each
+knowledge eval from the `config: dict` already passed into `run()` —
+previously a `_JUDGE_MODEL = "gemini-3.5-flash"` module-level constant
+duplicated identically in both `open_audio_bench.py` and
+`halu_eval_audio.py`. Gemini call-tuning (`thinking_level`,
+`max_output_tokens`) is not a `judge` config field — see
+`core/retrieval_backend.py`'s note on why those stay a shared code default
+rather than a per-run knob.
+
 ### `EvalResult` dataclass
 
 ```python
@@ -278,7 +510,7 @@ class EvalResult:
   same underlying benchmark, just published under its originating org instead.)
 - Runs TriviaQA, WebQ, and LlamaQ subsets
 - For each question: feeds audio file into `model.respond()`, collects transcribed text output
-- Scores each response via Gemini API LLM judge using prompt from MoshiRAG paper appendix (Table 16)
+- Scores each response via Gemini API LLM judge (model from config's `judge.model`, see "Judge model configuration" above) using prompt from MoshiRAG paper appendix (Table 16)
 - Returns per-subset accuracy scores
 - Respects mode sample size limits and resumability via `last_completed_index`
 
@@ -316,11 +548,26 @@ class EvalResult:
 - `--spot-check` flag outputs 20 examples as numbered list of `(transcribed response, extracted keyword, verdict: correct/incorrect)` for human review before trusting metric at scale
 - `spot_check_completed: false` flag in result metadata surfaces as reminder in console output until manually flipped to `true`
 
-**`evals/registry/latency/retrieval_breakdown.py`**
-- Timing hooks inside `GeminiAPIBackend.retrieve()` recording duration of:
-  - ASR transcription wait
-  - Gemini API call
-  - Context injection
+**`evals/registry/latency/retrieval_breakdown.py`** (does not exist yet,
+same as `e2ekd.py` above — this describes its target design, not shipped
+behavior)
+- Reports the same three stages as the demo's `retrieval_breakdown_s`
+  (`asr_wait_s`, `api_call_s`, `context_injection_s`) for consistency, but
+  **not** via the demo's mechanism — `RAGManager._background_task` is
+  never patched on the eval path (only `get_reference_text` is;
+  `core/model_interface.py`'s `_TimedInferenceJob._patch_rag_manager`
+  doesn't touch it), so there's no existing hook there to reuse.
+  `context_injection_s` is straightforward regardless: same technique as
+  the demo, a second, redundant, timed call to `core/retrieval_backend.py`'s
+  `format_context()` (see "Context formatting" above) around whatever eval
+  code calls `MoshiRAGAdapter.respond()`. Where `asr_wait_s` comes from on
+  a one-shot, non-live `respond()` call (there's no `_wait_event`-style
+  live wait the way there is in a continuous demo session) is an open
+  design question for whoever implements this file, not resolved by this
+  pass — correcting an earlier, inaccurate claim in this spec that
+  `GeminiAPIBackend.retrieve()` itself already had three internal timing
+  hooks; it doesn't, it returns one `(text, latency)` figure, same as
+  today
 - Reports mean and P95 per stage
 - Flags any run where P95 total exceeds `latency_gate_ms` — this surfaces in console output, JSON errors list, and is treated as a correctness concern not just a performance one
 
@@ -347,9 +594,12 @@ class EvalResult:
 The demo provides a browser-based full-duplex voice interface for ad-hoc
 testing, edge-case probing, and stakeholder demos. It runs on the VM as
 kyutai-labs/moshi-rag's `moshi.server` + `moshi.server_conditioner` — the
-main server process is wrapped by a thin, narrow, logging-only
-instrumentation layer (`scripts/instrumented_server.py`, see below), not
-reimplemented or forked; `server_conditioner` remains fully unmodified.
+main server process is wrapped by a thin, narrow instrumentation layer
+(`scripts/instrumented_server.py`, see below), not reimplemented or
+forked; `server_conditioner` remains fully unmodified. Most of that layer
+is logging-only, with one deliberate, bounded exception (retrieval
+routing — see "Session instrumentation" below); step-loop/turn-taking/VAD
+mechanics stay moshi.server's own, unmodified logic throughout.
 macOS (or any machine with a browser) connects via SSH tunnel — no Python,
 no model weights on the client side.
 
@@ -384,11 +634,75 @@ access works without TLS certificates.
   survive independent of tmux's lifecycle/scrollback, and prints the
   session dir path in its final instructions (mirroring the eval console's
   "results written to: ..." line)
-- `--checkpoint`, `--stt`, `--rag-timeout`, `--conditioner-only` flags —
-  see the script's own header comment
-- Retrieval on/off and everything else about session *behavior* remains
-  moshi.server's own, unmodified logic — only logging/instrumentation is
-  additive
+- `--checkpoint`, `--stt`, `--rag-timeout`, `--conditioner-only`, and
+  `--config <path>` flags (default `configs/baseline_with_retrieval.yaml`
+  for `--config`) — see the script's own header comment
+- Turn-taking/VAD/step-loop *mechanics* remain moshi.server's own,
+  unmodified logic — only *retrieval* (which backend and prompt answer a
+  `<ret>` trigger) is redirected, via the `RAGManager.get_reference_text`
+  patch described under "Session instrumentation" below; instrumentation
+  proper (logging/session files/live client push) stays additive on top of
+  that
+
+**Config-derived environment (`scripts/print_demo_env.py`):** rather than
+hardcoding `LLM_MODEL_NAME=gemini-3.5-flash` and the generation-affecting
+CLI flags directly in the shell script (as it did before this pass),
+`run_demo.sh` shells out to a new small Python helper — same pattern it
+already uses for `resolve_checkpoint` — that loads the `--config` YAML and
+prints a shell-sourceable block covering only:
+- `LLM_BASE_URL` / `LLM_MODEL_NAME` / `LLM_API_KEY`, resolved from the
+  config's `model.retrieval.backend` entry — needed **only** because
+  `ServerState.__init__` unconditionally constructs its own
+  `LLMReferenceGenerator` and `ServerState.warmup()` makes one real,
+  synchronous API call against it before the server ever accepts a
+  connection (same requirement `core/model_interface.py`'s
+  `_DEFAULT_LLM_BASE_URL`/`_DEFAULT_LLM_MODEL_NAME` notes already document
+  for the eval path). These values are otherwise **vestigial** once the
+  `get_reference_text` patch is active — `LLMReferenceGenerator` is never
+  called again after that one startup warmup call, so this is "keep
+  `ServerState.warmup()` from raising," not "configure retrieval." Worth a
+  clear comment in the generated env block so this isn't mistaken for the
+  actual retrieval configuration later
+- The generation CLI flags (`--cfg-coef`, `--stt-wait-time`, `--rag-timeout`,
+  `--max-reference-tokens`, `--vad-window-size`, `--vad-threshold`,
+  `--power-threshold`) derived from the config's `model.generation` block —
+  see `core/model_interface.py`'s "Generation parameters" table for the
+  field-name mapping
+
+**Not emitted, deliberately: `MOSHI_RETRIEVAL_LLMS_JSON`.** This is
+moshi-rag's own native multi-provider mechanism (server-side
+`RetrievalProfile` config + a real, already-built live-switching UI in our
+`demo/client/` fork — `useRetrievalBackendChoice.ts`,
+`SearchPanel.tsx`'s `RetrievalBackendTabs`, dormant since it's never been
+populated). It's a real, working feature, confirmed against actual source,
+but it only affects `LLMReferenceGenerator.generate_reference_text()` —
+which the `get_reference_text` patch below bypasses entirely. Setting it
+anyway (e.g. to reach `prompt_style`, an earlier direction considered and
+dropped) would render the client's tabs visible and clickable but
+functionally inert, since the patched `get_reference_text` never consults
+`RAGManager._active_profile_id`. **Not implemented in this pass**, but
+worth recording as a real extension point: live open/closed backend
+switching in production would mean re-pointing that same already-built
+client UI (same kind-byte-4 metadata message shape) at a switch inside our
+own `RetrievalBackend` layer instead of moshi's profiles — see
+`core/retrieval_backend.py`'s registry note.
+
+`run_demo.sh`'s own `--rag-timeout`/`--stt` flags remain as explicit
+overrides layered on top of whatever the config produced, not the sole
+source — so `bash scripts/run_demo.sh --config configs/baseline_with_retrieval.yaml --rag-timeout 12`
+still works as an ad-hoc override. `--batch-size` and `--init-active-speaker`
+are not derived from the shared config (see `core/model_interface.py`'s
+note on why those two stay demo-specific) — `run_demo.sh` keeps setting
+`--init-active-speaker model` itself, as it does today.
+
+`scripts/instrumented_server.py` additionally needs a `DEMO_CONFIG` env var
+(alongside the existing `DEMO_SESSION_DIR`/`DEMO_CHECKPOINT`), set by
+`run_demo.sh` to the same `--config` path — used directly in Python (via
+`core/config.py` + `core/retrieval_backend.py`'s `build_retrieval_backend`)
+to construct the one `RetrievalBackend` instance the `get_reference_text`
+patch below routes through. This doesn't need shell-env translation the
+way the CLI flags above do, since `instrumented_server.py` is Python and
+can load the YAML directly.
 
 ### Session instrumentation
 
@@ -396,13 +710,83 @@ access works without TLS certificates.
 moshi-rag's real `moshi.server` entrypoint unchanged, then, before
 invoking its serve function:
 
-- Patches `RAGManager.get_reference_text` for logging — same technique
-  and signature as `core/model_interface.py`'s `_patch_rag_manager`
-  (`context: str -> (context, ref_text, elapsed, backend_label)`). moshi's
-  own logging does not print the retrieved reference text at all, and
-  only prints a truncated context snippet at trigger time — this patch is
-  what makes full-fidelity capture possible; log-scraping stdout alone
-  cannot recover it
+- **Patches `RAGManager.get_reference_text` to actually route retrieval
+  through `core/retrieval_backend.py`, not just to log it** — same
+  technique and signature as `core/model_interface.py`'s
+  `_patch_rag_manager` (`context: str -> (context, ref_text, elapsed,
+  backend_label)`), ported near-verbatim, since `RAGManager` is a plain
+  Python object (not the PyO3-native kind instance-patching can't touch —
+  see `_patch_deliver_step_row`'s docstring for that lesson) and `Channel`
+  constructs its own fresh `RAGManager` per connection exactly like
+  `InferenceJob` does, confirmed directly against real
+  `inference_utils/channel.py` and `inference_utils/rag_manager.py`
+  source. Installed inside the existing `_patch_channel`'s `patched_init`,
+  right where `self.rag_manager` becomes available. The `RetrievalBackend`
+  instance is built once at server startup (`main()`, via
+  `core/config.py` + `core/retrieval_backend.py`'s `build_retrieval_backend`
+  factory, from the same `--config` YAML the eval side uses — see
+  `core/retrieval_backend.py`'s "On prompt parity with the demo path" note
+  above) and shared across every connection/turn in the session, same
+  lifetime pattern as `MoshiRAGAdapter.retrieval_backend` across multiple
+  `respond()` calls.
+  *(Correction to a stale claim in an earlier draft of this spec: this
+  section previously described a "for logging" version of this patch,
+  capturing the retrieved reference text moshi's own stdout logging omits.
+  That was never actually implemented in shipped code — `apply_patches()`
+  as committed only wires up `_patch_rag_manager_trigger` and
+  `_patch_rag_manager_background_task`, no `get_reference_text` patch at
+  all. The logging need described there is real and still applies — moshi
+  never logs the retrieved reference text — but it's now satisfied as a
+  side effect of the routing patch below rather than a separate logging-only
+  one, since our own `RetrievalBackend.retrieve()` call sites already log
+  their own request/response.)*
+  **Reference-history bookkeeping**, mirroring moshi's own unpatched
+  `RAGManager.get_reference_text`: after `backend.retrieve(context,
+  history=self._history)` returns, the patch calls `core/retrieval_backend.py`'s
+  `format_context()` itself — a second, redundant call with the same
+  inputs `retrieve()` already used internally, computing the identical
+  result at identical cost since the function is pure and does no I/O —
+  purely to recover `num_turns`, then does
+  `self._history.append((num_turns, reference_text))` if both are
+  non-empty, exactly like moshi's real source does. This is also where a
+  genuine `context_injection_s` timing figure comes from — see the
+  `retrieval_breakdown_s` bullet below.
+- **`session_start`'s `retrieval_backend` field, and the live
+  `"instrumentation_session"` push to the browser, are sourced from
+  `describe_backend(name, backend_def)` — the same resolved backend
+  `main()` built the real `RetrievalBackend` instance from — not from
+  `LLM_MODEL_NAME`/`LLM_BASE_URL`.** Fixing a real bug found while
+  designing the `get_reference_text` patch above, not a pre-existing
+  correct behavior: as shipped, `_patch_server_state` (writes
+  `session_start` to `turns.jsonl`, also feeds the console header's
+  `retrieval: ...` line) and `_patch_channel` (pushes
+  `"kind": "instrumentation_session"` to the browser — the live "which
+  backend is answering" indicator a user actually sees mid-session) each
+  independently build `{"model": os.environ.get("LLM_MODEL_NAME"),
+  "base_url": os.environ.get("LLM_BASE_URL")}`. Those env vars are exactly
+  the ones `scripts/run_demo.sh`'s "Config-derived environment" section
+  above documents as vestigial — needed only to keep `ServerState.warmup()`
+  from raising, no longer connected to what actually answers retrieval
+  once `get_reference_text` is patched. Left alone, the session log and
+  the live browser UI would both report whatever `warmup()` happened to be
+  pointed at rather than the real backend — silently correct only by
+  coincidence in the single-backend case (`print_demo_env.py` currently
+  derives both from the same resolved entry), and wrong the moment that
+  coincidence doesn't hold (a `fallback:` backend, or any future backend
+  type without a `model`/`base_url` shaped like Gemini's). `main()` now
+  computes `describe_backend(name, backend_def)` exactly **once** and
+  threads that single dict through `apply_patches()` to both patch
+  functions, rather than each independently reading environment state —
+  the duplication (two independently-maintained copies of the same
+  lookup) was the root cause, not just the wrong source, so the fix
+  removes the duplication too. See "Demo session log" below for the
+  corrected `session_start` JSON shape (`{"name", "type", "model"}`, no
+  `base_url` for a `gemini_api` backend — that field in the old, buggy
+  version was always moshi's own internal OpenAI-shim endpoint, never
+  something from `configs/retrieval_backends.yaml` at all).
+  `scripts/summarize_demo_session.py`'s console header must tolerate a
+  missing `model` key (e.g. a `null_backend` session has none) rather than
+  assuming one is always present.
 - Reuses the same `<ret>`-token detection already validated for
   `respond()`, applied to the live `Channel`/`RAGManager` objects — but
   `rag_triggered`/`rag_trigger_count`/`retrieval_context`/
@@ -432,11 +816,33 @@ invoking its serve function:
   since it's always about whichever turn is currently pending
 - Breaks retrieval timing into the same three stages as
   `evals/registry/latency/retrieval_breakdown.py` — ASR transcription
-  wait, Gemini API call, context injection — captured via patches at the
-  equivalent points in moshi's own reference-generation call path (not
-  `GeminiAPIBackend.retrieve()`, since the demo doesn't go through our
-  `RetrievalBackend` — the exact hook points are confirmed against real
-  source during implementation, same discipline as the `RAGManager` patch)
+  wait, Gemini API call, context injection. **`context_injection_s` is
+  genuinely meaningful again**, not a stale/dead measurement: it was
+  previously captured by patching `LLMReferenceGenerator.process_reference_text`
+  (moshi's `Human:`/`moshi:`/`Reference:` transcript-reformatting step),
+  which is unreachable now that `get_reference_text` bypasses
+  `LLMReferenceGenerator` entirely — `_patch_process_reference_text` is
+  dropped from `apply_patches()` rather than kept as a dead no-op — but
+  "Context formatting" (`core/retrieval_backend.py`) restores a real
+  equivalent: the `get_reference_text` patch's own redundant
+  `format_context()` call (see above, done for `num_turns` bookkeeping) is
+  timed and reported as `context_injection_s` directly. With every backend's
+  `context_formatting` field at its default (`false`/`null` — no drops, no
+  history threading), that measured time is honestly close to `0.0`, since
+  no real formatting work happens; turning any of them on makes it a real,
+  non-fabricated number reflecting actual work done, not a hardcoded
+  constant either way. `asr_wait_s` (from `RAGManager._background_task`'s
+  own `_wait_event`) and `api_call_s` (`retrieve()`'s own measured Gemini
+  latency, minus `context_injection_s`, same computation as before) are
+  unaffected and still real. **Decided: `context_injection_s` is always
+  displayed as a real number** (console `[aggregate]` table, `raw_events.jsonl`,
+  `--json` output alike) — never `—`. It is not the same situation as
+  `e2ekd_s` below, which shows `—` because it is genuinely unmeasured
+  pending a methodology dependency; `context_injection_s` is always
+  actually measured, and a session with every `context_formatting` field
+  at its default legitimately has one that's ~`0.0` — that's a true
+  measurement of "no formatting work happened," not a placeholder for
+  missing data, so it renders the same way any other real number does
 - **`e2ekd_s`/`keyword_delay_s` are deferred, not implemented in this
   pass** — every turn record carries them as `null`. `e2ekd.py` doesn't
   exist yet anywhere in this repo (only `knowledge/` evals are
@@ -485,6 +891,18 @@ the console report — see "Demo session log" below for why `turns.jsonl`
 itself is deliberately not pretty-printed and needs this flag to get an
 eval-style browsable view. This is a CLI tool only — there is no web-based
 viewer for historical sessions (see Explicitly Out of Scope).
+
+**On the two, unrelated, `--config` JSON files in this stack** (confirmed
+directly against `kyutai-labs/moshi-rag`'s real source, not assumed): both
+`moshi.server_conditioner` and `moshi.server` accept a `--config <path>`
+flag pointing at the checkpoint's `config.json`. `server_conditioner`
+actually reads it — it's the model/conditioner architecture config (`dim`,
+`conditioners`, `fuser`), describing how the ARC-Encoder's output fuses
+into the LM. On `moshi.server` itself, `--config` is a **dead argument** —
+declared via `argparse`, never referenced anywhere else in `server.py`.
+Neither of these is where retrieval-backend fallback configuration lives —
+that's `MOSHI_RETRIEVAL_LLMS_JSON` (an environment variable, not a file),
+covered under `scripts/run_demo.sh` above.
 
 ### Web client
 
@@ -745,10 +1163,17 @@ completion point.
 carries **no retrieval fields at all** — see the note below for why.
 
 ```json
-{"type": "session_start", "session_id": "2026-07-13T09-32-11Z", "checkpoint": "base", "git_hash": "a3f9c12", "timestamp": "2026-07-13T09:32:11Z", "retrieval_backend": {"model": "gemini-3.5-flash", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/"}, "rag_timeout_s": 8, "stt_mode": "local"}
+{"type": "session_start", "session_id": "2026-07-13T09-32-11Z", "checkpoint": "base", "git_hash": "a3f9c12", "timestamp": "2026-07-13T09:32:11Z", "retrieval_backend": {"name": "gemini_api", "type": "gemini_api", "model": "gemini-3.5-flash"}, "rag_timeout_s": 8, "stt_mode": "local"}
 {"type": "turn", "turn_index": 1, "timestamp": "2026-07-13T09:32:45Z", "user_question_text": "What's the capital of France?", "model_response_text": "Paris.", "ttfat_s": 0.05, "e2ekd_s": null, "keyword_delay_s": null}
 {"type": "turn", "turn_index": 2, "timestamp": "2026-07-13T09:33:20Z", "user_question_text": "What did the Q3 earnings report say about revenue growth?", "model_response_text": "Revenue grew twelve percent year over year.", "ttfat_s": 1.42, "e2ekd_s": null, "keyword_delay_s": null}
 ```
+
+`retrieval_backend`'s shape is `describe_backend()`'s output (see
+`core/retrieval_backend.py` and "Session instrumentation" above) —
+`{"name", "type", "model"?, "base_url"?}`, the latter two only present if
+the resolved backend definition has them. A `null_backend` session (no
+retrieval) carries `{"name": "null", "type": "null_backend"}`, no `model`
+key — consumers must not assume one is always present.
 
 **`raw_events.jsonl`** — one record per raw user/model text chunk and RAG
 event, un-turn-scoped. This is the *only* source of retrieval data. Each
@@ -897,8 +1322,20 @@ not an inconsistency between the two sections.
 ```yaml
 model:
   checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
   retrieval:
     enabled: false
+
+judge:
+  model: gemini-3.5-flash
 
 evals:
   - knowledge.open_audio_bench
@@ -915,11 +1352,26 @@ output_dir: ./evals/results/
 ```yaml
 model:
   checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
   retrieval:
     enabled: true
-    backend: gemini_api
-    model: gemini-3.5-flash
+    backend: gemini_api          # key into configs/retrieval_backends.yaml
     latency_gate_ms: 1500
+    fallback: null                # scaffold slot — a second backend name to
+                                   # race/fall back to; unimplemented beyond
+                                   # this config slot existing, see
+                                   # core/retrieval_backend.py's registry note
+
+judge:
+  model: gemini-3.5-flash
 
 evals:
   - knowledge.open_audio_bench
@@ -931,6 +1383,108 @@ evals:
 
 output_dir: ./evals/results/
 ```
+
+`model.retrieval.model` (the Gemini model name) has moved out of the
+per-run config and into `configs/retrieval_backends.yaml`'s `gemini_api`
+entry below — it's a property of the backend, not something that varies
+per eval run the way `latency_gate_ms` does.
+
+### `configs/retrieval_backends.yaml`
+
+New file (committed, non-sensitive — `${VAR}` interpolation available same
+as `checkpoints.yaml`). Named backend definitions, looked up by
+`model.retrieval.backend`/`.fallback` in the eval configs above and
+resolved by `core/config.py`. `type` is the `BACKEND_REGISTRY` key
+`core/retrieval_backend.py`'s factory dispatches on:
+
+```yaml
+backends:
+  gemini_api:
+    type: gemini_api
+    model: gemini-3.5-flash
+    api_key_env: GEMINI_API_KEY
+    prompt_template: configs/prompts/retrieval_reference_simple.txt
+    context_formatting:
+      drop_leading_incomplete_turn: false
+      drop_trailing_incomplete_turn: false
+      thread_reference_history: false
+      history_max_entries: null
+      role_labels: {user: "Human", model: "moshi"}
+
+  # Alternate starting point, not the shipped default — demonstrates the
+  # full moshi-defaults pairing described in core/retrieval_backend.py's
+  # "On prompt parity" note. Select it explicitly
+  # (model.retrieval.backend: gemini_api_moshi_style) rather than editing
+  # the entry above in place, so the existing baseline configs' behavior
+  # doesn't change silently underneath anyone already relying on it.
+  # gemini_api_moshi_style:
+  #   type: gemini_api
+  #   model: gemini-3.5-flash
+  #   api_key_env: GEMINI_API_KEY
+  #   prompt_template: configs/prompts/retrieval_reference_moshi_style.txt
+  #   context_formatting:
+  #     drop_leading_incomplete_turn: true
+  #     drop_trailing_incomplete_turn: true
+  #     thread_reference_history: true
+  #     history_max_entries: null   # true parity with moshi's own real
+  #                                 # (unbounded) behavior — set a number
+  #                                 # instead if long-session growth becomes
+  #                                 # a real problem; moshi itself doesn't
+  #                                 # cap this either
+  #     role_labels: {user: "Human", model: "moshi"}
+
+  null:
+    type: null_backend
+
+  # Extension point, not implemented yet — no closed/local retrieval
+  # backend exists to build or test against today. A future entry would
+  # look something like this and become selectable purely via config, with
+  # a new RetrievalBackend subclass registered in BACKEND_REGISTRY:
+  #
+  # local_llm:
+  #   type: openai_compatible
+  #   base_url: http://localhost:8080/v1
+  #   model: llama-3-8b-instruct
+  #   api_key_env: LOCAL_LLM_API_KEY
+  #   prompt_template: configs/prompts/retrieval_reference_simple.txt
+```
+
+`context_formatting` is optional per backend entry — a backend definition
+that omits it entirely gets `format_context()`'s own all-off defaults
+(identical to the `gemini_api` entry above written out explicitly). See
+`core/retrieval_backend.py`'s "Context formatting" section for what each
+field does.
+
+### `configs/prompts/retrieval_reference_simple.txt`
+
+The `GeminiAPIBackend` prompt template, extracted verbatim from what was
+previously `core/retrieval_backend.py`'s `_RETRIEVE_PROMPT` string literal.
+Plain text with a `{context}` placeholder — not moshi-rag's own
+`Human:`/`moshi:`/`Reference:` transcript-reformatting format. Pairs with
+every `context_formatting` field at its default (`false`/`null`) — the
+shipped default for both `baseline_*.yaml` configs.
+
+### `configs/prompts/retrieval_reference_moshi_style.txt`
+
+A completion-style prompt modeled on moshi-rag's own bundled
+`reference_prompt_template.txt`: ends in a bare trailing `Reference:` with
+nothing after it (so the LLM continues the pattern rather than answering
+an instruction), includes moshi's own guidelines (concise, factual, no
+markdown, roughly 50 words), and expects `{context}` to already be a
+`Human:`/`moshi:`/`Reference:`-labeled transcript — i.e. it only produces
+sensible output when paired with `drop_leading_incomplete_turn`,
+`drop_trailing_incomplete_turn`, and `thread_reference_history` all
+enabled (see the commented `gemini_api_moshi_style` entry above). Not
+selected by default; a concrete, working starting point for whoever
+experiments with this next, and the naming convention
+(`retrieval_reference_<style>.txt`) new prompt files as experimentation
+proceeds are expected to follow.
+
+Both files now serve **both** the demo and evals for whichever backend
+references them (see `core/retrieval_backend.py`'s "On prompt parity with
+the demo path" note for how) — editing one changes retrieval behavior
+everywhere that backend is used at once; there is no separate demo-side
+prompt to keep in sync.
 
 ### `configs/checkpoints.yaml`
 ```yaml

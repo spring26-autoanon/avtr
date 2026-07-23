@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from evals.registry.knowledge import open_audio_bench as oab
-from evals.runner import EvalResult
+from evals.runner import DEFAULT_JUDGE_MODEL, EvalResult
 
 
 # ── _valid_answers ───────────────────────────────────────────────────────────
@@ -51,18 +51,24 @@ def test_valid_answers_llamaq_single_only():
 
 def test_judge_parses_correct_verdict():
     with patch.object(oab, "call_gemini", return_value="reasoning... the score is [Correct]"):
-        assert oab._judge("q", ["paris"], "Paris") is True
+        assert oab._judge("q", ["paris"], "Paris", DEFAULT_JUDGE_MODEL) is True
 
 
 def test_judge_parses_incorrect_verdict():
     with patch.object(oab, "call_gemini", return_value="reasoning... the score is [Incorrect]"):
-        assert oab._judge("q", ["paris"], "London") is False
+        assert oab._judge("q", ["paris"], "London", DEFAULT_JUDGE_MODEL) is False
 
 
 def test_judge_raises_on_unparseable_response():
     with patch.object(oab, "call_gemini", return_value="no verdict here"):
         with pytest.raises(ValueError, match="no parseable verdict"):
-            oab._judge("q", ["paris"], "London")
+            oab._judge("q", ["paris"], "London", DEFAULT_JUDGE_MODEL)
+
+
+def test_judge_passes_judge_model_through_to_call_gemini():
+    with patch.object(oab, "call_gemini", return_value="the score is [Correct]") as mock_call:
+        oab._judge("q", ["paris"], "Paris", "custom-judge-model")
+    assert mock_call.call_args[0][0] == "custom-judge-model"
 
 
 # ── OpenAudioBenchEval.run() ──────────────────────────────────────────────────
@@ -101,7 +107,7 @@ def test_run_smoke_mode_scores_all_subsets():
     assert result.scores["webq_acc"] == 1.0
     assert result.scores["llamaq_acc"] == 1.0
     assert result.metadata["n_triviaqa"] == 5
-    assert result.metadata["judge_model"] == oab._JUDGE_MODEL
+    assert result.metadata["judge_model"] == DEFAULT_JUDGE_MODEL
     assert result.last_completed_index == 15  # 5 per subset x 3 subsets
     assert result.completed is True
     assert result.errors == []
@@ -116,6 +122,17 @@ def test_run_smoke_mode_scores_all_subsets():
     assert entry["retrieval_context"] == "ctx"
     assert entry["retrieval_text"] == "ref"
     assert entry["judge_verdict"] == "correct"
+
+
+def test_run_uses_judge_model_from_config():
+    model = _FakeModel()
+    with patch.object(oab, "_load_rows", side_effect=_fake_rows), \
+         patch.object(oab, "_load_audio_bytes", return_value=b"wav-bytes"), \
+         patch.object(oab, "call_gemini", return_value="the score is [Correct]") as mock_call:
+        result = oab.OpenAudioBenchEval().run(model, {"judge": {"model": "custom-judge"}}, "tiny")
+
+    assert result.metadata["judge_model"] == "custom-judge"
+    assert mock_call.call_args[0][0] == "custom-judge"
 
 
 def test_run_tiny_mode_limits_to_one_per_subset():
@@ -156,7 +173,7 @@ def test_run_resumes_without_recalling_model_for_done_items():
         eval_name="knowledge.open_audio_bench",
         scores={"triviaqa_acc": 1.0, "webq_acc": 1.0, "llamaq_acc": 1.0},
         metadata={
-            "judge_model": oab._JUDGE_MODEL,
+            "judge_model": DEFAULT_JUDGE_MODEL,
             "n_triviaqa": 5, "n_webq": 5, "n_llamaq": 5,
             "_progress": {
                 "triviaqa": {"correct": 5, "total": 5},
