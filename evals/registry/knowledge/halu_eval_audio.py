@@ -91,6 +91,7 @@ class HaluEvalAudioEval(BaseEval):
         progress.setdefault("total", 0)
         progress.setdefault("correct_ref", 0)
         progress.setdefault("correct_resp", 0)
+        progress.setdefault("degenerate_silence", 0)
         errors: list[str] = list(prior.errors) if prior is not None else []
         transcript: list[dict] = list(prior.transcript) if prior is not None else []
 
@@ -125,7 +126,14 @@ class HaluEvalAudioEval(BaseEval):
                     "retrieval_text": retrieval_text,
                     "resp_verdict": "correct" if resp_correct else "incorrect",
                     "ref_verdict": "correct" if ref_correct else "incorrect",
+                    # See MoshiRAGAdapter.respond()'s docstring — an empty
+                    # response with no <ret> is a distinct failure mode from
+                    # "model got it wrong", worth telling apart in scoring
+                    # review rather than silently folding into resp_verdict.
+                    "degenerate_silence": resp_metadata.get("degenerate_silence", False),
                 })
+                if resp_metadata.get("degenerate_silence"):
+                    progress["degenerate_silence"] += 1
             except Exception as exc:
                 logger.warning("halu_eval_audio[%d] failed: %s", i, exc)
                 errors.append(f"[{i}]: {exc}")
@@ -150,6 +158,8 @@ class HaluEvalAudioEval(BaseEval):
             "judge_model": judge_model,
             "_progress": progress,
         }
+        if progress["degenerate_silence"]:
+            metadata["degenerate_silence_count"] = progress["degenerate_silence"]
 
         return EvalResult(
             eval_name="knowledge.halu_eval_audio",

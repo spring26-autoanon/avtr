@@ -139,6 +139,59 @@ def test_moshi_rag_adapter_generation_none_uses_defaults(monkeypatch):
     assert adapter._generation == _DEFAULT_GENERATION
 
 
+# ── MoshiRAGAdapter.respond() degenerate-silence retry/flag ─────────────────
+# _respond_once() itself needs a real GPU/moshi environment — patched here to
+# fake single-call outcomes so respond()'s retry/flagging wrapper (see its
+# docstring — the WebQ/LlamaQ "zero engagement" investigation in CLAUDE.md)
+# is exercisable without one.
+
+
+def _make_adapter(monkeypatch, once_results):
+    """once_results: list of (text_out, rag_trigger_count) for successive _respond_once() calls."""
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    adapter = MoshiRAGAdapter("some/checkpoint")
+    calls = iter(once_results)
+
+    def _fake_respond_once(self, audio_in):
+        text_out, rag_trigger_count = next(calls)
+        return b"RIFF....WAVEfmt ", text_out, {"rag_trigger_count": rag_trigger_count}
+
+    monkeypatch.setattr(MoshiRAGAdapter, "_respond_once", _fake_respond_once)
+    return adapter
+
+
+def test_respond_normal_turn_not_flagged_no_retry(monkeypatch):
+    adapter = _make_adapter(monkeypatch, [("Paris.", 0)])
+    _, text_out, metadata = adapter.respond(b"")
+    assert text_out == "Paris."
+    assert metadata["degenerate_silence"] is False
+    assert metadata["degenerate_silence_retried"] is False
+
+
+def test_respond_rag_triggered_empty_text_not_flagged(monkeypatch):
+    # rag_trigger_count > 0 alone doesn't count as degenerate, even if the
+    # visible text happens to be empty at that exact point in the trace.
+    adapter = _make_adapter(monkeypatch, [("", 1)])
+    _, _, metadata = adapter.respond(b"")
+    assert metadata["degenerate_silence"] is False
+
+
+def test_respond_degenerate_silence_retries_once(monkeypatch):
+    adapter = _make_adapter(monkeypatch, [("", 0), ("", 0)])
+    _, text_out, metadata = adapter.respond(b"")
+    assert text_out == ""
+    assert metadata["degenerate_silence_retried"] is True
+    assert metadata["degenerate_silence"] is True
+
+
+def test_respond_degenerate_silence_recovers_on_retry(monkeypatch):
+    adapter = _make_adapter(monkeypatch, [("", 0), ("Paris.", 0)])
+    _, text_out, metadata = adapter.respond(b"")
+    assert text_out == "Paris."
+    assert metadata["degenerate_silence_retried"] is True
+    assert metadata["degenerate_silence"] is False
+
+
 # ── _TimedInferenceJob retrieval diagnostics ──────────────────────────────────
 
 

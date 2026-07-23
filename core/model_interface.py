@@ -925,6 +925,43 @@ class MoshiRAGAdapter(ModelInterface):
 
     def respond(self, audio_in: bytes) -> tuple[bytes, str, dict]:
         """
+        Run one inference turn, with a single automatic retry and explicit
+        flagging on "degenerate silence" (empty response, <ret> never
+        predicted — see _respond_once).
+
+        Background: two specific recordings in OpenAudioBench (WebQ/LlamaQ)
+        reliably reproduce this on every call — confirmed via a dedicated
+        diagnostic (see CLAUDE.md) that ruled out sample rate/resampling and
+        loudness/gain as causes across controlled real-checkpoint runs; the
+        model itself enters a genuine zero-engagement state for the whole
+        turn (never a single non-pad token), not a pipeline artifact we can
+        normalize away. Root cause (specific to those recordings' acoustic
+        content) is still open. Retrying does NOT fix those two — they're
+        deterministic — but costs one extra ~5s call and is worth keeping as
+        a safety net for less-deterministic occurrences in datasets we
+        haven't hit this on yet. What actually matters for scoring
+        integrity is the flag: without it, a degenerate-silence turn is
+        indistinguishable in results from "model genuinely got the question
+        wrong," silently deflating accuracy on whatever subset happens to
+        contain more of these recordings. metadata["degenerate_silence"]
+        marks the case explicitly so callers (evals, transcripts) can
+        surface it instead of scoring it blind.
+        """
+        audio_out, inner_text, metadata = self._respond_once(audio_in)
+        degenerate = not inner_text.strip() and metadata["rag_trigger_count"] == 0
+        metadata["degenerate_silence_retried"] = degenerate
+        if degenerate:
+            logger.warning("[respond] degenerate silence (empty response, no <ret>) — retrying once")
+            audio_out, inner_text, metadata = self._respond_once(audio_in)
+            degenerate = not inner_text.strip() and metadata["rag_trigger_count"] == 0
+            metadata["degenerate_silence_retried"] = True
+            if degenerate:
+                logger.warning("[respond] degenerate silence persisted after retry")
+        metadata["degenerate_silence"] = degenerate
+        return audio_out, inner_text, metadata
+
+    def _respond_once(self, audio_in: bytes) -> tuple[bytes, str, dict]:
+        """
         Run one inference turn.
 
         Writes audio_in to a temp WAV, runs InferenceJob to completion,

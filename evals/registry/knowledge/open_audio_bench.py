@@ -145,7 +145,8 @@ class OpenAudioBenchEval(BaseEval):
 
         for subset_key, subset_cfg in _SUBSETS.items():
             rows = _load_rows(subset_cfg, limit)
-            state = progress.setdefault(subset_key, {"correct": 0, "total": 0})
+            state = progress.setdefault(subset_key, {"correct": 0, "total": 0, "degenerate_silence": 0})
+            state.setdefault("degenerate_silence", 0)
 
             for i, row in enumerate(rows):
                 if i < state["total"]:
@@ -169,7 +170,15 @@ class OpenAudioBenchEval(BaseEval):
                         "retrieval_context": resp_metadata.get("retrieval_context", ""),
                         "retrieval_text": resp_metadata.get("retrieval_text", ""),
                         "judge_verdict": "correct" if correct else "incorrect",
+                        # See MoshiRAGAdapter.respond()'s docstring — an empty
+                        # response with no <ret> is a distinct failure mode
+                        # from "model got it wrong", worth telling apart in
+                        # scoring review rather than silently folding into
+                        # judge_verdict=incorrect.
+                        "degenerate_silence": resp_metadata.get("degenerate_silence", False),
                     })
+                    if resp_metadata.get("degenerate_silence"):
+                        state["degenerate_silence"] += 1
                 except Exception as exc:
                     logger.warning("open_audio_bench[%s][%d] failed: %s", subset_key, i, exc)
                     errors.append(f"{subset_key}[{i}]: {exc}")
@@ -183,11 +192,15 @@ class OpenAudioBenchEval(BaseEval):
 
         scores = {}
         metadata: dict = {"judge_model": judge_model, "_progress": progress}
+        degenerate_silence_count = 0
         for subset_key in _SUBSETS:
             state = progress[subset_key]
             if state["total"]:
                 scores[f"{subset_key}_acc"] = state["correct"] / state["total"]
             metadata[f"n_{subset_key}"] = state["total"]
+            degenerate_silence_count += state.get("degenerate_silence", 0)
+        if degenerate_silence_count:
+            metadata["degenerate_silence_count"] = degenerate_silence_count
 
         last_completed_index = sum(s["total"] for s in progress.values())
 

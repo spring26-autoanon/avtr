@@ -14,6 +14,7 @@ from evals.runner import (
     BaseEval,
     EvalResult,
     _indicator,
+    _print_eval_result,
     _transcript_path,
     build_model,
     compare_runs,
@@ -513,6 +514,30 @@ def test_run_evals_resumes_completed_evals(tmp_path, capsys):
         assert "resumed" in captured.out
     finally:
         runner_mod.RESULTS_DIR = orig_results
+
+
+# ── _print_eval_result degenerate-silence warning ────────────────────────────
+# See MoshiRAGAdapter.respond()'s docstring / CLAUDE.md — surfacing this
+# metadata key is reusable across any eval that populates it, not just
+# knowledge.open_audio_bench/halu_eval_audio.
+
+
+def test_print_eval_result_warns_on_degenerate_silence(capsys):
+    result = EvalResult(
+        eval_name="fixture.constant",
+        scores={"score": 0.75},
+        metadata={"degenerate_silence_count": 2},
+    )
+    _print_eval_result("fixture.constant", result, ConstantEval())
+    out = capsys.readouterr().out
+    assert "2 question(s) got a degenerate silent response" in out
+
+
+def test_print_eval_result_silent_when_no_degenerate_silence(capsys):
+    result = EvalResult(eval_name="fixture.constant", scores={"score": 0.75}, metadata={})
+    _print_eval_result("fixture.constant", result, ConstantEval())
+    out = capsys.readouterr().out
+    assert "degenerate silent response" not in out
 
 
 # ── compare_runs ──────────────────────────────────────────────────────────────

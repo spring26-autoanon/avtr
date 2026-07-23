@@ -286,6 +286,13 @@ def _print_eval_result(name: str, result: EvalResult, instance: BaseEval) -> Non
         print(f"  ⚠ {err}")
     if result.metadata.get("spot_check_completed") is False:
         print("  ⚠ spot_check_completed is false — run with --spot-check before trusting this metric")
+    if result.metadata.get("degenerate_silence_count"):
+        n = result.metadata["degenerate_silence_count"]
+        print(
+            f"  ⚠ {n} question(s) got a degenerate silent response (no <ret>, no speech, "
+            "survived a retry) — these are folded into the accuracy score as wrong answers, "
+            "not distinguished from genuine misses; see the transcript's degenerate_silence field"
+        )
     if result.metadata.get("gate_breached_p95"):
         gate = result.metadata.get("latency_gate_ms", "?")
         p95 = result.scores.get("total_p95_s", "?")

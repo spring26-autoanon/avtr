@@ -174,6 +174,50 @@ def test_run_resumes_without_recalling_model_for_done_items():
     assert result.transcript[0]["question"] == "prior q0"  # untouched prior entry
 
 
+# ── degenerate_silence flagging ──────────────────────────────────────────────
+# See MoshiRAGAdapter.respond()'s docstring / CLAUDE.md — an empty response
+# with no <ret> is a distinct failure mode the eval must surface, not fold
+# silently into resp_verdict=incorrect.
+
+
+class _SometimesSilentModel:
+    """Flags every other call as degenerate_silence, others normal."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def respond(self, audio_in: bytes):
+        i = self.calls
+        self.calls += 1
+        degenerate = i % 2 == 0
+        text_out = "" if degenerate else "some answer"
+        return b"", text_out, {
+            "retrieval_context": "ctx", "retrieval_text": "some reference",
+            "degenerate_silence": degenerate,
+        }
+
+
+def test_run_flags_degenerate_silence_in_transcript_and_metadata():
+    model = _SometimesSilentModel()
+    with patch.object(hea, "_load_rows", side_effect=_fake_rows), \
+         patch.object(hea, "call_gemini", return_value="the score is [Correct]"):
+        result = hea.HaluEvalAudioEval().run(model, {}, "smoke")
+
+    flagged = [e for e in result.transcript if e["degenerate_silence"]]
+    assert len(flagged) == 3  # indices 0, 2, 4 of 5
+    assert result.metadata["degenerate_silence_count"] == 3
+
+
+def test_run_no_degenerate_silence_key_when_none_occur():
+    model = _FakeModel()
+    with patch.object(hea, "_load_rows", side_effect=_fake_rows), \
+         patch.object(hea, "call_gemini", return_value="the score is [Correct]"):
+        result = hea.HaluEvalAudioEval().run(model, {}, "tiny")
+
+    assert "degenerate_silence_count" not in result.metadata
+    assert result.transcript[0]["degenerate_silence"] is False
+
+
 # ── format_results ────────────────────────────────────────────────────────────
 
 
