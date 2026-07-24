@@ -401,6 +401,27 @@ def test_first_audio_records_ttfat_once_only():
     asyncio.run(run())
 
 
+def test_model_text_triggers_first_audio_automatically():
+    """The real fix (found validating latency.ttfat on the batch path, then
+    applied here by analogy): ttfat_s's first-audio signal now comes from
+    the first genuine (non-pad) model text token via on_model_text, not a
+    separate pcm-presence check — see the module docstring's
+    TurnManager.handle_spoken_text bullet for why."""
+    async def run():
+        session = _FakeSession()
+        state = _ChannelState(session, _fake_channel())
+
+        state.on_utterance_end()
+        assert state._pending["ttfat_s"] is None
+
+        state.on_model_text("Paris.")
+
+        assert state._pending["ttfat_s"] is not None
+        assert any(ev["event"] == "first_audio" for ev in session.raw_written)
+
+    asyncio.run(run())
+
+
 def test_first_audio_before_any_turn_is_a_no_op():
     async def run():
         session = _FakeSession()

@@ -223,9 +223,35 @@ class _TimedInferenceJob:
         self.ttfat_s: float = 0.0
         self.t_first_audio: float = 0.0
         self.retrieval_latency_s: float = 0.0
+        # Wall-clock time of the ARC-encoder round trip (job._async_update_
+        # reference's get_conditioning_remote_async call) — the real
+        # /embed HTTP call to the separate-process conditioner, distinct
+        # from retrieval_latency_s (the text-retrieval LLM call above it in
+        # the pipeline). Timed in _immediate_handle_reference_text below;
+        # 0.0 if no <ret> ever fired this turn.
+        self.conditioning_latency_s: float = 0.0
         self.retrieval_context: str = ""
+        # Wall-clock (perf_counter) timestamp of the most recent <ret>
+        # trigger, and the gap between it and get_reference_text() actually
+        # being called — see _patch_output_loop()'s <ret> branch (sets
+        # retrieval_trigger_ts) and _patch_rag_manager()'s
+        # _patched_get_reference_text (computes asr_wait_s from it). This is
+        # the real, same wait_steps-based delay RAGManager._background_task
+        # (unpatched, shared by both InferenceJob and Channel) always
+        # imposes between a <ret> trigger and grabbing the final context —
+        # genuinely measurable here too, not an approximation, even though
+        # respond() is a one-shot batch call with no live session. Like
+        # rag_trigger_step, a second <ret> in the same turn overwrites this
+        # before the first's get_reference_text call may have run — same
+        # last-trigger-wins fidelity already accepted for rag_trigger_step,
+        # not a new limitation introduced here.
+        self.retrieval_trigger_ts: float | None = None
+        self.asr_wait_s: float = 0.0
         self._t_question_end: float | None = None
         self._first_audio_recorded = False
+        # (feed_step -> wall-clock time) for every _feed_loop() call to
+        # input_queue.put() — see _finalize_ttfat()'s docstring.
+        self._feed_call_times: list[float] = []
 
         # Patch the job's RAGManager retrieval to route through our backend —
         # unconditionally, including NullBackend. The model predicts <ret>
@@ -333,6 +359,8 @@ class _TimedInferenceJob:
 
         async def _patched_get_reference_text(context: str) -> tuple[str, str, float, str]:
             t0 = time.perf_counter()
+            if self.retrieval_trigger_ts is not None:
+                self.asr_wait_s = max(0.0, t0 - self.retrieval_trigger_ts)
             self.retrieval_context = context
             try:
                 ref_text, latency = backend.retrieve(context)
@@ -421,7 +449,9 @@ class _TimedInferenceJob:
             # (the actual conditioning update) used to split across a
             # step-index-deferred handoff.
             job.trace["reference_text"] = reference_text or ""
+            t0 = time.perf_counter()
             await job._async_update_reference(reference_text or "")
+            self.conditioning_latency_s = time.perf_counter() - t0
 
         rag_trigger_count = 0
         # Diagnostic: _decode_text_token() treats any of {0,1,2,3} as "pad"
@@ -460,6 +490,7 @@ class _TimedInferenceJob:
 
                 if text_token == job.server.runner.lm_gen.lm_model.rag_token_id:
                     rag_trigger_count += 1
+                    self.retrieval_trigger_ts = time.perf_counter()
                     job.trace["rag_trigger_step"] = job.step_index
                     job.trace["rag_trigger_count"] = rag_trigger_count
                     job.model_text.append(job.server.text_tokenizer.id_to_piece(text_token))  # type: ignore[arg-type]
@@ -509,6 +540,19 @@ class _TimedInferenceJob:
                         job.model_text.append("<pad>")
                     else:
                         job.model_text.append(job.server.text_tokenizer.id_to_piece(text_token))  # type: ignore[arg-type]
+                        # First non-pad text token = first audio token, per
+                        # _finalize_ttfat()'s docstring: text and audio are
+                        # generated in lockstep, and this is a robust proxy
+                        # where raw PCM amplitude thresholding was not — a
+                        # real VM run showed pcm.abs().max() firing at
+                        # step_index=0 with an *identical* value across
+                        # every different question/response (0.01241324,
+                        # to 8 decimal places), confirming it was a fixed
+                        # decoder warm-up artifact, not content-dependent
+                        # speech onset.
+                        if not self._first_audio_recorded:
+                            self.t_first_audio = time.time()
+                            self._first_audio_recorded = True
 
                 if job._user_id_buffer:
                     uid = job._user_id_buffer.popleft()
@@ -531,38 +575,62 @@ class _TimedInferenceJob:
 
     async def run(self, task_group):
         """Delegate to the underlying InferenceJob, hooking timing."""
-        # Wrap _feed_loop to record t_question_end
-        original_feed = self._job._feed_loop
+        # Records a (feed_step -> wall-clock time) mapping for every
+        # _feed_loop() call to input_queue.put() — see _finalize_ttfat()'s
+        # docstring for why this replaces a previous, broken approach.
+        # Wraps a single method, not _feed_loop's own logic — its behavior
+        # is unchanged, only observed.
+        original_put = self._job.input_queue.put
 
-        async def _timed_feed():
-            await original_feed()
-            self._t_question_end = time.time()
+        async def _timed_put(step_input):
+            self._feed_call_times.append(time.time())
+            return await original_put(step_input)
 
-        self._job._feed_loop = _timed_feed
+        self._job.input_queue.put = _timed_put
 
-        # Wrap _output_loop to record t_first_audio
-        original_output = self._job._output_loop
-
-        async def _timed_output():
-            await original_output()
-
-        # Hook into output_queue consumption to detect first audio
-        original_queue_get = self._job.output_queue.get
-
-        async def _watching_get():
-            out = await original_queue_get()
-            if not self._first_audio_recorded and out is not None:
-                import numpy as np
-                pcm = getattr(out, "pcm", None)
-                if pcm is not None and pcm.abs().max().item() > 1e-6:
-                    self.t_first_audio = time.time()
-                    self._first_audio_recorded = True
-                    if self._t_question_end is not None:
-                        self.ttfat_s = max(0.0, self.t_first_audio - self._t_question_end)
-            return out
-
-        self._job.output_queue.get = _watching_get
         await self._job.run(task_group)
+        self._finalize_ttfat()
+
+    def _finalize_ttfat(self) -> None:
+        """
+        Computes ttfat_s once the job has fully finished, using
+        trace["question_end_step"] (set by moshi-rag's own, unpatched
+        _feed_loop() to the index of the last REAL — not padding — input
+        frame) correlated against _feed_call_times (recorded in run()
+        above).
+
+        Replaces a previous, broken approach: _t_question_end used to be
+        set to wall-clock time right after _feed_loop() *returned* — but
+        confirmed against real inference_job.py source, under
+        stop_on_end_of_input=False (respond()'s own deliberate setting —
+        see _respond_once), _feed_loop() does NOT return when the user's
+        real audio ends; it falls into an unconditional while loop feeding
+        zero-padding silence until the whole turn's _shutdown_event fires
+        (i.e. near end-of-turn, not end-of-question). Since first real
+        audio output always precedes end-of-turn, the old computation had
+        t_first_audio < t_question_end by construction, clamping ttfat_s to
+        exactly 0.0 on every single call — confirmed on a real VM run, not
+        a rounding artifact.
+
+        _feed_loop's own feed_step counter (source of question_end_step)
+        increments exactly once per input_queue.put() call, in both its
+        real-input loop and its trailing-silence loop — so
+        _feed_call_times[question_end_step] is the precise wall-clock
+        moment the user's real question finished being fed, independent of
+        whatever _feed_loop does afterward.
+
+        t_first_audio itself comes from _patch_output_loop()'s first
+        non-pad text token, not PCM amplitude — an earlier version watched
+        output_queue for the first pcm.abs().max() > 1e-6 chunk, but a real
+        VM run showed that firing at step_index=0 with an *identical*
+        amplitude across every different question/response, confirming a
+        fixed decoder warm-up artifact rather than genuine speech onset.
+        """
+        question_end_step = self._job.trace.get("question_end_step")
+        if question_end_step is not None and 0 <= question_end_step < len(self._feed_call_times):
+            self._t_question_end = self._feed_call_times[question_end_step]
+        if self._first_audio_recorded and self._t_question_end is not None:
+            self.ttfat_s = max(0.0, self.t_first_audio - self._t_question_end)
 
     @property
     def trace(self):
@@ -1077,6 +1145,17 @@ class MoshiRAGAdapter(ModelInterface):
                 "retrieval_context": job.retrieval_context,
                 "retrieval_text": trace.get("reference_text", ""),
                 "retrieval_latency_s": job.retrieval_latency_s,
+                # Real ARC-encoder /embed round trip — see
+                # _TimedInferenceJob.conditioning_latency_s's docstring.
+                # This is what actually gates when the model's spoken
+                # response reflects the retrieved reference, distinct from
+                # (and typically much larger than) retrieval_latency_s.
+                "conditioning_latency_s": job.conditioning_latency_s,
+                # Time between the <ret> trigger and get_reference_text()
+                # actually being called — see _TimedInferenceJob.__init__'s
+                # retrieval_trigger_ts/asr_wait_s docstring. 0.0 (the
+                # __init__ default) when no <ret> ever fired this turn.
+                "asr_wait_s": job.asr_wait_s,
                 # BUG FIX: "rag_trigger_step" in trace was always True — moshi's
                 # own InferenceJob.__init__ pre-populates trace with
                 # {"rag_trigger_step": -1, ...} as a sentinel default, before

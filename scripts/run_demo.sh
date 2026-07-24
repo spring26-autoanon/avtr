@@ -148,12 +148,29 @@ SESSION=demo
 
 if [[ "$CONDITIONER_ONLY" == "1" ]]; then
     # ── Launch conditioner alone ────────────────────────────────────────────
+    # Tee'd to a persistent on-disk log, same as the full (non-conditioner-only)
+    # path below — a real gap found the hard way: this branch used to run the
+    # conditioner with no redirection at all, so its only record was tmux's
+    # own scrollback. When the tmux *server* itself died (not just this
+    # session — e.g. a VM hiccup, an OOM kill, anything that takes the whole
+    # server process down), that scrollback was gone with it, along with any
+    # crash traceback that would have explained why the conditioner stopped
+    # responding. A conditioner crash mid-eval-run is exactly the kind of
+    # unattended failure this project's evals are most exposed to (see
+    # CLAUDE.md's reference-encoder ConnectError notes) — worth a durable log
+    # regardless of how rarely it fires.
+    CONDITIONER_ONLY_SESSION_ID=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+    CONDITIONER_ONLY_SESSION_DIR="$PROJECT_DIR/demo/sessions/$CONDITIONER_ONLY_SESSION_ID"
+    mkdir -p "$CONDITIONER_ONLY_SESSION_DIR"
+
     tmux kill-session -t "$SESSION" 2>/dev/null || true
     tmux new-session -d -s "$SESSION" -n conditioner
-    tmux send-keys -t "$SESSION:conditioner" "cd $PROJECT_DIR && $CONDITIONER_CMD" Enter
+    tmux send-keys -t "$SESSION:conditioner" \
+        "cd $PROJECT_DIR && $CONDITIONER_CMD 2>&1 | tee '$CONDITIONER_ONLY_SESSION_DIR/conditioner.log'" Enter
 
     echo ""
     echo "Conditioner-only launching in tmux session '$SESSION' (port 8001)."
+    echo "Log: $CONDITIONER_ONLY_SESSION_DIR/conditioner.log"
     echo ""
     echo "  tmux attach -t $SESSION   — watch logs"
     echo ""

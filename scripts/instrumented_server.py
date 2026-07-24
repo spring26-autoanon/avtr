@@ -13,11 +13,6 @@ flow. Patches, in order of "how invasive":
 
   - ServerState.__init__            leaf wrap: capture rag_timeout/stt_mode,
                                      write the session_start record once
-  - ServerState._deliver_step_row   leaf wrap: detect first non-None audio
-                                     frame per turn (ttfat_s) — see that
-                                     patch's own docstring for why this
-                                     replaced an initial attempt to wrap
-                                     Channel.opus_writer.append_pcm directly
   - Channel.__init__                leaf wrap: per-connection state, plus
                                      installs the per-RAGManager-instance
                                      get_reference_text patch below, right
@@ -41,6 +36,30 @@ flow. Patches, in order of "how invasive":
   - TurnManager._update_active_speaker  leaf wrap: detect end-of-user-utterance
                                      (this is the ttfat clock start and the
                                      turn boundary)
+  - TurnManager.handle_spoken_text  leaf wrap: also the ttfat clock *stop* —
+                                     _ChannelState.on_model_text() (called
+                                     here whenever model_text is not None,
+                                     i.e. a genuine non-pad token) triggers
+                                     on_first_audio(). An earlier version
+                                     wrapped ServerState._deliver_step_row
+                                     instead, firing ttfat_s off "pcm_out is
+                                     not None" — the real batch-path
+                                     equivalent of that check was confirmed,
+                                     via a real VM run's diagnostic logging,
+                                     to fire on step_index=0 with an
+                                     amplitude *identical* across every
+                                     different question/response (a fixed
+                                     decoder artifact, not genuine speech
+                                     onset — see core/model_interface.py's
+                                     _finalize_ttfat docstring). Not directly
+                                     re-confirmed against a live demo session
+                                     as of this writing (unlike the batch
+                                     path, which was), but the same
+                                     underlying moshi-rag step mechanics
+                                     apply to both, and this reuses a signal
+                                     the demo already computes correctly for
+                                     transcript purposes rather than
+                                     introducing a new one
   - RAGManager._background_task     whole-method patch (same class of change
                                      as model_interface.py's _patch_output_loop):
                                      needs internal timestamps (asr_wait_s
@@ -170,7 +189,7 @@ def _push_instrumentation(channel, turn_index: int, fields: dict) -> None:
     over the same generic message type.
 
     Called from several sync monkeypatched methods (_update_active_speaker,
-    _deliver_step_row) that can't `await` directly, so this always schedules
+    handle_spoken_text) that can't `await` directly, so this always schedules
     via asyncio.create_task — even from the async call sites (RAGManager.trigger,
     _background_task), for one uniform fire-and-forget path that never
     blocks or slows the real conversation on an instrumentation send.
@@ -228,6 +247,15 @@ class _ChannelState:
 
     def on_model_text(self, text: str) -> None:
         self._session.write_raw_event("model_text", turn_index=self.turn_index, text=text)
+        # This is also ttfat_s's first-audio-frame signal: on_model_text is
+        # only ever called with a genuine, non-pad decoded token (see
+        # _patch_turn_manager's patched_handle_spoken_text, which filters
+        # out model_text=None before calling here) — the same real-vs-pad
+        # distinction core/model_interface.py's _finalize_ttfat uses on the
+        # batch path, for the same reason: a raw "is there a PCM chunk at
+        # all" check fires on essentially the first step of a turn
+        # regardless of whether genuine speech has started yet.
+        self.on_first_audio()
         # Unlike user text, the model's response to turn N arrives while
         # self._pending already *is* turn N's record (on_utterance_end for N
         # creates it before the model starts responding, and it isn't
@@ -465,37 +493,6 @@ def _patch_server_state(session: SessionLog, checkpoint: str, retrieval_backend_
     ServerState.__init__ = patched_init
 
 
-def _patch_deliver_step_row(session: SessionLog) -> None:
-    """ttfat_s's first-audio-frame hook.
-
-    First attempt wrapped Channel.opus_writer.append_pcm per instance (same
-    style as model_interface.py's _patch_audio_power_diagnostics) — VM
-    verification confirmed this fails: sphn.OpusStreamWriter is a compiled/
-    native (PyO3) extension type, and `instance.method = wrapper` raises
-    `AttributeError: ... attribute 'append_pcm' is read-only` on those.
-
-    ServerState._deliver_step_row is the callback the shared batched step
-    loop already calls once per active occupant per step
-    (`occupant.output_queue.put_nowait(StepOutput(text_token=..., pcm=pcm_out))`)
-    — a plain Python leaf method (no native object involved), called before
-    any occupant-specific opus encoding happens. occupant is whichever
-    Channel/InferenceJob owns that slot this step; pcm_out is that step's
-    audio tensor, or None between real audio frames (e.g. acoustic delay).
-    """
-    from moshi.server import ServerState
-
-    original = ServerState._deliver_step_row
-
-    def patched(self, occupant, *, text_token: int, pcm_out):
-        if pcm_out is not None:
-            state = session.state_for_channel(occupant)
-            if state is not None:
-                state.on_first_audio()
-        return original(self, occupant, text_token=text_token, pcm_out=pcm_out)
-
-    ServerState._deliver_step_row = patched
-
-
 def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retrieval_backend) -> None:
     """
     Per-instance replacement (not a wrap) of one RAGManager's
@@ -520,8 +517,11 @@ def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retr
     registry instead, not implemented here).
 
     RAGManager is a plain Python object, not the PyO3-native kind
-    instance-patching can't touch (see _patch_deliver_step_row's docstring
-    for that lesson), and Channel constructs its own fresh RAGManager per
+    instance-patching can't touch (confirmed the hard way: an early attempt
+    to wrap Channel.opus_writer.append_pcm directly failed with
+    `AttributeError: ... attribute 'append_pcm' is read-only`, since
+    sphn.OpusStreamWriter is a compiled/native extension type), and Channel
+    constructs its own fresh RAGManager per
     connection exactly like InferenceJob does — confirmed directly against
     real inference_utils/channel.py and inference_utils/rag_manager.py
     source. Installed from _patch_channel's patched_init, right where
@@ -584,12 +584,12 @@ def _patch_channel(session: SessionLog, retrieval_backend, retrieval_backend_dis
         _patch_rag_manager_get_reference_text(session, self.rag_manager, retrieval_backend)
 
         _push_session_info(self, retrieval_backend=retrieval_backend_display)
-        # ttfat_s's first-audio-frame signal comes from a separate patch on
-        # ServerState._deliver_step_row (see _patch_deliver_step_row below),
-        # not from wrapping self.opus_writer.append_pcm here — that was tried
-        # first and confirmed broken during VM verification: sphn.OpusStreamWriter
-        # is a compiled/native (PyO3) extension type and doesn't support
-        # instance attribute assignment on its methods.
+        # ttfat_s's first-audio-frame signal comes from _ChannelState.on_model_text
+        # (see _patch_turn_manager and _ChannelState.on_first_audio's own
+        # docstring), not from wrapping self.opus_writer.append_pcm here —
+        # that was tried first and confirmed broken during VM verification:
+        # sphn.OpusStreamWriter is a compiled/native (PyO3) extension type
+        # and doesn't support instance attribute assignment on its methods.
 
     async def patched_aexit(self, exc_type, exc, tb):
         state = session.state_for_channel(self)
@@ -752,7 +752,6 @@ def apply_patches(
     retrieval_backend_display: dict,
 ) -> None:
     _patch_server_state(session, checkpoint, retrieval_backend_display)
-    _patch_deliver_step_row(session)
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)

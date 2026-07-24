@@ -13,6 +13,7 @@ import pytest
 from evals.runner import (
     BaseEval,
     EvalResult,
+    _cache_model_respond,
     _indicator,
     _print_eval_result,
     _transcript_path,
@@ -167,6 +168,83 @@ def test_build_model_stub_with_retrieval_enabled_uses_resolved_backend(tmp_path,
     assert isinstance(model.retrieval_backend, GeminiAPIBackend)
     assert model.retrieval_backend.model == "gemini-3.5-flash"
     assert model.retrieval_backend.latency_gate_ms == 5000
+
+
+# ── _cache_model_respond ──────────────────────────────────────────────────────
+# See the real VM run that motivated this: latency.ttfat and
+# latency.retrieval_breakdown deliberately sample from
+# knowledge.open_audio_bench's own question pool, so the exact same audio
+# bytes were observed being fed through respond() three separate times
+# (once per eval) in a single tiny-mode run — a real GPU inference pass plus
+# a real Gemini retrieval call, repeated for no additional signal.
+
+
+class _CountingModel:
+    def __init__(self):
+        self.calls = 0
+
+    def respond(self, audio_in: bytes):
+        self.calls += 1
+        return (b"audio", f"response for {audio_in!r}", {"call_index": self.calls})
+
+
+def test_cache_model_respond_reuses_result_for_identical_audio():
+    model = _CountingModel()
+    _cache_model_respond(model)
+
+    first = model.respond(b"same-audio")
+    second = model.respond(b"same-audio")
+
+    assert model.calls == 1  # underlying respond only invoked once
+    assert first == second
+
+
+def test_cache_model_respond_calls_through_for_different_audio():
+    model = _CountingModel()
+    _cache_model_respond(model)
+
+    first = model.respond(b"audio-a")
+    second = model.respond(b"audio-b")
+
+    assert model.calls == 2
+    assert first != second
+
+
+def test_cache_model_respond_logs_on_cache_hit(caplog):
+    model = _CountingModel()
+    _cache_model_respond(model)
+
+    with caplog.at_level("INFO", logger="evals.runner"):
+        model.respond(b"same-audio")
+        model.respond(b"same-audio")
+
+    assert any("respond cache" in r.message for r in caplog.records)
+
+
+def test_run_evals_shares_cache_across_evals(tmp_path):
+    """End-to-end: two evals in the same run, both calling respond() with
+    the same audio, should only invoke the underlying model once total."""
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    counting_model = _CountingModel()
+
+    class SharedAudioEval(BaseEval):
+        def run(self, model, config, mode):
+            _, text, _ = model.respond(b"shared-audio")
+            return EvalResult(eval_name="fixture.shared", scores={"seen": 1}, completed=True, last_completed_index=1)
+
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.shared_a", "fixture.shared_b"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=counting_model), \
+             patch.object(runner_mod, "load_eval_class", return_value=SharedAudioEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+
+        assert counting_model.calls == 1  # both evals shared the one real call
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
 
 
 # ── write_results / find_partial_result ───────────────────────────────────────
