@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 _CHECKPOINTS_YAML = Path(__file__).parent.parent / "configs" / "checkpoints.yaml"
 _RETRIEVAL_BACKENDS_YAML = Path(__file__).parent.parent / "configs" / "retrieval_backends.yaml"
+_TTS_BACKENDS_YAML = Path(__file__).parent.parent / "configs" / "tts_backends.yaml"
 _VAR_RE = re.compile(r"\$\{([^}]+)\}")
 
 
@@ -43,6 +44,14 @@ def _load_retrieval_backends() -> dict:
     return data.get("backends", {}) if data else {}
 
 
+def _load_tts_backends() -> dict:
+    if not _TTS_BACKENDS_YAML.exists():
+        return {}
+    with open(_TTS_BACKENDS_YAML) as f:
+        data = yaml.safe_load(f)
+    return data.get("backends", {}) if data else {}
+
+
 def load_config(path: str) -> dict:
     load_dotenv()
     with open(path) as f:
@@ -75,5 +84,20 @@ def load_config(path: str) -> dict:
                 f"configs/retrieval_backends.yaml (known backends: {sorted(backends, key=str)})"
             )
         retrieval["_resolved_backend"] = backends[backend_name]
+
+    # Resolve tts.backend against configs/tts_backends.yaml the same way.
+    # Unlike retrieval, this isn't gated behind an "enabled" flag — tts: is
+    # simply absent from a config that runs no TTS-dependent eval, so only
+    # resolve it if a backend name is actually set.
+    tts = config.get("tts", {})
+    tts_backend_name = tts.get("backend")
+    if tts_backend_name:
+        tts_backends = _load_tts_backends()
+        if tts_backend_name not in tts_backends:
+            raise ValueError(
+                f"tts.backend {tts_backend_name!r} not found in "
+                f"configs/tts_backends.yaml (known backends: {sorted(tts_backends, key=str)})"
+            )
+        tts["_resolved_backend"] = tts_backends[tts_backend_name]
 
     return config

@@ -119,3 +119,38 @@ def test_load_config_no_backend_field_skips_resolution(tmp_path):
     )
     cfg = load_config(str(f))
     assert "_resolved_backend" not in cfg["model"]["retrieval"]
+
+
+# ── tts.backend resolution against configs/tts_backends.yaml ────────────────
+
+
+def test_load_config_resolves_known_tts_backend(tmp_path):
+    f = tmp_path / "cfg.yaml"
+    f.write_text(
+        "model:\n  checkpoint: local/path\n  retrieval:\n    enabled: false\n"
+        "tts:\n  backend: gemini_tts\nevals: []\noutput_dir: ./out/\n"
+    )
+    cfg = load_config(str(f))
+    resolved = cfg["tts"]["_resolved_backend"]
+    assert resolved["type"] == "gemini_tts"
+    assert resolved["voice"] == "Kore"
+
+
+def test_load_config_unknown_tts_backend_raises(tmp_path):
+    f = tmp_path / "cfg.yaml"
+    f.write_text(
+        "model:\n  checkpoint: local/path\n  retrieval:\n    enabled: false\n"
+        "tts:\n  backend: totally_not_a_real_tts_backend\nevals: []\noutput_dir: ./out/\n"
+    )
+    with pytest.raises(ValueError, match="totally_not_a_real_tts_backend"):
+        load_config(str(f))
+
+
+def test_load_config_no_tts_block_skips_resolution(tmp_path):
+    f = tmp_path / "cfg.yaml"
+    f.write_text(
+        "model:\n  checkpoint: local/path\n  retrieval:\n    enabled: false\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    cfg = load_config(str(f))
+    assert "tts" not in cfg or "_resolved_backend" not in cfg.get("tts", {})

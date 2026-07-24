@@ -29,12 +29,15 @@ model:
 judge:
   model: gemini-3.5-flash
 
+tts:
+  backend: gemini_tts          # key into configs/tts_backends.yaml — used by knowledge.gsm8k
+
 evals:
   - knowledge.open_audio_bench
   - knowledge.halu_eval_audio
+  - knowledge.gsm8k
   - duplex.full_duplex_bench
   - latency.ttfat
-  - latency.e2ekd
   - latency.retrieval_breakdown
 
 output_dir: ./evals/results/

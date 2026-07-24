@@ -102,6 +102,7 @@ moshirag-evals/
   core/
     model_interface.py
     retrieval_backend.py
+    tts.py
     checkpoint.py
     config.py
   evals/
@@ -110,6 +111,7 @@ moshirag-evals/
       knowledge/
         open_audio_bench.py
         halu_eval_audio.py
+        gsm8k.py
       duplex/
         full_duplex_bench.py
       latency/
@@ -133,6 +135,7 @@ moshirag-evals/
     baseline_with_retrieval.yaml
     checkpoints.yaml
     retrieval_backends.yaml
+    tts_backends.yaml
     prompts/
       retrieval_reference_simple.txt
       retrieval_reference_moshi_style.txt
@@ -394,6 +397,83 @@ disclosed gap:
    `context_formatting` settings it assumes, since the two layers only
    reproduce a coherent result when authored together.
 
+### `core/tts.py`
+
+Added to support `knowledge.gsm8k` (see "Eval Implementations" below), and
+deliberately built as a reusable scaffold rather than a one-off — GSM8K is
+the first eval whose source dataset is text-only with no accompanying
+audio, and it won't be the last (a future custom eval was raised as the
+motivating second use case when this was designed). Mirrors
+`core/retrieval_backend.py`'s registry shape closely, since the same
+config-driven-swap need applies to both:
+
+- Abstract base class `TTSBackend` with method `synthesize(text: str) ->
+  bytes` returning a complete mono WAV file's bytes at MoshiRAG's own
+  sample rate (`core/model_interface.py`'s `_SAMPLE_RATE = 24000` — no
+  resampling needed, since Gemini's TTS output is natively 24kHz/mono/16-bit
+  PCM too, confirmed against Google's current API docs)
+- `TTS_REGISTRY: dict[str, type[TTSBackend]]` and `build_tts_backend(name:
+  str, backend_def: dict) -> TTSBackend` — same factory-keyed-by-`type`
+  pattern as `retrieval_backend.py`'s `BACKEND_REGISTRY`/
+  `build_retrieval_backend`. Not implemented now, but the intended
+  extension point for a local engine (e.g. Kokoro) if one is ever needed —
+  registers here, becomes selectable purely via
+  `configs/tts_backends.yaml`, no changes needed to any caller. Raises on
+  an unknown `type`, same as the retrieval registry
+- Concrete class `GeminiTTSBackend(TTSBackend)`:
+  - Calls Gemini's TTS-capable `generate_content` path
+    (`response_modalities=["AUDIO"]`, a `speech_config` naming a prebuilt
+    voice) — the same `client.models.generate_content()` call shape
+    `core/llm_judge.py`/`core/retrieval_backend.py` already use, not
+    Google's newer `client.interactions.create()` API (confirmed both
+    exist as of this writing; Google's docs mark `generate_content`-based
+    TTS "legacy" and recommend the Interactions API for new work, but this
+    project deliberately stays on `generate_content` for one reason: it's
+    the one Gemini call shape already used everywhere else in this
+    codebase, and learning a second SDK surface for a single feature isn't
+    worth it pre-emptively. Revisit only if the legacy path is actually
+    sunset, not before)
+  - Requires no new dependency — `google-genai` is already a base
+    dependency (used by `core/llm_judge.py`/`core/retrieval_backend.py`
+    already), so adding this needs no `uv add`
+  - Extracts raw PCM16 bytes from `response.candidates[0].content.parts[0].inline_data.data`
+    and wraps them as a WAV via `core/model_interface.py`'s existing
+    `_pcm16_to_wav()` (imported, not duplicated — same helper the browser
+    client's raw-PCM path already uses)
+  - Retries failed calls up to 3 times with exponential backoff — same
+    convention as `GeminiAPIBackend`/`call_gemini()`
+  - Config fields: `model` (a Gemini TTS-capable model name — see
+    `configs/tts_backends.yaml` below for the shipped default), `voice` (a
+    prebuilt voice name, e.g. `"Kore"` — pinned per backend definition so
+    synthesized audio is reproducible across runs, not re-rolled per call),
+    `api_key_env`
+- `synthesize_cached(text: str, backend: TTSBackend, backend_name: str,
+  backend_def: dict, cache_dir: Path) -> bytes` — the reusable scaffold
+  itself. Computes a cache key from a hash of `backend_def` (`type`,
+  `model`, `voice` — everything that affects the resulting audio) plus the
+  text being synthesized, so switching backend/model/voice in config
+  naturally starts populating a new cache namespace rather than silently
+  reusing stale audio; nothing needs manual invalidation. Looks for
+  `cache_dir / f"{key}.wav"`; if present, returns its bytes directly with
+  no API call. Otherwise calls `backend.synthesize(text)`, writes the
+  result atomically (temp file + rename, so a killed process mid-write
+  can't corrupt a cache entry future runs would otherwise trust), and
+  returns it. `knowledge.gsm8k` calls this directly; a future custom eval
+  needing synthesized audio does too, with no per-eval caching logic to
+  write from scratch
+  - Cache lives at `./tts_cache/` (repo root, sibling to
+    `checkpoint_cache/`) — generated locally, not committed. Gitignored and
+    excluded from `make sync`'s rsync (see Makefile section below), same
+    treatment as `checkpoint_cache/`
+- `describe_tts_backend(name: str, backend_def: dict) -> dict` — same
+  small, pure display-summary helper as `retrieval_backend.py`'s
+  `describe_backend()` (`{"name", "type", "model", "voice"}` — `voice`
+  included since, unlike a secret, it's real, useful identifying
+  information for reproducing a given run's audio; never a secret value),
+  for the same reason: one place to compute "what TTS backend produced this
+  audio" instead of a second independent copy wherever it's reported (see
+  `knowledge.gsm8k`'s `tts_backend` result metadata field below)
+
 ### `core/checkpoint.py`
 
 - `resolve_checkpoint(uri: str) -> str` that:
@@ -417,6 +497,15 @@ disclosed gap:
   re-read the file or re-implement the lookup. Raises if
   `model.retrieval.backend` names an entry that doesn't exist in
   `retrieval_backends.yaml`
+- Resolves `tts.backend` against `configs/tts_backends.yaml` the same way,
+  attaching the resolved definition at `config["tts"]["_resolved_backend"]`.
+  Unlike retrieval, this isn't gated behind an `enabled` flag — `tts:` is
+  simply absent from a config that runs no TTS-dependent eval. Only
+  resolved if `config.get("tts", {}).get("backend")` is actually set; a
+  config that includes `knowledge.gsm8k` in its `evals:` list without a
+  `tts:` block is a config error the eval itself raises clearly at run
+  time, not something `core/config.py` cross-checks against the `evals:`
+  list
 - Validates required fields including `latency_gate_ms`
 
 ---
@@ -455,6 +544,22 @@ and purpose are unchanged.
 **Runner behavior:**
 - Discovers and instantiates evals listed in config from the registry by name
 - Instantiates `ModelInterface` from config
+- Wraps the instantiated model's `respond()` with an in-memory,
+  process-lifetime cache keyed by a hash of `audio_in` bytes
+  (`_cache_model_respond()`), applied once, here, before any eval runs —
+  not inside individual eval files. `latency.ttfat` and
+  `latency.retrieval_breakdown` deliberately sample from
+  `knowledge.open_audio_bench`'s own question pool (see their own sections
+  above), so the exact same audio can legitimately get fed to `respond()`
+  more than once across different evals in one run — confirmed on a real
+  VM run: a `tiny`-mode run fed the same first TriviaQA question through
+  `respond()` three separate times (once per eval touching that pool),
+  each a real GPU inference pass plus a real Gemini retrieval call, for no
+  additional signal a repeated call on byte-identical input can't add.
+  Scoped to one process's lifetime only (a plain dict, never persisted) —
+  a restarted/resumed run starts with an empty cache; each eval's own
+  resumability via `last_completed_index` is unaffected and still governs
+  which items get (re-)processed across restarts
 - Runs each eval, collects `EvalResult` objects
 - On Gemini API failure: retries up to 3 times with exponential backoff, then writes partial results to JSON and exits gracefully with a clear error message indicating where it stopped
 - On restart: detects existing partial result file for the same checkpoint and config, resumes from last completed question rather than starting over
@@ -521,6 +626,90 @@ class EvalResult:
 - Per-run JSON records raw `ref_acc` and `resp_acc` only — `rag_lift_pp` is computed by comparison CLI when diffing Config A vs Config B runs
 - Respects mode sample size limits and resumability
 
+**`evals/registry/knowledge/gsm8k.py`**
+
+Not part of the MoshiRAG paper's own eval suite (the paper's Table 1 covers
+TriviaQA/WebQ/LlamaQ/HaluEvalAudio only) — added independently to track a
+standard, widely-cited benchmark number, so this file's scoring methodology
+is this project's own design, not a paper-verbatim reproduction the way the
+Table 16 judge prompt is elsewhere in this section.
+
+- Downloads from HuggingFace `openai/gsm8k`, `main` config (not
+  `socratic`, which adds sub-question annotations this eval doesn't use),
+  `test` split — 1,319 examples, columns `question` and `answer` (`answer`
+  is a full worked solution ending in a literal `#### <number>` line, GSM8K's
+  own convention for marking the final answer)
+- **GSM8K has no existing audio version and isn't part of the MoshiRAG
+  paper's own audio benchmark suite** (confirmed: no audio GSM8K dataset is
+  publicly available, and `baichuan-inc/OpenAudioBench`'s own `reasoning_qa`
+  subset — checked directly against its real CSV rows — is a different,
+  Chinese-language, 202-example, self-constructed grab-bag of comparison/
+  riddle/geometry questions with free-text answers, not a GSM8K derivative
+  and not comparable to any published GSM8K score). Question audio is
+  synthesized via `core/tts.py`'s `synthesize_cached()`, using the config's
+  resolved `tts` backend (see "Configs" below), and disk-cached
+  indefinitely — each of the 1,319 questions is synthesized at most once,
+  ever, across every future run
+- For each question: synthesizes audio for `question`, feeds it into
+  `model.respond()`, collects transcribed text output — same pattern as
+  every other knowledge eval
+- **Scoring is exact-match on the final number, not the Correct/Incorrect
+  Gemini judge the other two knowledge evals use** — deliberate, since a
+  benchmark whose entire point is one precise numeric answer is better
+  served by extract-then-compare than a free-form verdict call:
+  1. Ground truth: parsed directly from `answer`'s trailing `#### <number>`
+     via regex, stripping commas — no LLM call needed, this is deterministic
+     data-file parsing. Raises if a row's `answer` doesn't match the
+     expected format (a parsing bug in this code, not a legitimate scoring
+     outcome, since every real GSM8K row has this exact convention)
+  2. Model's answer: extracted from the transcribed response via a small
+     Gemini call, reusing `core/llm_judge.py`'s `call_gemini()` (same
+     retry/backoff infra as every other Gemini call in this codebase) with
+     a purpose-built extraction prompt this project owns (not a paper
+     prompt):
+     ```
+     Extract the final numeric answer from the response below. Respond
+     with ONLY the number — digits only, no words, no units, no currency
+     symbols, no punctuation other than a decimal point or minus sign. If
+     the response contains multiple numbers, extract the one that
+     represents the final answer to the question. If no numeric answer can
+     be determined, respond with exactly: NONE
+
+     Question:
+     {question}
+
+     Response:
+     {response}
+     ```
+     A dedicated extraction call (rather than a regex over the transcribed
+     text directly) handles MoshiRAG spelling a number out as words rather
+     than digits, which a plain regex can't reliably catch — same rationale
+     `latency/e2ekd.py`'s keyword extraction already established for a
+     different field. Reads the extraction model from `config["judge"]["model"]`,
+     same as every other knowledge eval's judge model — no new config field
+  3. Both values normalized (strip `$`/`,`/`%`/whitespace, parse as float)
+     and compared for equality — GSM8K's ground truth is always an exact
+     integer or simple decimal, so no fuzzy tolerance is needed. A `NONE`
+     extraction result (or anything that fails to parse as a number) scores
+     as incorrect, not an error — this is a legitimate, expected outcome for
+     a genuinely non-numeric or degenerate response, same status as any
+     other wrong answer
+  - As with `latency/e2ekd.py`'s keyword extraction, this extraction step's
+    own accuracy isn't independently validated by this spec — review a
+    handful of real transcript entries after the first real-checkpoint run
+    before trusting `gsm8k_acc` at scale, same caution as any new
+    LLM-mediated scoring step, though this is a much simpler extraction task
+    than e2ekd's and doesn't warrant a dedicated `--spot-check` flag the way
+    that one does
+- Same `degenerate_silence` flagging, resumability (`last_completed_index`/
+  `_progress`), and mode sample sizes as `open_audio_bench.py` (`tiny`: 1,
+  `smoke`: 5, `sample`: 100; `full`: all 1,319)
+- Returns `gsm8k_acc` (`METRIC_DIRECTIONS = {"gsm8k_acc": "higher"}`)
+- Retrieval is orthogonal here, same as for every other knowledge eval —
+  GSM8K questions are self-contained math word problems needing no external
+  knowledge, but whatever the config's `model.retrieval` says still applies
+  normally (this eval doesn't force retrieval on or off)
+
 ### Duplex
 
 **`evals/registry/duplex/full_duplex_bench.py`**
@@ -538,7 +727,9 @@ class EvalResult:
 - Default: 200 questions sampled from the knowledge eval question set; `--full` runs all ~1500
 - Reports mean, P50, P95
 
-**`evals/registry/latency/e2ekd.py`**
+**`evals/registry/latency/e2ekd.py`** — **deliberately deferred, not implemented**
+(2026-07-23). Original target design, kept below for reference if this is
+picked up later:
 - Two-step pipeline:
   1. Gemini API extracts keyword from transcribed response using prompt from paper appendix (Table 17)
   2. `nvidia/parakeet-tdt-0.6b-v2` gives onset timestamp of that keyword in audio output
@@ -548,9 +739,39 @@ class EvalResult:
 - `--spot-check` flag outputs 20 examples as numbered list of `(transcribed response, extracted keyword, verdict: correct/incorrect)` for human review before trusting metric at scale
 - `spot_check_completed: false` flag in result metadata surfaces as reminder in console output until manually flipped to `true`
 
-**`evals/registry/latency/retrieval_breakdown.py`** (does not exist yet,
-same as `e2ekd.py` above — this describes its target design, not shipped
-behavior)
+**Why deferred:** the keyword-onset step requires `nemo_toolkit["asr"]`
+(NVIDIA NeMo, to run `parakeet-tdt-0.6b-v2`) — a large, opinionated
+framework (its own ASR/NLP/TTS collections, `pytorch-lightning`/
+`hydra-core`/`torchmetrics`/etc. transitive deps) that pins its own
+`torch`/`torchaudio` compatible ranges. This project already has `torch`
+pinned carefully for `moshi` compatibility, and CLAUDE.md documents a real
+precedent (`moshi`'s own `uv pip install` step silently downgrading
+`transformers`, unnoticed until a plain `uv run` — no `--all-extras` —
+left it that way) for exactly this kind of second-large-framework version
+conflict. Weighed against that concrete, hard-to-test-in-advance risk (untestable
+in this environment either way — no GPU, aarch64 musl, same reason `torch`
+itself can't install here), the user judged E2EKD's incremental diagnostic
+value too narrow to justify it right now: `latency.ttfat` (TTFAT) and
+`latency.retrieval_breakdown` (`asr_wait_s`/`api_call_s`/
+`context_injection_s`) already cover the mechanism most likely to regress
+from fine-tuning a RAG-augmented model — whether `<ret>` fires appropriately
+and how the retrieval round-trip behaves. The one thing E2EKD's keyword-delay
+component would catch that those don't is a change in how long the model
+rambles *after* receiving retrieved context before actually stating the
+answer (a fine-tune could plausibly learn to hedge/pad more without
+`<ret>` behavior or retrieval latency moving at all) — a real but narrower,
+more speculative regression than "did retrieval break," and one
+`duplex.full_duplex_bench`'s turn-taking/interruption-latency tracks
+partially proxy for anyway from a different angle. Revisit if a lighter
+word-timestamp option surfaces, or if `<ret>`-behavior/retrieval-timing
+metrics stay stable across a fine-tune but end-to-end factuality or
+qualitative review still suggests a real latency regression slipping
+through.
+
+**`evals/registry/latency/retrieval_breakdown.py`** — implemented
+(2026-07-23), reusing `latency.ttfat`'s `_load_question_pool()` and
+`knowledge.open_audio_bench`'s `_load_audio_bytes()` rather than a third
+independent copy of the same pool-building logic.
 - Reports the same three stages as the demo's `retrieval_breakdown_s`
   (`asr_wait_s`, `api_call_s`, `context_injection_s`) for consistency, but
   **not** via the demo's mechanism — `RAGManager._background_task` is
@@ -560,16 +781,32 @@ behavior)
   `context_injection_s` is straightforward regardless: same technique as
   the demo, a second, redundant, timed call to `core/retrieval_backend.py`'s
   `format_context()` (see "Context formatting" above) around whatever eval
-  code calls `MoshiRAGAdapter.respond()`. Where `asr_wait_s` comes from on
-  a one-shot, non-live `respond()` call (there's no `_wait_event`-style
-  live wait the way there is in a continuous demo session) is an open
-  design question for whoever implements this file, not resolved by this
-  pass — correcting an earlier, inaccurate claim in this spec that
-  `GeminiAPIBackend.retrieve()` itself already had three internal timing
-  hooks; it doesn't, it returns one `(text, latency)` figure, same as
-  today
+  code calls `MoshiRAGAdapter.respond()`. `api_call_s` is `retrieval_latency_s`
+  directly, no subtraction needed — confirmed `GeminiAPIBackend.retrieve()`'s
+  own timer already starts *after* its `format_context()` call, so there's
+  no double-counting to correct for on this path (unlike the demo's own,
+  separate, now-superseded timing mechanism)
+- **`asr_wait_s`'s open design question (previously unresolved by this
+  spec) is now resolved**: `RAGManager._background_task`'s `wait_steps`-based
+  delay between a `<ret>` trigger and grabbing the final context is real,
+  unpatched code shared by `InferenceJob` and `Channel` alike — it
+  genuinely happens on the one-shot `respond()` path too, it just wasn't
+  being *timed* there yet. Fixed via a narrow addition to the two
+  already-existing allowed patches in `_TimedInferenceJob` (not a new
+  patch): `_patch_output_loop()`'s `<ret>` branch now stamps
+  `self.retrieval_trigger_ts = time.perf_counter()`, and
+  `_patch_rag_manager()`'s `_patched_get_reference_text` computes
+  `self.asr_wait_s = t0 - retrieval_trigger_ts` at entry. Both surface into
+  `respond()`'s metadata (`asr_wait_s`, 0.0 default when no `<ret>` fired).
+  Same last-trigger-wins fidelity limitation `rag_trigger_step` already has
+  for multiple `<ret>`s in one turn — not a new gap introduced here
+- Runs fine over `NullBackend` (retrieval disabled) — `<ret>` still fires
+  and gets timed regardless of backend, so `configs/baseline_no_retrieval.yaml`
+  legitimately keeps this eval in its `evals:` list; `api_call_s` is simply
+  near-zero in that case (`NullBackend.retrieve()`'s instant empty return),
+  not an error condition
 - Reports mean and P95 per stage
-- Flags any run where P95 total exceeds `latency_gate_ms` — this surfaces in console output, JSON errors list, and is treated as a correctness concern not just a performance one
+- Flags any run where P95 total exceeds `latency_gate_ms` — this surfaces in console output, JSON errors list, and is treated as a correctness concern not just a performance one. No `evals/runner.py` changes were needed for this — the gate-check console/compare-CLI handling and every metric key this eval reports were already generic/present from the original spec
 
 ### Voice (Step 2 only — registered but excluded from baseline configs)
 
@@ -716,7 +953,9 @@ invoking its serve function:
   `_patch_rag_manager` (`context: str -> (context, ref_text, elapsed,
   backend_label)`), ported near-verbatim, since `RAGManager` is a plain
   Python object (not the PyO3-native kind instance-patching can't touch —
-  see `_patch_deliver_step_row`'s docstring for that lesson) and `Channel`
+  confirmed the hard way: an early attempt to wrap `Channel.opus_writer.append_pcm`
+  directly failed, since `sphn.OpusStreamWriter` is a compiled/native
+  extension type) and `Channel`
   constructs its own fresh `RAGManager` per connection exactly like
   `InferenceJob` does, confirmed directly against real
   `inference_utils/channel.py` and `inference_utils/rag_manager.py`
@@ -959,6 +1198,11 @@ timestamp  : 2025-07-13T09:32:11Z
   resp acc     : 36.3%   (n=100)
   judge model  : gemini-3.5-flash
 
+[knowledge.gsm8k]
+  acc              : 61.4%   (n=100)
+  extractor model  : gemini-3.5-flash
+  tts backend      : gemini_tts (gemini-3.1-flash-tts-preview, voice: Kore)
+
 [duplex.full_duplex_bench]
   pause TOR (synthetic)    : 0.32  ↓ lower is better
   pause TOR (candor)       : 0.56  ↓
@@ -1029,6 +1273,19 @@ results written to: evals/results/run-2025-07-13T09-32-11Z.json
       "metadata": {
         "n": 100,
         "judge_model": "gemini-3.5-flash"
+      },
+      "completed": true,
+      "last_completed_index": 100,
+      "errors": []
+    },
+    "knowledge.gsm8k": {
+      "scores": {
+        "gsm8k_acc": 0.614
+      },
+      "metadata": {
+        "n": 100,
+        "judge_model": "gemini-3.5-flash",
+        "tts_backend": {"name": "gemini_tts", "type": "gemini_tts", "model": "gemini-3.1-flash-tts-preview", "voice": "Kore"}
       },
       "completed": true,
       "last_completed_index": 100,
@@ -1127,6 +1384,9 @@ knowledge.halu_eval_audio
   ref_acc           A: 42.0%   B: 43.1%   Δ +1.1pp  ✓
   resp_acc          A: 36.3%   B: 37.9%   Δ +1.6pp  ✓
   rag_lift_pp       (computed) A→B: +1.6pp over no-retrieval baseline
+
+knowledge.gsm8k
+  gsm8k_acc         A: 61.4%   B: 63.0%   Δ +1.6pp  ✓
 
 duplex.full_duplex_bench
   pause_tor_synth   A: 0.32    B: 0.35    Δ +0.03   ↓
@@ -1337,12 +1597,15 @@ model:
 judge:
   model: gemini-3.5-flash
 
+tts:
+  backend: gemini_tts          # key into configs/tts_backends.yaml — used by knowledge.gsm8k
+
 evals:
   - knowledge.open_audio_bench
   - knowledge.halu_eval_audio
+  - knowledge.gsm8k
   - duplex.full_duplex_bench
   - latency.ttfat
-  - latency.e2ekd
   - latency.retrieval_breakdown
 
 output_dir: ./evals/results/
@@ -1373,12 +1636,15 @@ model:
 judge:
   model: gemini-3.5-flash
 
+tts:
+  backend: gemini_tts          # key into configs/tts_backends.yaml — used by knowledge.gsm8k
+
 evals:
   - knowledge.open_audio_bench
   - knowledge.halu_eval_audio
+  - knowledge.gsm8k
   - duplex.full_duplex_bench
   - latency.ttfat
-  - latency.e2ekd
   - latency.retrieval_breakdown
 
 output_dir: ./evals/results/
@@ -1455,6 +1721,42 @@ that omits it entirely gets `format_context()`'s own all-off defaults
 `core/retrieval_backend.py`'s "Context formatting" section for what each
 field does.
 
+### `configs/tts_backends.yaml`
+
+New file (committed, non-sensitive — same `${VAR}` interpolation and
+alias-file pattern as `retrieval_backends.yaml`). Named backend
+definitions, looked up by `tts.backend` in an eval config and resolved by
+`core/config.py`. `type` is the `TTS_REGISTRY` key `core/tts.py`'s factory
+dispatches on:
+
+```yaml
+backends:
+  gemini_tts:
+    type: gemini_tts
+    model: gemini-3.1-flash-tts-preview
+    voice: Kore
+    api_key_env: GEMINI_API_KEY
+
+  # Alternate starting point — Gemini's 2.5-generation TTS-capable models,
+  # if the 3.1 preview model above is ever unavailable or unstable. Select
+  # explicitly (tts.backend: gemini_tts_25) rather than editing the entry
+  # above in place.
+  # gemini_tts_25:
+  #   type: gemini_tts
+  #   model: gemini-2.5-flash-preview-tts
+  #   voice: Kore
+  #   api_key_env: GEMINI_API_KEY
+
+  # Extension point, not implemented yet — no local TTS engine has been
+  # evaluated for this project. A future entry would look something like
+  # this and become selectable purely via config, with a new TTSBackend
+  # subclass registered in TTS_REGISTRY:
+  #
+  # kokoro:
+  #   type: kokoro
+  #   voice: af_heart
+```
+
 ### `configs/prompts/retrieval_reference_simple.txt`
 
 The `GeminiAPIBackend` prompt template, extracted verbatim from what was
@@ -1511,6 +1813,12 @@ tool this project depends on; it is a build-time dependency only,
 `moshi.server` serves the built static output at runtime and needs nothing
 further from Node.
 
+`core/tts.py`'s `GeminiTTSBackend` (see "Core Abstractions") needs no new
+dependency — `google-genai` is already a base dependency for the LLM judge
+and retrieval backend. `./tts_cache/` (generated, gitignored, excluded from
+`make sync` — see Makefile) holds synthesized question audio, same
+treatment as `./checkpoint_cache/`.
+
 Local dev (Ubuntu VM): `uv venv && uv sync`
 Vertex AI VM: `make sync && make install` (install only needed when dependencies change)
 
@@ -1541,6 +1849,7 @@ sync:
 	  --exclude '.venv' \
 	  --exclude '__pycache__' \
 	  --exclude 'checkpoint_cache' \
+	  --exclude 'tts_cache' \
 	  --exclude 'evals/results' \
 	  --exclude '*.pyc' \
 	  . $(REMOTE_USER)@$(REMOTE_HOST):$(REMOTE_DIR)/
