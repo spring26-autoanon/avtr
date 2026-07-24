@@ -229,6 +229,207 @@ rarely it fires. Not blocking the demo (a human just reconnects), but worth
 carrying into Phase 2's design: an eval run is long and unattended, so the
 same rare event there wouldn't have a human around to notice and retry.
 
+**Update (2026-07-24, `respond()`/eval path, not the demo)**: hit this same
+`ConnectError` far more frequently — 5 of 5 real retrieval-triggering
+`respond()` calls in one stretch — while A/B-testing a
+`gemini-3.5-flash-lite` retrieval backend (`configs/retrieval_backends.yaml`'s
+`gemini_api_flash_lite` entry) against a conditioner that had been running
+continuously for a long session. Cross-checking the retrieved reference
+text against the model's spoken answer confirmed real damage, not just a
+logged error: conditioning silently failed to apply, so the model
+hallucinated ungrounded answers (e.g. correctly-retrieved "Aristotle
+Onassis" spoken back as "Arthur Schlesinger") while every other signal
+(`rag_triggered=True`, a populated reference text) looked like a normal,
+successful RAG turn — exactly the "unattended eval run, no human to notice"
+risk this section already flagged, now confirmed to actually happen, not
+just a theoretical concern.
+
+Initial hypothesis (faster retrieval races the conditioner, landing the
+`/embed` call in a bad window given both processes share the VM's single
+A100 — unlike the paper's own MoshiRAG setup, which per Table 1's footnote
+12 always runs the front-end model and the local retrieval backend on
+*separate* GPUs) was **tested directly and did not hold up**: checking the
+conditioner's own state found the tmux *server* itself gone entirely (not
+just the session) — the conditioner process had died at some earlier,
+unknown point in that long session. A fresh conditioner ran `gemini_api`
+*and* `gemini_api_flash_lite` back to back with zero `ConnectError`s and
+correctly-grounded answers on both. **Best current read, updated: the
+conditioner can degrade/die over a long-running session for reasons still
+unknown (not yet caught in the act with a real crash log), independent of
+which retrieval backend is configured** — the apparent correlation with
+`gemini_api_flash_lite` was very likely coincidental timing (it happened to
+be under test when the conditioner died), not a causal property of that
+backend's speed. `gemini_api_flash_lite` is otherwise validated safe and
+meaningfully faster — see its own entry in
+`configs/retrieval_backends.yaml`.
+
+Practical fix landed from this: `scripts/run_demo.sh --conditioner-only`
+previously ran the conditioner with **no output redirection at all** — its
+only record was tmux's own scrollback, which is exactly what vanished when
+the tmux server died this round, destroying any chance of finding a crash
+traceback after the fact. It now tees to
+`demo/sessions/<session_id>/conditioner.log`, matching the full
+(non-`--conditioner-only`) path's existing behavior — the next occurrence
+should leave real evidence to root-cause from, rather than needing to be
+caught live. If a long run starts throwing reference-encoder
+`ConnectError`s, check that log first, then restart the conditioner.
+
+### RESOLVED: real ARC-encoder conditioning latency (~1.5-2s) is GPU contention with the front-end, not compute cost or IPC overhead
+
+Separate from the `ConnectError` investigation above: a live conversation
+test (VAD 0.15 + `gemini_api_flash_lite`, see the flash-lite entry in
+`configs/retrieval_backends.yaml`) surfaced the model speaking fabricated,
+ungrounded content ("Kabul", a fictional-sounding tournament name) on a
+question about the history of football, which then got fed back into the
+next turn's retrieval context and "confirmed" by the retrieval LLM as if it
+were real — a genuine hallucination-feedback loop, not independent noise.
+Root cause, found directly in the session's own conditioner/server logs:
+the model started speaking its answer within ~40ms of the reference text
+coming back, but the ARC-encoder's `/embed` call (which turns that
+reference text into the condition tensor actually applied via
+`update_streaming_sum_tensors`) took ~2.2s to complete — so the model's
+opening tokens were generated before real grounding had landed at all. This
+is expected, by-design MoshiRAG behavior, confirmed against the paper's own
+text (`arxiv.org/html/2604.12928v1`, fetched directly via `curl` after
+`WebFetch` gave two contradictory quotes for footnote 12 across two calls
+and couldn't be trusted): "While retrieval is in progress, the front-end
+Moshi continues to operate in full duplex... so the conversation proceeds
+without interruption" (§3.2) — generation is never gated on conditioning.
+The system's correctness depends entirely on the *whole* pipeline (text
+retrieval + ARC-encoding + conditioning applied) finishing inside the
+paper's own stated budget: "the entire retrieval process completes within
+two seconds" (§3.1), with "a sharp decline in accuracy when retrieval
+latency exceeds 1.5 seconds" observed empirically in their own data.
+
+This exposed a real, independent bug in our own eval code:
+`latency.retrieval_breakdown`'s `context_injection_s` measured a redundant,
+no-op `format_context()` call (pure string formatting, no I/O) instead of
+the actual `/embed` round trip, so it always silently reported `~0.00s`
+while the real ARC-encoder call was taking ~2s. Fixed: `core/
+model_interface.py`'s `_TimedInferenceJob` now times `job.
+_async_update_reference()` directly (new `conditioning_latency_s` field,
+exposed in `respond()`'s metadata dict), and `retrieval_breakdown.py` reads
+that real value instead. `total_s` now reflects genuine end-to-end
+grounding latency for the first time.
+
+**Isolating cause of the ~2s `/embed` latency itself** (GPU contention vs.
+inherent compute cost of the ARC-Encoder, which is `Llama-3.2-3B-Instruct`-
+based, not a lightweight embedder, vs. HTTP/serialization overhead):
+`scripts/gpu_diag_solo.sh` + `scripts/gpu_diag_contended.sh` ran the same
+conditioner process through two conditions — solo (no front-end model
+loaded at all) vs. contended (front-end actively generating via a real
+`evals/runner.py --mode smoke` run) — while polling `nvidia-smi` at ~100ms
+resolution throughout both.
+
+- **Solo** (nothing else on the GPU): steady-state `/embed` calls took
+  **~42ms** (first call ~410ms, CUDA warm-up). GPU utilization sat at ~0%
+  between brief spikes during the calls themselves. This rules out
+  "the 3B-param encoder is just inherently slow" and "HTTP/serialization
+  overhead accounts for the ~2s" — both would show up here too, and don't.
+- **Contended** (real eval, front-end generating against the same
+  conditioner process): `context_injection_mean_s` = **1.58s** (p95 1.68s)
+  — a **~37x slowdown** from the solo baseline, with nothing else changed.
+  GPU utilization sat at **66-76% for roughly half of all samples**,
+  sustained — the front-end's own generation compute, even at
+  `MoshiRAGAdapter`'s hardcoded `batch_size=1` (see `core/
+  model_interface.py`'s `_load_models()`), already saturates most of the
+  VM's single A100 during active generation, leaving the encoder's forward
+  pass to queue/time-slice for whatever's left.
+
+**Confirmed conclusion**: this is GPU contention on a shared single-A100
+VM, not inherent ARC-Encoder cost, not IPC overhead. moshi-rag's own
+separate-process conditioner design (`server_conditioner.py`) is working
+as intended — it's just not getting the isolation it's designed to
+provide, which assumes either a genuinely idle GPU alongside the front-end
+or the encoder's own dedicated second GPU (per the upstream README: "front-
+end needs a GPU with a significant amount of memory (24GB)... the reference
+encoder can run on a second GPU, or on the same GPU as Moshi if you have
+enough VRAM... ideally on the same machine [if separate], to reduce
+networking issues"). Note this README guidance is about deployment
+flexibility/VRAM headroom, not a latency optimization — it doesn't
+contradict this finding, it explains why our single-GPU deployment doesn't
+get the benefit the split is designed for. Separately: the paper's own
+footnote 12 ("the front-end models run on one GPU, and the local retrieval
+back end runs on another") is about the *retrieval back end* (the LLM
+generating reference text, e.g. their local Gemma) — a different component
+from the ARC-Encoder/reference-encoder. The paper never states where the
+ARC-Encoder ran during their own benchmarks; this remains genuinely
+unspecified, not inferred either way.
+
+**Real fix requires either a second, genuinely separate GPU for the
+conditioner, or MIG (Multi-Instance GPU) partitioning of the current single
+A100** — nothing fixable in this codebase alone. Neither has been tried yet;
+CUDA MPS was considered and rejected as a candidate fix on reasoning alone
+(it reduces context-switch overhead between processes sharing a GPU, but
+doesn't add compute capacity — the front-end's own 66-76% utilization during
+generation leaves too little headroom for MPS to meaningfully help).
+
+MIG is the untried, no-new-hardware option: the current VM's single A100 is
+the 80GB variant (see "Instance sizing" below). Whether it has enough total
+VRAM to carve a genuinely isolated partition for each component depends on
+the front-end's real footprint, which turned out to be meaningfully larger
+than moshi-rag's stated 24GB minimum once actually measured — see the
+correction below — so check real MIG profile sizes against that measured
+number before assuming this fits, rather than against the vendor's
+minimum-case figure.
+
+**Instance sizing, if a second physical GPU is what gets chosen**: `wb-gpu-
+a1ultra` is a single A100 **80GB** (`a2-ultragpu-1g` — confirmed by the
+~66-69GB combined figure below, which wouldn't fit on a 40GB card at all).
+Real GCP specs (`cloud.google.com/compute/docs/gpus`, fetched directly,
+not trusted from `WebFetch` synthesis after two unrelated contradictions
+this same investigation):
+
+| Machine type      | vCPU | Instance memory | GPUs         | GPU memory (total) |
+|--------------------|------|------------------|--------------|---------------------|
+| `a2-highgpu-2g`    | 24   | 170 GB           | 2x A100 40GB | 80 GB                |
+| `a2-ultragpu-2g`   | 24   | 340 GB           | 2x A100 80GB | 160 GB               |
+
+The ~66-69GB combined figure (front-end + conditioner, one GPU, recorded
+under Phase 1) reflects `moshi.server`'s own CLI default of `batch_size=16`
+(16 reserved concurrent-conversation KV-cache slots) — `run_demo.sh` never
+overrides it. The eval path is not affected by that specific number:
+`core/model_interface.py`'s `MoshiRAGAdapter._load_models()` hardcodes
+`batch_size=1` unconditionally (line ~903), and the GPU-contention finding
+above was measured entirely on that path.
+
+**Measured directly** (`scripts/gpu_diag_per_process.sh`, run against a real
+smoke eval): per-process `nvidia-smi --query-compute-apps` turned out to be
+blind to the eval's own process for its entire run — every one of 1615
+polled samples showed only the conditioner's PID, never the front-end's,
+despite the eval completing normally with real results. Cause not pinned
+down (not a permissions issue — same user owns both processes; not MIG,
+confirmed disabled). Worked around it with the simpler, already-collected
+**total**-memory data instead (`scripts/gpu_diag_contended.sh`'s
+`memory.used` column, `--query-gpu` rather than `--query-compute-apps`,
+which does not have this blind spot): conditioner-alone baseline is a
+steady ~23.7GB (`solo_poll.csv`); front-end+conditioner together
+(`contended_poll.csv`) ranged from ~46.5GB up to a peak of **71.5GB**,
+not a flat number — PyTorch's caching allocator visibly grew its reserved
+pool as different questions with different sequence lengths ran through
+generation, without releasing memory back down between them. Front-end's
+own incremental footprint (contended total minus conditioner-alone
+baseline): **~22.8GB at the low end, ~47.8GB at the peak.**
+
+**This corrects the provisional recommendation above** (originally: "`a2-
+highgpu-2g` is very likely sufficient," reasoned from moshi-rag's stated
+24GB *minimum*, before any real measurement existed) — keeping that
+reasoning trail here rather than silently replacing it, since it was a
+real, considered guess that real data has now overturned, not a typo. The
+measured peak (~47.8GB) **exceeds `a2-highgpu-2g`'s 40GB-per-GPU ceiling**.
+It's also a lower bound, not an upper one: this came from a *smoke* run
+(25 questions total); a real sample/full eval run (100+ questions) would
+very plausibly push the high-water mark higher still, since nothing in
+this codebase calls `torch.cuda.empty_cache()` between questions.
+**Confirmed recommendation: `a2-ultragpu-2g` (80GB per GPU) is necessary**,
+not `a2-highgpu-2g` — 40GB doesn't leave safe headroom above an already-
+observed 47.8GB peak. MIG partitioning of the *current* single 80GB A100
+remains untried and worth a look before provisioning new hardware at all
+(same conclusion as above, unaffected by this correction) — a 47.8GB
+partition plus a small one for the conditioner is a tighter fit inside one
+80GB card than originally assumed, but may still be workable; check real
+MIG profile sizes against this number before ruling it out.
+
 ### `respond()`-only: `_doing_retrieval` step-loop stall, mitigated (root cause: self-inflicted, not upstream)
 
 `core/model_interface.py`'s `_TimedInferenceJob._patch_output_loop()` and
@@ -368,6 +569,66 @@ the permanent fix, not a stopgap pending one. Practical implication: every
 `respond()`/eval run now requires a `server_conditioner` process running
 alongside it — see "Required setup: `server_conditioner` process" under
 "Running evals" below.
+
+### RESOLVED: `ttfat_s` always exactly 0.0 (found validating `latency.ttfat`)
+
+Every real VM run of `respond()` (any eval, any checkpoint) reported
+`ttfat_s=0.000` in its `[respond]` log line, and `latency.ttfat`'s
+aggregated mean/p50/p95 were all `0.00s` — including turns with substantial
+real generation, not just degenerate-silence ones. Root cause, confirmed
+against real `inference_utils/inference_job.py` source (cloned directly,
+not guessed): `_TimedInferenceJob.run()` used to set `self._t_question_end
+= time.time()` right after `await original_feed()` (the real
+`_feed_loop()`) *returned*. But under `stop_on_end_of_input=False`
+(`respond()`'s own deliberate setting — see the earlier
+`stop_on_end_of_input` bug above), `_feed_loop()` does **not** return when
+the user's real audio ends — it falls into an unconditional loop feeding
+zero-padding silence until the whole turn's `_shutdown_event` fires (i.e.
+near end-of-turn, not end-of-question). Since first real audio output
+always precedes end-of-turn, `t_first_audio < t_question_end` by
+construction, and `ttfat_s = max(0.0, t_first_audio - t_question_end)`
+clamped to exactly `0.0` on every single call.
+
+**Fix**: `_feed_loop()`'s own `feed_step` counter (source of
+`trace["question_end_step"]`, moshi-rag's own correct index for the last
+*real* input frame) increments exactly once per `input_queue.put()` call,
+in both its real-input loop and its trailing-silence loop. `run()` now
+wraps `input_queue.put()` (not `_feed_loop` itself — a single-method,
+observation-only patch, no behavior change) to record a
+`feed_step -> wall-clock time` list, then a new `_finalize_ttfat()`,
+called once `job.run()` fully returns, looks up the wall-clock time at
+`trace["question_end_step"]` and uses *that* as `t_question_end` — the
+precise moment the user's real question finished being fed, independent of
+whatever `_feed_loop` does afterward.
+
+**Second, independent bug found re-verifying the fix above on a real VM
+run**: `ttfat_s` was *still* exactly `0.000` after the `t_question_end` fix
+landed. Added temporary diagnostic logging (`[TTFAT-DIAG]`) rather than
+guessing again, and it was conclusive: `t_first_audio` (the "first audio
+token" side of the calculation, set via `output_queue.get()`'s
+`pcm.abs().max() > 1e-6` check) fired at `step_index=0` with
+`pcm_max_amp=0.01241324` — identical to 8 decimal places — across five
+completely different real questions/responses in the same run. A value
+that doesn't vary at all with content that different is definitionally not
+content-dependent speech onset; it's a fixed artifact (most likely a Mimi
+decoder warm-up transient) that happens to clear a `1e-6` threshold on the
+very first decoded frame, every time, regardless of what's actually being
+said. **Fix**: `t_first_audio` is now set on the first non-pad *text*
+token instead of PCM amplitude — MoshiRAG generates text and audio in
+lockstep, and the step-loop already distinguishes real tokens from
+`<pad>` (`_decode_text_token(text_token) is None`) for other bookkeeping,
+so this reuses an existing, already-correct signal rather than tuning a
+new amplitude threshold empirically. Lives inside the *already-patched*
+`_patched_output_loop` (the same function `asr_wait_s`/`rag_trigger_step`
+already extend this session), not a new patch surface. The old
+`output_queue.get` wrapping in `run()` is gone entirely — first-audio
+detection no longer needs it.
+
+Both fixes are unit-tested (fake job, no GPU needed to verify the wiring)
+but **not yet re-verified against a real checkpoint** as of this writing —
+do that before trusting any `latency.ttfat` numbers from a run predating
+this second fix, including runs made *after* the first fix but before this
+one (they'd still show `ttfat_s=0.000` for the reason described above).
 
 ### On the VM
 

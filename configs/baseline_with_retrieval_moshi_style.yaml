@@ -1,0 +1,40 @@
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
+  retrieval:
+    enabled: true
+    backend: gemini_api_moshi_style          # key into configs/retrieval_backends.yaml
+    # 1500 was tuned for gemini-2.0-flash (now deprecated/shut down). Its
+    # replacement, gemini-3.5-flash, is a "thinking" model that defaults to
+    # medium thinking effort and — unlike the 2.5 family's
+    # reasoning_effort="none" — cannot fully disable it. Observed real-world
+    # latency on a short retrieval prompt was ~6.8s at the default thinking
+    # level, before core/retrieval_backend.py requested thinking_level="low".
+    # 8000 is a buffer above that unoptimized figure; tighten once real
+    # latency stats are available with the low-thinking request in place.
+    latency_gate_ms: 8000
+    fallback: null                # scaffold slot — a second backend name to
+                                   # race/fall back to; unimplemented beyond
+                                   # this config slot existing, see
+                                   # core/retrieval_backend.py's registry note
+
+judge:
+  model: gemini-3.5-flash
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.e2ekd
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

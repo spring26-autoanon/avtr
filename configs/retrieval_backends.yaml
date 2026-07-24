@@ -33,6 +33,31 @@ backends:
                                   # cap this either
       role_labels: {user: "Human", model: "moshi"}
 
+  # Alternate starting point, not the shipped default — gemini-3.5-flash-lite,
+  # confirmed on a real VM run to cut retrieval latency meaningfully (~0.35-0.5s
+  # vs ~2s for gemini-3.5-flash, real Table 1-style retrieval_breakdown numbers)
+  # with no quality/grounding regression once tested against a healthy
+  # conditioner process (an earlier apparent regression — silently ungrounded
+  # answers alongside a reference-encoder ConnectError — was root-caused to a
+  # degraded/dead long-running conditioner unrelated to this backend; see
+  # CLAUDE.md's reference-encoder ConnectError note). Validated, not yet
+  # promoted to the shipped default — select explicitly
+  # (model.retrieval.backend: gemini_api_flash_lite) rather than editing
+  # the entry above in place. Retrieval only: this doesn't touch judge.model
+  # or the tts: block, which stay on gemini-3.5-flash/gemini-3.1-flash-tts-preview
+  # respectively regardless of which retrieval backend is selected.
+  gemini_api_flash_lite:
+    type: gemini_api
+    model: gemini-3.5-flash-lite
+    api_key_env: GEMINI_API_KEY
+    prompt_template: configs/prompts/retrieval_reference_simple.txt
+    context_formatting:
+      drop_leading_incomplete_turn: false
+      drop_trailing_incomplete_turn: false
+      thread_reference_history: false
+      history_max_entries: null
+      role_labels: {user: "Human", model: "moshi"}
+
   "null":
     type: null_backend
 

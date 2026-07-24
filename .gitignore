@@ -17,6 +17,7 @@ build/
 checkpoint_cache/
 evals/results/
 demo/sessions/
+gpu_diag/
 
 # demo/client/ (forked web client) build tooling
 node_modules/
