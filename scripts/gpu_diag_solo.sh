@@ -15,6 +15,26 @@
 # this same process deliberately, so "front-end generating or not" is the
 # only variable that changes between the two runs.
 #
+# On a real dual-GPU box (see specs/moshirag-evals-requirements.md's "GPU
+# Sizing and Multi-GPU Deployment" section): run_demo.sh --conditioner-only
+# auto-assigns this conditioner to physical GPU 1 rather than sharing GPU 0
+# with whatever front-end gpu_diag_contended.sh later loads. Neither script
+# sets CUDA_VISIBLE_DEVICES itself to force sharing -- this pair was
+# actually run this way on a real dual-GPU box (wb-gpu-a1ultra2g) to test
+# whether separation would eliminate the conditioning latency. **It
+# didn't**: gpu_diag_contended.sh's context_injection_s came back
+# statistically unchanged from the original single-A100 figure (~1.5-1.9s)
+# even with the conditioner genuinely isolated on GPU 1, confirmed idle via
+# nvidia-smi throughout. See CLAUDE.md's "SUPERSEDED: GPU contention
+# conclusion was wrong" section for the full evidence and the real root
+# cause (moshi-rag's own real-time step loop blocking the event loop, not
+# GPU sharing) — since fixed, see that same section's follow-up. This pair
+# stays useful as a real diagnostic tool (e.g. a regression check that the
+# fix stays fixed), just not as a way to prove GPU topology matters — it
+# doesn't. To force both processes back onto one GPU deliberately (e.g. to
+# reproduce the single-GPU numbers for comparison), export
+# CUDA_VISIBLE_DEVICES=0 before running both scripts.
+#
 # Usage: bash scripts/gpu_diag_solo.sh
 set -euo pipefail
 

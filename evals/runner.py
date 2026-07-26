@@ -383,6 +383,16 @@ def run_evals(config_path: str, mode: str, spot_check: bool) -> None:
             )
 
     model = build_model(cfg)
+    gpu_devices = getattr(model, "gpu_devices", None)
+    if gpu_devices is not None:
+        run_doc["conditioner_contended"] = gpu_devices.contended
+        if gpu_devices.contended:
+            print(
+                "⚠ single-GPU mode: known conditioner contention, do not trust "
+                "retrieval-latency or grounding-dependent scores from this run "
+                "(see specs/moshirag-evals-requirements.md's \"GPU Sizing and "
+                "Multi-GPU Deployment\" section)\n"
+            )
     _cache_model_respond(model)
     eval_names: list[str] = cfg.get("evals", [])
     all_completed = True

@@ -55,7 +55,22 @@ Co-authored-by: Claude <claude@anthropic.com>
 
 ---
 
-## Remote instance
+## Remote instances
+
+Two GCP Vertex AI VMs, same project and zone. See specs/
+moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
+section for why both exist: `wb-gpu-a1ultra2g` is the dual-GPU target that
+resolves the confirmed conditioner-contention finding (MIG was ruled out);
+`wb-gpu-a1ultra` remains valid for `tiny`/`smoke` dev-iteration and
+no-retrieval configs, not for scored retrieval-enabled `sample`/`full` runs
+or the demo. The codebase itself needs no per-instance configuration to
+target either one — `core/gpu.py` auto-detects real GPU count at runtime on
+whichever box it's rsynced to (see that section). The Makefile's `INSTANCE`/
+`SSH_ALIAS`/`REMOTE_DIR` variables (all `?=`, overridable) mean every `make`
+target already works against either box, e.g. `make sync
+SSH_ALIAS=wb-gpu-a1ultra2g`.
+
+### `wb-gpu-a1ultra` (single A100 80GB)
 
 ```
 GCP project:  adsp-s26-autoanon
@@ -67,12 +82,35 @@ Connection:   gcloud compute ssh with --tunnel-through-iap (no external IP)
 SSH alias:    wb-gpu-a1ultra  (short alias in ~/.ssh/config with IAP ProxyCommand)
 ```
 
+### `wb-gpu-a1ultra2g` (2x A100 80GB)
+
+Provisioning as of this writing — same GCP project/zone/user/remote-path
+convention as `wb-gpu-a1ultra` above, confirmed unchanged (same project,
+just a second VM in it).
+
+```
+GCP project:  adsp-s26-autoanon
+Zone:         us-central1-c
+Instance:     wb-gpu-a1ultra2g
+User:         jupyter
+Remote path:  /home/jupyter/moshirag-evals
+Connection:   gcloud compute ssh with --tunnel-through-iap (no external IP)
+SSH alias:    wb-gpu-a1ultra2g  (short alias in ~/.ssh/config with IAP ProxyCommand)
+```
+
 ### gcloud shorthand (add to your shell profile)
 
 ```bash
+# wb-gpu-a1ultra (single A100)
 alias gcloudssh='gcloud compute ssh jupyter@wb-gpu-a1ultra \
   --project=adsp-s26-autoanon --zone=us-central1-c --tunnel-through-iap'
 alias gcloudcmd='gcloud compute ssh jupyter@wb-gpu-a1ultra \
+  --project=adsp-s26-autoanon --zone=us-central1-c --tunnel-through-iap --'
+
+# wb-gpu-a1ultra2g (2x A100)
+alias gcloudssh2g='gcloud compute ssh jupyter@wb-gpu-a1ultra2g \
+  --project=adsp-s26-autoanon --zone=us-central1-c --tunnel-through-iap'
+alias gcloudcmd2g='gcloud compute ssh jupyter@wb-gpu-a1ultra2g \
   --project=adsp-s26-autoanon --zone=us-central1-c --tunnel-through-iap --'
 ```
 
@@ -112,6 +150,19 @@ Host wb-gpu-a1ultra
 This alias routes all SSH traffic through IAP (`start-iap-tunnel`) so `make sync`,
 `make install`, and `make ssh` all work without needing a VPN or firewall rule.
 
+**For `wb-gpu-a1ultra2g`** (the 2x A100 box — see "Remote instances" above),
+add a second block, same shape, name substituted throughout:
+
+```
+Host wb-gpu-a1ultra2g
+  HostName wb-gpu-a1ultra2g.us-central1-c.adsp-s26-autoanon
+  User jupyter
+  IdentityFile ~/.ssh/google_compute_engine
+  ProxyCommand gcloud compute start-iap-tunnel wb-gpu-a1ultra2g %p --listen-on-stdin --project=adsp-s26-autoanon --zone=us-central1-c
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+```
+
 ### Step 2 — Sync code to remote (local machine)
 
 ```bash
@@ -142,7 +193,28 @@ gcloud compute ssh jupyter@wb-gpu-a1ultra \
 nvidia-smi
 ```
 
-### Step 5 — Install dependencies
+### Step 5 — Install `uv` (skip if already present)
+
+Only needed on a genuinely fresh VM — a boot disk that isn't a clone/snapshot
+of an already-set-up box. This step existed on `wb-gpu-a1ultra` from some
+earlier, undocumented one-time setup; it was only discovered missing when
+`wb-gpu-a1ultra2g` (a fresh instance, not a clone) hit `-bash: uv: command
+not found` on every `uv ...` command below. Check first:
+
+```bash
+ls -la ~/.local/bin/uv
+```
+
+If that exists, `uv` is installed — just make sure it's on `PATH` (`source
+~/.bashrc`, or open a new shell). If it doesn't exist:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+source ~/.bashrc
+uv --version
+```
+
+### Step 6 — Install dependencies
 
 Prefer `make install` (also installs `moshi` and applies the post-install patches it needs
 — see the Makefile). If running manually:
@@ -154,7 +226,24 @@ uv sync --all-extras
 
 Only re-run after changes to `pyproject.toml`. For code-only changes, `make sync` is sufficient.
 
-### Step 6 — Download model checkpoint (inside tmux — survives disconnects)
+### Step 7 — Set up `.env`
+
+`.env` holds secrets (see "Environment and Secrets" in specs/
+moshirag-evals-requirements.md) and is gitignored *and* excluded from
+`make sync`'s rsync — a fresh VM never receives one from your local machine
+and needs its own, created from the committed `.env.example` template:
+
+```bash
+cd /home/jupyter/moshirag-evals
+cp .env.example .env
+# then edit .env and fill in real values for GEMINI_API_KEY, GCS_BUCKET, GCP_PROJECT
+```
+
+Required before Step 8 below (`resolve_checkpoint()` interpolates
+`GCS_BUCKET` into the checkpoint's `gs://` URI) and before running any
+eval/demo (`GEMINI_API_KEY` is used for every retrieval/judge/TTS call).
+
+### Step 8 — Download model checkpoint (inside tmux — survives disconnects)
 
 ```bash
 tmux new-session -s setup
@@ -274,7 +363,20 @@ should leave real evidence to root-cause from, rather than needing to be
 caught live. If a long run starts throwing reference-encoder
 `ConnectError`s, check that log first, then restart the conditioner.
 
-### RESOLVED: real ARC-encoder conditioning latency (~1.5-2s) is GPU contention with the front-end, not compute cost or IPC overhead
+### SUPERSEDED: real ARC-encoder conditioning latency (~1.5-2s) is GPU contention with the front-end, not compute cost or IPC overhead
+
+**Correction (2026-07-26): this section's "Confirmed conclusion" and everything
+built on it (MIG ruling, `a2-ultragpu-2g` provisioning) turned out to be
+diagnosing the wrong mechanism — see "SUPERSEDED: GPU contention conclusion
+was wrong" immediately after this section for the real root cause, found by
+actually testing on real dual-GPU hardware.** Kept below verbatim, not
+deleted or rewritten in place, since it was a real, carefully-reasoned
+conclusion from the evidence available on a single-GPU box at the time —
+the single-GPU evidence genuinely can't distinguish "conditioner compute
+contending with the front-end for the same GPU" from "front-end's own
+step loop starving its own concurrent I/O," since both look identical when
+there's only one GPU to look at. Only got disentangled once a second,
+genuinely separate GPU existed to test against.
 
 Separate from the `ConnectError` investigation above: a live conversation
 test (VAD 0.15 + `gemini_api_flash_lite`, see the flash-lite entry in

@@ -25,6 +25,7 @@ from evals.runner import (
     write_results,
     write_transcripts,
 )
+from core.gpu import DeviceAssignment
 from core.model_interface import ModelInterface, StubModelAdapter
 from core.retrieval_backend import NullBackend
 
@@ -243,6 +244,126 @@ def test_run_evals_shares_cache_across_evals(tmp_path):
             run_evals(cfg_path, mode="smoke", spot_check=False)
 
         assert counting_model.calls == 1  # both evals shared the one real call
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
+
+
+# ── conditioner_contended propagation ────────────────────────────────────────
+# See core/gpu.py and specs/moshirag-evals-requirements.md's "GPU Sizing and
+# Multi-GPU Deployment" section — run_evals() reads model.gpu_devices (if
+# present) and tags the result JSON so --compare surfaces a contended run
+# without the operator needing to remember which VM produced which file.
+
+
+def test_run_evals_tags_conditioner_contended_in_result_json(tmp_path):
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    model = _CountingModel()
+    model.gpu_devices = DeviceAssignment(
+        frontend_cuda_visible_devices="0", conditioner_cuda_visible_devices="0", contended=True
+    )
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.constant"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=model), \
+             patch.object(runner_mod, "load_eval_class", return_value=ConstantEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+
+        out_files = list(runner_mod.RESULTS_DIR.glob("run-*.json"))
+        with open(out_files[0]) as f:
+            data = json.load(f)
+        assert data["conditioner_contended"] is True
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
+
+
+def test_run_evals_tags_conditioner_not_contended_in_result_json(tmp_path):
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    model = _CountingModel()
+    model.gpu_devices = DeviceAssignment(
+        frontend_cuda_visible_devices="0", conditioner_cuda_visible_devices="1", contended=False
+    )
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.constant"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=model), \
+             patch.object(runner_mod, "load_eval_class", return_value=ConstantEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+
+        out_files = list(runner_mod.RESULTS_DIR.glob("run-*.json"))
+        with open(out_files[0]) as f:
+            data = json.load(f)
+        assert data["conditioner_contended"] is False
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
+
+
+def test_run_evals_omits_conditioner_contended_when_model_has_no_gpu_devices(tmp_path):
+    """StubModelAdapter (and any model with no gpu_devices attribute at all,
+    like _CountingModel by default) has no real GPU story — the field
+    shouldn't appear rather than being stamped as a misleading False."""
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.constant"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=StubModelAdapter()), \
+             patch.object(runner_mod, "load_eval_class", return_value=ConstantEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+
+        out_files = list(runner_mod.RESULTS_DIR.glob("run-*.json"))
+        with open(out_files[0]) as f:
+            data = json.load(f)
+        assert "conditioner_contended" not in data
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
+
+
+def test_run_evals_prints_warning_when_gpu_contended(tmp_path, capsys):
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    model = _CountingModel()
+    model.gpu_devices = DeviceAssignment(
+        frontend_cuda_visible_devices="0", conditioner_cuda_visible_devices="0", contended=True
+    )
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.constant"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=model), \
+             patch.object(runner_mod, "load_eval_class", return_value=ConstantEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+        captured = capsys.readouterr()
+        assert "single-GPU mode" in captured.out
+    finally:
+        runner_mod.RESULTS_DIR = orig_results
+
+
+def test_run_evals_silent_when_gpu_not_contended(tmp_path, capsys):
+    from evals import runner as runner_mod
+    orig_results = runner_mod.RESULTS_DIR
+    runner_mod.RESULTS_DIR = tmp_path / "results"
+
+    model = _CountingModel()
+    model.gpu_devices = DeviceAssignment(
+        frontend_cuda_visible_devices="0", conditioner_cuda_visible_devices="1", contended=False
+    )
+    cfg_path = _minimal_config(tmp_path, evals=["fixture.constant"])
+
+    try:
+        with patch.object(runner_mod, "build_model", return_value=model), \
+             patch.object(runner_mod, "load_eval_class", return_value=ConstantEval):
+            run_evals(cfg_path, mode="smoke", spot_check=False)
+        captured = capsys.readouterr()
+        assert "single-GPU mode" not in captured.out
     finally:
         runner_mod.RESULTS_DIR = orig_results
 

@@ -10,6 +10,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
+from core.gpu import DeviceAssignment, ensure_cuda_visible_devices
 from core.retrieval_backend import NullBackend, RetrievalBackend
 
 logger = logging.getLogger(__name__)
@@ -115,6 +116,12 @@ def _silent_wav(duration_s: float = 0.5, sample_rate: int = _SAMPLE_RATE) -> byt
 
 
 class ModelInterface(abc.ABC):
+    # Populated by MoshiRAGAdapter; stays None for StubModelAdapter and any
+    # other adapter with no real GPU story. See core/gpu.py and specs/
+    # moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
+    # section.
+    gpu_devices: DeviceAssignment | None = None
+
     @abc.abstractmethod
     def transcribe(self, audio: bytes) -> str:
         """Transcribe audio bytes to text."""
@@ -782,6 +789,19 @@ class MoshiRAGAdapter(ModelInterface):
         trigger and routes retrieval through Gemini, so latency is measured
         by retrieval_breakdown eval hooks on that backend instance.
 
+    GPU device assignment:
+      - Always claims physical GPU 0 (core/gpu.py's
+        ensure_cuda_visible_devices("frontend")), resolved and applied to
+        this process's own CUDA_VISIBLE_DEVICES before _load_models()
+        imports torch. On the current single-A100 VM this is also where
+        the conditioner runs, which is a confirmed source of GPU
+        contention (see specs/moshirag-evals-requirements.md's "GPU Sizing
+        and Multi-GPU Deployment" section) -- self.gpu_devices.contended
+        is True in that case, and a warning is logged. Not carried further
+        into respond()'s own metadata dict; read self.gpu_devices directly
+        (evals/runner.py does, to tag conditioner_contended into the
+        result JSON).
+
     TTFAT is computed as wall-clock delta from user audio end → first non-silent
     audio token emitted. In batch offline inference this is driven by the model's
     processing latency (~1 inference step at 12.5Hz ≈ 80ms minimum).
@@ -798,6 +818,18 @@ class MoshiRAGAdapter(ModelInterface):
         # Any field omitted from `generation` falls back to the same
         # default that was previously hardcoded — see _DEFAULT_GENERATION.
         self._generation = {**_DEFAULT_GENERATION, **(generation or {})}
+        # Must resolve before _load_models() imports torch -- CUDA_VISIBLE_DEVICES
+        # has no effect on a process once its CUDA runtime has initialized.
+        # See core/gpu.py and specs/moshirag-evals-requirements.md's "GPU
+        # Sizing and Multi-GPU Deployment" section.
+        self.gpu_devices = ensure_cuda_visible_devices("frontend")
+        if self.gpu_devices.contended:
+            logger.warning(
+                "single-GPU mode: known conditioner contention (see specs/"
+                "moshirag-evals-requirements.md's \"GPU Sizing and Multi-GPU "
+                "Deployment\" section) -- do not trust retrieval-latency or "
+                "grounding-dependent scores from this run"
+            )
         self._load_models()
         # See _ensure_step_loop() — lazily created on first respond() call,
         # then kept alive for this adapter's whole lifetime.
@@ -898,6 +930,12 @@ class MoshiRAGAdapter(ModelInterface):
         # hardcoded, not config-driven (see that constant's own comment for
         # why those three are path-specific rather than shared).
         args = argparse.Namespace(
+            # Always "cuda:0", deliberately not derived from gpu_devices
+            # (__init__ already resolved and applied the real physical GPU
+            # choice to this process's own CUDA_VISIBLE_DEVICES before this
+            # method ever ran) -- once that scoping is in effect, whichever
+            # physical GPU this process was assigned is always the only one
+            # visible to it, so it's always addressed as index 0 from here.
             device="cuda:0",
             cfg_coef=self._generation["cfg_coef"],
             batch_size=1,

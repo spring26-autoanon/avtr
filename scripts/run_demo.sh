@@ -125,6 +125,21 @@ TOKENIZER=$(ls "$CKPT"/*.model 2>/dev/null | head -1)
 echo "Deriving environment from '$CONFIG_PATH'..."
 eval "$(uv run --all-extras python scripts/print_demo_env.py --config "$CONFIG_PATH")"
 
+# ── GPU device assignment ─────────────────────────────────────────────────────
+# Auto-detected from real hardware -- the same script, same rsynced files,
+# and same commands run unchanged on the current single-A100 box and a
+# future dual-A100 one; nothing here branches on hostname or machine type.
+# See core/gpu.py and specs/moshirag-evals-requirements.md's "GPU Sizing and
+# Multi-GPU Deployment" section for the resolution rule and why an explicit
+# CUDA_VISIBLE_DEVICES already set in this shell's environment always wins
+# over auto-detection (each process still gets --cuda-device 0/--device
+# cuda below regardless -- once CUDA_VISIBLE_DEVICES scopes a process to one
+# physical GPU, that GPU is always addressed as index 0 from inside it).
+FRONTEND_CUDA_VISIBLE_DEVICES=$(uv run --all-extras python -m core.gpu frontend)
+COND_CUDA_VISIBLE_DEVICES=$(uv run --all-extras python -m core.gpu conditioner)
+GPU_CONTENDED=0
+[[ "$FRONTEND_CUDA_VISIBLE_DEVICES" == "$COND_CUDA_VISIBLE_DEVICES" ]] && GPU_CONTENDED=1
+
 # ── Build env prefix (passed into each tmux window) ──────────────────────────
 ENV_PREFIX="REFERENCE_ENCODER_URL=http://localhost:8001"
 ENV_PREFIX+=" LLM_BASE_URL=$LLM_BASE_URL"
@@ -137,7 +152,7 @@ if [[ "$STT_MODE" == "gradium" ]]; then
 fi
 
 # ── Build service commands ────────────────────────────────────────────────────
-CONDITIONER_CMD="$ENV_PREFIX uv run --all-extras python -m moshi.server_conditioner \
+CONDITIONER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$COND_CUDA_VISIBLE_DEVICES uv run --all-extras python -m moshi.server_conditioner \
   --config '$CKPT/config.json' \
   --moshi-weight '$MOSHI_WEIGHT' \
   --cuda-device 0 \
@@ -169,8 +184,16 @@ if [[ "$CONDITIONER_ONLY" == "1" ]]; then
         "cd $PROJECT_DIR && $CONDITIONER_CMD 2>&1 | tee '$CONDITIONER_ONLY_SESSION_DIR/conditioner.log'" Enter
 
     echo ""
-    echo "Conditioner-only launching in tmux session '$SESSION' (port 8001)."
+    echo "Conditioner-only launching in tmux session '$SESSION' (port 8001, CUDA_VISIBLE_DEVICES=$COND_CUDA_VISIBLE_DEVICES)."
     echo "Log: $CONDITIONER_ONLY_SESSION_DIR/conditioner.log"
+    if [[ "$GPU_CONTENDED" == "1" ]]; then
+        echo ""
+        echo "⚠ single-GPU mode: whatever process you point at this conditioner will"
+        echo "  share this same physical GPU with it -- known conditioner contention,"
+        echo "  do not trust retrieval-latency or grounding-dependent scores from"
+        echo "  that run (see specs/moshirag-evals-requirements.md's \"GPU Sizing and"
+        echo "  Multi-GPU Deployment\" section)."
+    fi
     echo ""
     echo "  tmux attach -t $SESSION   — watch logs"
     echo ""
@@ -194,7 +217,7 @@ echo "Building web client (demo/client/)..."
 CLIENT_DIST="$PROJECT_DIR/demo/client/dist"
 [[ -f "$CLIENT_DIST/index.html" ]] || { echo "Client build did not produce $CLIENT_DIST/index.html" >&2; exit 1; }
 
-SERVER_CMD="$ENV_PREFIX DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKPOINT_ALIAS' DEMO_CONFIG='$CONFIG_PATH' \
+SERVER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$FRONTEND_CUDA_VISIBLE_DEVICES DEMO_SESSION_DIR='$SESSION_DIR' DEMO_CHECKPOINT='$CHECKPOINT_ALIAS' DEMO_CONFIG='$CONFIG_PATH' \
   uv run --all-extras python scripts/instrumented_server.py \
   --moshi-weight '$MOSHI_WEIGHT' \
   --mimi-weight '$MIMI_WEIGHT' \
@@ -229,6 +252,13 @@ RAG_TIMEOUT_NOTE="from $CONFIG_PATH"
 [[ -n "$RAG_TIMEOUT_OVERRIDE" ]] && RAG_TIMEOUT_NOTE="${RAG_TIMEOUT_OVERRIDE}s (--rag-timeout override)"
 echo ""
 echo "Demo launching in tmux session '$SESSION' (STT: $STT_MODE, config: $CONFIG_PATH, rag-timeout: $RAG_TIMEOUT_NOTE)."
+if [[ "$GPU_CONTENDED" == "1" ]]; then
+    echo ""
+    echo "⚠ single-GPU mode: conditioner and front-end share one physical GPU --"
+    echo "  known contention (see specs/moshirag-evals-requirements.md's \"GPU"
+    echo "  Sizing and Multi-GPU Deployment\" section). Do not trust"
+    echo "  retrieval-latency or grounding-dependent behavior from this session."
+fi
 echo ""
 echo "  tmux attach -t $SESSION              — watch all logs"
 echo "  tmux select-window -t $SESSION:0     — conditioner (port 8001)"

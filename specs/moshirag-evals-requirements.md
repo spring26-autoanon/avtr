@@ -1826,7 +1826,12 @@ Vertex AI VM: `make sync && make install` (install only needed when dependencies
 
 ## Infrastructure
 
-- GCP Vertex AI, single `a2-highgpu-1g` VM (1 x A100 80GB)
+- GCP Vertex AI, single `a2-ultragpu-1g` VM (1 x A100 80GB) — corrected
+  from an earlier `a2-highgpu-1g` in this section, which names the
+  40GB-per-GPU tier; the VM has always been the 80GB variant, confirmed
+  via GCP's own machine-type table once combined front-end+conditioner
+  memory usage (~66-71GB, see "GPU Sizing and Multi-GPU Deployment" below)
+  was actually measured and wouldn't have fit on a 40GB card at all
 - MoshiRAG 7B + 1B streaming ASR run in-process on the A100; the ARC-Encoder always runs as a separate `server_conditioner` process — for both the demo and evals, not just one or the other
 - All LLM backend and judge calls go to Gemini API — no local LLM
 - Checkpoints stored in GCS, referenced by URI or named alias
@@ -1834,6 +1839,143 @@ Vertex AI VM: `make sync && make install` (install only needed when dependencies
 - Production VM environment managed via `make sync` and `make install` — no Docker
 - `.venv` excluded from rsync, built on VM to match Linux and CUDA environment
 - Demo accessed from macOS (or any browser) via SSH tunnel to VM port 8998 — no software installation required on the client machine
+
+---
+
+## GPU Sizing and Multi-GPU Deployment
+
+**Correction (2026-07-26): the "GPU contention" root cause below, and the
+MIG/dual-GPU sizing work that followed from it, is superseded.** Testing on
+real dual-GPU hardware (`wb-gpu-a1ultra2g`, since stopped) showed the
+conditioning latency (~1.5-1.9s) persists essentially unchanged even with
+the front-end and conditioner on genuinely separate physical GPUs — proving
+GPU compute sharing was never the actual mechanism. The real cause is
+upstream moshi-rag's own `ServerState._step_loop` running each generation
+step as a synchronous, unyielding call inside an `async def` function,
+starving its own concurrent conditioning HTTP call of event-loop time —
+see CLAUDE.md's "SUPERSEDED: GPU contention conclusion was wrong" section
+for the full evidence chain (GPU utilization traces, matched timer values,
+real moshi-rag source). **GPU count is not the relevant variable for this
+latency** — `wb-gpu-a1ultra` (single A100) is sufficient for all further
+work. The sections below are kept largely as originally written (not
+deleted or silently rewritten, per this repo's convention for correcting a
+wrong conclusion) since the reasoning was sound given single-GPU-only
+evidence at the time — only disentangled once a genuinely separate GPU
+existed to test against. Where a subsection's conclusion no longer holds,
+that's called out inline rather than removed.
+
+Original root cause claim (superseded, see above): running the front-end
+model and `server_conditioner`'s ARC-Encoder on the same physical GPU means
+the front-end's own 66-76% utilization during generation starves the
+conditioner's `/embed` calls — measured `context_injection_s` mean 1.58s /
+p95 1.68s under real contention vs. ~42ms solo, a ~37x slowdown from the
+same process and code. This exceeds the MoshiRAG paper's own stated budget
+(§3.1: "the entire retrieval process completes within two seconds," with "a
+sharp decline in accuracy when retrieval latency exceeds 1.5 seconds"
+observed empirically) and has produced a confirmed hallucination-feedback
+loop in a live session, not just a theoretical risk. This was believed
+ruled out via solo-vs-contended `nvidia-smi` polling on the single-GPU box
+at the time — but that comparison couldn't actually distinguish "conditioner
+compute contending for the GPU" from "front-end's own step loop starving
+its own I/O," since both look identical when there's only one GPU in the
+picture. The dual-GPU test is what actually disentangled them.
+
+### MIG: ruled out (moot now, not just infeasible)
+
+The largest MIG sub-partition available on an 80GB A100 short of the
+whole card (`7g.80gb`, which isn't a partition at all) is 40GB (`4g.40gb`
++ `3g.40gb`, the standard two-way split). The front-end's own measured
+peak memory footprint is **47.8GB** — from a 25-question *smoke* run,
+itself a lower bound since nothing in this codebase calls
+`torch.cuda.empty_cache()` between questions and a real sample/full run
+would plausibly push it higher still. That already exceeds the largest
+partition MIG can offer without allocating the entire GPU, which defeats
+the point of partitioning. MIG does not fit this workload on capacity
+grounds alone — and separately, now moot regardless: the correction above
+means no GPU-partitioning scheme was ever going to fix this latency, since
+the bottleneck isn't GPU compute sharing at all.
+
+### Dual-GPU (`a2-ultragpu-2g`): tried, confirmed not the fix
+
+Provisioned as `wb-gpu-a1ultra2g` (2x A100 80GB, same project/zone as
+`wb-gpu-a1ultra` — see CLAUDE.md's "Remote instances"), specifically to test
+whether genuine physical GPU separation resolved the conditioning latency.
+It did not — see the correction at the top of this section and CLAUDE.md's
+"SUPERSEDED: GPU contention conclusion was wrong" for the full evidence.
+`nvidia-smi` confirmed the device-pinning mechanism below worked exactly as
+designed (front-end on GPU 0, conditioner alone on GPU 1, correct memory
+footprints on each) — the mechanism isn't broken, it just doesn't address
+the actual bottleneck. Stopped (not deleted) once this was confirmed;
+resuming single-GPU-only work on `wb-gpu-a1ultra` for the underlying
+step-loop fix, which needs no GPU-count-specific infrastructure at all.
+
+### Device assignment: auto-detected, same codebase on both instances
+
+`make sync`'s rsync, and every file it carries, stay identical regardless
+of which VM they land on — no hostname or machine-type branching
+anywhere. Device assignment is a pure function of GPU count, resolved
+fresh at each process launch:
+
+- **Front-end**: always `cuda:0`
+- **Conditioner**: `cuda:1` if `torch.cuda.device_count() >= 2`, else
+  `cuda:0` (shared with the front-end — see the warning gate below)
+
+This fixed, role-based rule (not negotiation between processes) is
+required because the eval path's two processes are launched
+independently, from two separate terminals (see "Required setup:
+`server_conditioner` process" in CLAUDE.md) with no shared parent to
+coordinate a split at launch time — each has to independently arrive at
+the same answer.
+
+- **Single source of truth**: `core/gpu.py`'s `resolve_devices()`
+  (Python, via `torch.cuda.device_count()`) is the one place this logic
+  lives. `scripts/run_demo.sh` shells out to it (same pattern as its
+  existing `resolve_checkpoint`/`print_demo_env.py` calls) rather than
+  reimplementing device-count detection separately in bash — avoids the
+  two ever disagreeing.
+- **Explicit override always wins**: auto-detection only sets
+  `CUDA_VISIBLE_DEVICES` when the launching process's environment doesn't
+  already have it set. This preserves `scripts/gpu_diag_solo.sh`/
+  `scripts/gpu_diag_contended.sh`'s existing pattern of deliberately
+  forcing both processes onto the same GPU for a controlled comparison,
+  including on the dual-GPU box if that comparison is ever rerun there.
+- **Replaces two existing hardcodes**: `core/model_interface.py`'s
+  `device="cuda:0"` in `MoshiRAGAdapter._load_models()`, and
+  `scripts/run_demo.sh`'s `--cuda-device 0` (conditioner) / `--device
+  cuda` (server) flags.
+
+### Warning gate: contended runs are tagged, not silently trusted
+
+`resolve_devices()` returns `contended: bool` — true whenever the
+conditioner ends up sharing device 0 with the front-end (the single-GPU
+case). Whenever `contended` is true:
+
+- Logged at startup on both the demo and eval paths (`⚠ single-GPU mode:
+  known conditioner contention, do not trust retrieval-latency or
+  grounding-dependent scores from this run`)
+- Stamped into the eval result JSON's metadata as
+  `conditioner_contended: true`, alongside the existing
+  checkpoint/timestamp/git-hash/config/mode tags — so `--compare` between
+  two runs surfaces a contended run immediately, without the operator
+  needing to remember which VM produced which file. Same spirit as the
+  existing `spot_check_completed` gate.
+
+### Current guidance: `wb-gpu-a1ultra` (single GPU) is sufficient for all work
+
+Superseding the "Fallback scope" framing this section originally had (which
+assumed retrieval-enabled `sample`/`full` runs and the demo required
+dual-GPU): since GPU count was never the relevant variable, single-GPU is
+not a restricted fallback anymore — it's simply the instance, for
+`tiny`/`smoke`/no-retrieval work and retrieval-enabled `sample`/`full`/demo
+work alike, until the real step-loop fix (see CLAUDE.md's "Not yet decided"
+list under the superseded-conclusion section) lands. The
+`conditioner_contended` JSON tag and warning gate (below) still fire
+correctly on single-GPU runs — they're accurate about *contention*, just no
+longer the whole explanation for the latency those runs will still show.
+Leave that tag and warning in place (harmless, still meaningful for
+diagnosing genuine GPU-sharing scenarios in the future) without treating an
+absence of contention as proof a run's conditioning latency is fine — that
+now depends on whether the step-loop fix has landed, not on GPU topology.
 
 ---
 

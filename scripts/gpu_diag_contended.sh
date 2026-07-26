@@ -16,6 +16,29 @@
 # alongside "is the front-end generating," defeating the point of the
 # comparison.
 #
+# On a real dual-GPU box, this script's own name is no longer literally
+# accurate by default: MoshiRAGAdapter.__init__ auto-assigns the front-end
+# to physical GPU 0, and gpu_diag_solo.sh's conditioner already auto-landed
+# on GPU 1 -- so this run is genuinely NOT GPU-contended unless
+# CUDA_VISIBLE_DEVICES was forced beforehand (see gpu_diag_solo.sh's
+# header). That was the whole point of running it this way on
+# wb-gpu-a1ultra2g: to test whether genuine separation would collapse
+# context_injection_s back toward gpu_diag_solo.sh's solo numbers. **It
+# didn't** -- context_injection_s came back statistically unchanged from
+# the original single-A100 figure (~1.5-1.9s), while GPU 1 (the
+# conditioner) sat ~0% utilized throughout per nvidia-smi. Real root cause,
+# confirmed against moshi-rag's own source: `ServerState._step_loop` runs
+# the real per-step model computation synchronously inside an `async def`,
+# blocking the event loop and starving this exact conditioning HTTP call —
+# not GPU contention, and not something GPU topology can fix. See
+# CLAUDE.md's "SUPERSEDED: GPU contention conclusion was wrong" section for
+# the full evidence and the fix (core/model_interface.py's
+# _fetch_and_apply_reference_conditioning, applied on both the eval and
+# demo paths). If rerunning this pair after that fix, expect
+# context_injection_s to land close to the solo baseline regardless of
+# whether the conditioner shares a GPU with the front-end or not — the fix
+# targets the event-loop starvation directly, not GPU placement.
+#
 # Usage: bash scripts/gpu_diag_contended.sh
 set -euo pipefail
 

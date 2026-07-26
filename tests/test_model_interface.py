@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from core.gpu import DeviceAssignment
 from core.model_interface import (
     ModelInterface,
     MoshiRAGAdapter,
@@ -118,12 +119,14 @@ def test_stub_is_model_interface():
 
 
 def test_moshi_rag_adapter_generation_defaults(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
     adapter = MoshiRAGAdapter("some/checkpoint")
     assert adapter._generation == _DEFAULT_GENERATION
 
 
 def test_moshi_rag_adapter_generation_overrides_merge_over_defaults(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
     adapter = MoshiRAGAdapter("some/checkpoint", generation={"rag_timeout": 12.0})
     assert adapter._generation["rag_timeout"] == 12.0
@@ -134,9 +137,62 @@ def test_moshi_rag_adapter_generation_overrides_merge_over_defaults(monkeypatch)
 
 
 def test_moshi_rag_adapter_generation_none_uses_defaults(monkeypatch):
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
     adapter = MoshiRAGAdapter("some/checkpoint", generation=None)
     assert adapter._generation == _DEFAULT_GENERATION
+
+
+# ── MoshiRAGAdapter GPU device assignment ───────────────────────────────────
+# __init__ resolves gpu_devices (and logs the contention warning) itself,
+# before ever calling _load_models() — see core/gpu.py and specs/
+# moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
+# section for why this has to happen before _load_models() imports torch.
+
+
+def test_moshi_rag_adapter_sets_gpu_devices_from_ensure_cuda_visible_devices(monkeypatch):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    fake_assignment = DeviceAssignment(
+        frontend_cuda_visible_devices="0",
+        conditioner_cuda_visible_devices="1",
+        contended=False,
+    )
+    calls = []
+
+    def _fake_ensure(role, count=None):
+        calls.append(role)
+        return fake_assignment
+
+    monkeypatch.setattr("core.model_interface.ensure_cuda_visible_devices", _fake_ensure)
+    adapter = MoshiRAGAdapter("some/checkpoint")
+    assert adapter.gpu_devices is fake_assignment
+    assert calls == ["frontend"]
+
+
+def test_moshi_rag_adapter_logs_warning_when_gpu_contended(monkeypatch, caplog):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    monkeypatch.setattr(
+        "core.model_interface.ensure_cuda_visible_devices",
+        lambda role, count=None: DeviceAssignment("0", "0", contended=True),
+    )
+    with caplog.at_level("WARNING"):
+        MoshiRAGAdapter("some/checkpoint")
+    assert "single-GPU mode" in caplog.text
+
+
+def test_moshi_rag_adapter_no_warning_when_gpu_not_contended(monkeypatch, caplog):
+    monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
+    monkeypatch.setattr(
+        "core.model_interface.ensure_cuda_visible_devices",
+        lambda role, count=None: DeviceAssignment("0", "1", contended=False),
+    )
+    with caplog.at_level("WARNING"):
+        MoshiRAGAdapter("some/checkpoint")
+    assert "single-GPU mode" not in caplog.text
+
+
+def test_stub_model_adapter_gpu_devices_defaults_to_none():
+    assert StubModelAdapter().gpu_devices is None
 
 
 # ── MoshiRAGAdapter.respond() degenerate-silence retry/flag ─────────────────
@@ -148,6 +204,7 @@ def test_moshi_rag_adapter_generation_none_uses_defaults(monkeypatch):
 
 def _make_adapter(monkeypatch, once_results):
     """once_results: list of (text_out, rag_trigger_count) for successive _respond_once() calls."""
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     monkeypatch.setattr(MoshiRAGAdapter, "_load_models", lambda self: None)
     adapter = MoshiRAGAdapter("some/checkpoint")
     calls = iter(once_results)
