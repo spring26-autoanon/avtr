@@ -532,6 +532,153 @@ partition plus a small one for the conditioner is a tighter fit inside one
 80GB card than originally assumed, but may still be workable; check real
 MIG profile sizes against this number before ruling it out.
 
+### SUPERSEDED: GPU contention conclusion was wrong — real bottleneck is moshi-rag's own step loop, not GPU sharing
+
+Once `wb-gpu-a1ultra2g` (2x A100 80GB — see specs/moshirag-evals-requirements.md's
+"GPU Sizing and Multi-GPU Deployment") was provisioned and `core/gpu.py`'s
+auto-detected device pinning put the front-end on physical GPU 0 and the
+conditioner genuinely alone on physical GPU 1 (confirmed via `nvidia-smi`:
+conditioner process at its known ~23.7GB baseline on GPU 1, GPU 0 otherwise
+idle once the front-end's one-shot eval process exited), a real
+`gpu_diag_contended.sh` run against this genuinely-separated setup still
+measured `context_injection_mean_s` = **1.686s** (p95 1.857s) — statistically
+indistinguishable from the original single-GPU finding's 1.58s/1.68s. If GPU
+compute sharing were the real mechanism, true physical separation should
+have collapsed this back toward the ~42ms solo baseline. It didn't.
+
+**Root cause, traced through real source, not guessed:**
+
+1. `contended_poll.csv` (GPU utilization polled at ~100ms resolution
+   throughout the run) shows GPU 1 (conditioner) at **mean 0.08% utilization,
+   max 11%, only 29 of 3046 samples showing any activity at all** — consistent
+   with ~17 real `/embed` calls each taking their expected ~42-100ms, matching
+   the solo baseline exactly. The conditioner's own compute was never slow;
+   it sat idle almost the entire run.
+2. `core/model_interface.py`'s `conditioning_latency_s` timer wraps the whole
+   of moshi-rag's own `InferenceJob._async_update_reference()`:
+   ```python
+   async def _async_update_reference(self, reference_text: str) -> None:
+       streaming_sum_tensor = await get_conditioning_remote_async(...)
+       ...
+       self.server.runner.lm_gen.update_streaming_sum_tensors(per_slot)  # not awaited
+   ```
+   `update_streaming_sum_tensors` (moshi-rag's own `LMGen` method, confirmed
+   via `inspect.getsource` on the real VM) does one `t.to(device=device,
+   dtype=dtype)` call moving a ~200-600KB tensor onto the front-end's own GPU
+   — a real candidate for queuing behind the front-end's own generation
+   kernels. Ruled out by direct comparison: the eval result JSON's
+   `context_injection_values` (the *outer* timer, including this tensor
+   copy) match `get_conditioning_remote_async`'s own internally-logged
+   `"[Remote Encoder] Received response in X.XXXs"` (the *inner* timer,
+   HTTP call only) to the millisecond (e.g. `1.5117...` vs `1.511s`,
+   `1.8782...` vs `1.877s`). The tensor copy adds negligible time — the
+   entire delay is inside the awaited HTTP call itself, not the subsequent
+   GPU-side tensor application.
+3. That HTTP call (`get_conditioning_remote_async`, moshi-rag's own code,
+   confirmed via `inspect.getsource`) is a plain `httpx.AsyncClient` POST,
+   properly `await`ed, no synchronous blocking calls of its own. Combined
+   with finding 1 (server-side genuinely fast and idle), the only place left
+   for ~1.5s to hide is **the front-end's own event loop not getting back to
+   this coroutine promptly** — not because it isn't correctly async, but
+   because something else on the same thread isn't yielding.
+4. That something else, found in moshi-rag's own `server.py` (cloned
+   directly from `github.com/kyutai-labs/moshi-rag`, not guessed):
+   ```python
+   async def run_one_step(self) -> bool:
+       g = self._gather_step_inputs()
+       if g is None:
+           return False
+       return self.runner.run_step(g, self._deliver_step_row)  # sync call, not awaited
+
+   async def _step_loop(self):
+       while True:
+           ran = await self.run_one_step()
+           if ran:
+               await asyncio.sleep(0)
+           else:
+               await asyncio.sleep(0.005)
+   ```
+   `run_one_step` is declared `async def` but its body never `await`s
+   anything — `self.runner.run_step(...)` runs synchronously to completion,
+   blocking the entire single-threaded event loop for however long one
+   step takes, with the only yield point being `await asyncio.sleep(0)`
+   *between* steps. The same contended run's own log independently confirms
+   how long that is: `WARNING batched step (1/1 active) took 95.3ms`,
+   repeated throughout. ~1.5s / ~95ms per step ≈ 16 consecutive blocking
+   steps — a plausible span for the event loop to go without a genuine free
+   moment to service the already-completed httpx socket read.
+
+**Confirmed conclusion (revised)**: the bottleneck is moshi-rag's own
+`ServerState._step_loop`/`run_one_step` running the real per-step model
+computation as a synchronous, unyielding call inside an `async def`
+function — starving concurrent I/O (the conditioning HTTP call) of the
+event-loop time it needs to complete promptly, regardless of how many
+physical GPUs are involved or which one the conditioner runs on. This is
+upstream moshi-rag code, not anything introduced in this repo. **GPU count
+is not the relevant variable for this specific latency** — `wb-gpu-a1ultra`
+(single A100) is sufficient for all further work on this problem;
+`wb-gpu-a1ultra2g` was stopped (not deleted) once this was confirmed. See
+specs/moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
+section for the corresponding correction to the MIG/dual-GPU
+recommendation.
+
+**RESOLVED**: before deciding between patching the step loop itself vs.
+moving the conditioning call off it, checked whether `run_one_step`'s
+synchronous, unyielding call is a genuine bug or a deliberate design
+dependency — confirmed the latter, via real moshi-rag source
+(`lm.py`'s `apply_pending_streaming_sum_condition`): the conditioning
+tensor is consumed **one row per real-time step**
+(`state.pending_streaming_sums[b]`, drained one entry per call), in
+lockstep with Mimi/Moshi's fixed 12.5Hz frame rate — `run_step`'s own
+`elapsed_ms >= 77` warning threshold confirms a hard real-time budget per
+step. Patching `run_one_step`/`_step_loop` itself (splitting it across
+threads, inserting mid-step yields) would risk a real race on
+`pending_streaming_sums` and would fight that real-time constraint — not
+attempted, and moshi-rag's `InferenceJob`/`ServerState`/`Channel`/
+`BatchRunner` step-loop logic remains completely untouched, per this
+project's own rule against reimplementing it.
+
+Fix implemented instead: `core/model_interface.py`'s
+`_fetch_and_apply_reference_conditioning()` moves only the conditioning
+HTTP fetch (`get_conditioning_remote_async` — pure network I/O, zero
+GPU/model-state involvement) off the main event loop, via
+`asyncio.to_thread` running it to completion on its own throwaway event
+loop in a worker thread. `update_streaming_sum_tensors` (the one piece
+that touches live model state, confirmed cheap at ~1ms) stays on the
+calling thread, unchanged from upstream. Applied in **two places**, since
+this bug affects the live demo identically to respond()/evals (both share
+the same `ServerState._step_loop`, confirmed by reading `channel.py`'s own
+`Channel._async_update_reference` — the same pattern, same bug): `core/
+model_interface.py`'s `_immediate_handle_reference_text` (eval path) and a
+new `scripts/instrumented_server.py`'s `_patch_channel_conditioning()`
+(demo path, replacing `Channel._async_update_reference` wholesale). Not
+yet verified on real hardware — do that (rerun `scripts/gpu_diag_solo.sh`
++ `scripts/gpu_diag_contended.sh` on `wb-gpu-a1ultra`, expect
+`context_injection_s` to land near the solo baseline now) before trusting
+this fixed.
+
+`core/gpu.py`'s auto-detected device pinning stays in the codebase — it's
+not wrong, just not the fix for this — and remains useful groundwork if a
+real reason to use multiple GPUs ever comes up again.
+
+**TODO, not yet fixed**: the demo's own `session.last_context_injection_s`
+(feeds the live session log's `retrieval_breakdown_s.context_injection_s`)
+still comes from the older, separately-known-imprecise `format_context()`
+timing in `scripts/instrumented_server.py`'s
+`_patch_rag_manager_get_reference_text` — not the real conditioning
+latency this section is about. Confirmed why this isn't a trivial
+follow-up fix: `Channel._handle_reference_text` schedules
+`_async_update_reference` as a **fire-and-forget background task**
+(`self._task_group.create_task(...)`, not awaited), so by the time
+`RAGManager._background_task` reads `last_context_injection_s` to report
+`retrieval_breakdown_s`, the real conditioning fetch this section fixed
+hasn't necessarily completed yet — the real timing would need to be
+reported asynchronously, after the fact, once that background task
+actually finishes, which doesn't fit the current single synchronous
+reporting point in `_background_task`. Left alone for now; the eval
+path's own `context_injection_s` (via `latency.retrieval_breakdown`) is
+unaffected by this and already reports the real value correctly.
+
 ### `respond()`-only: `_doing_retrieval` step-loop stall, mitigated (root cause: self-inflicted, not upstream)
 
 `core/model_interface.py`'s `_TimedInferenceJob._patch_output_loop()` and

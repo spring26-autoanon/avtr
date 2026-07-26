@@ -214,6 +214,79 @@ def _float32_pcm_to_wav(pcm: "np.ndarray", sample_rate: int) -> bytes:  # type: 
     )
 
 
+async def _fetch_and_apply_reference_conditioning(
+    reference_text: str,
+    *,
+    encoder_url: str,
+    lm_gen,
+    batch_size: int,
+    slot_idx: int,
+) -> None:
+    """
+    Narrow, evidence-backed replacement for the conditioning-application
+    tail moshi-rag's own InferenceJob._async_update_reference() and
+    Channel._async_update_reference() each do identically (confirmed via
+    inspect.getsource() against the real installed package and a direct
+    clone of kyutai-labs/moshi-rag) — used by both core/model_interface.py's
+    _TimedInferenceJob (respond()/evals) and scripts/instrumented_server.py's
+    Channel patch (demo), so there's one implementation, not two that could
+    drift.
+
+    Why this exists — see CLAUDE.md's "SUPERSEDED: GPU contention conclusion
+    was wrong" section for the full evidence chain: a real dual-GPU test
+    proved the ~1.5-1.9s conditioning latency is NOT GPU compute contention
+    (the conditioner's own GPU sat ~0% utilized throughout). Root cause,
+    confirmed by reading moshi-rag's real `server.py` source: `ServerState.
+    _step_loop`/`run_one_step` calls the real per-step model forward pass
+    (`BatchRunner.run_step`) synchronously inside an `async def`, with no
+    yield mid-step, blocking the single-threaded event loop for the real,
+    logged duration of each step ("batched step ... took 95.3ms" warnings)
+    — starving this exact conditioning HTTP call (`get_conditioning_remote_
+    async`, a properly-awaited `httpx.AsyncClient` call with no blocking of
+    its own) of the event-loop time it needs to complete promptly, even
+    though the conditioner itself responds in ~42-100ms.
+
+    That step-loop behavior is NOT a bug to patch around: `lm.py`'s
+    `apply_pending_streaming_sum_condition` consumes the conditioning tensor
+    one row per real-time step (`state.pending_streaming_sums[b]`, drained
+    one entry per call), in lockstep with Mimi/Moshi's fixed 12.5Hz frame
+    rate — `run_step`'s own `elapsed_ms >= 77` warning threshold confirms a
+    hard real-time budget per step. Splitting `run_step` across threads or
+    inserting yields mid-step would risk a real race on
+    `pending_streaming_sums` and would fight a genuine real-time constraint
+    the model's own audio pacing depends on — moshi-rag's `InferenceJob`/
+    `ServerState`/`Channel`/`BatchRunner` step-loop logic is deliberately
+    NOT touched here, per this project's own rule against reimplementing it.
+
+    The fix instead: only the conditioning HTTP fetch — pure network I/O,
+    zero GPU/model-state involvement — moves off the main event loop, via
+    `asyncio.to_thread` running `get_conditioning_remote_async` to
+    completion on its own throwaway event loop in a worker thread
+    (`asyncio.run()` is safe here: a fresh worker thread has no existing
+    loop). `update_streaming_sum_tensors` stays on the calling (main)
+    thread, unchanged from upstream — confirmed cheap (~1ms: eval JSON's
+    `context_injection_values` matched the HTTP-only "Received response"
+    log timings to the millisecond, see CLAUDE.md), and it's the one piece
+    of this that touches live, shared model state, so there's no
+    correctness reason to move it off-thread too.
+    """
+    from moshi.inference_utils.inference_job import get_conditioning_remote_async
+
+    def _run_in_new_loop():
+        return asyncio.run(get_conditioning_remote_async(text=reference_text, encoder_url=encoder_url))
+
+    t0 = time.perf_counter()
+    condition_tensor = await asyncio.to_thread(_run_in_new_loop)
+    logger.info(
+        "[Reference] ARC encoding received in %.3fs (streaming_sum %s)",
+        time.perf_counter() - t0,
+        tuple(condition_tensor.shape),
+    )
+    per_slot = [None] * batch_size
+    per_slot[slot_idx] = condition_tensor.squeeze(0)
+    lm_gen.update_streaming_sum_tensors(per_slot)
+
+
 class _TimedInferenceJob:
     """
     Thin wrapper around InferenceJob that:
@@ -457,7 +530,18 @@ class _TimedInferenceJob:
             # step-index-deferred handoff.
             job.trace["reference_text"] = reference_text or ""
             t0 = time.perf_counter()
-            await job._async_update_reference(reference_text or "")
+            # _fetch_and_apply_reference_conditioning() replaces moshi-rag's
+            # own job._async_update_reference() call that used to be here —
+            # see that function's docstring for why (event-loop starvation
+            # by moshi-rag's own real-time step loop, not GPU contention).
+            await _fetch_and_apply_reference_conditioning(
+                reference_text or "",
+                encoder_url=job.server.reference_encoder_url,
+                lm_gen=job.server.runner.lm_gen,
+                batch_size=job.server.batch_size,
+                slot_idx=job.slot_idx,
+            )
+            job.trace["conditioning_step"] = job.step_index
             self.conditioning_latency_s = time.perf_counter() - t0
 
         rag_trigger_count = 0

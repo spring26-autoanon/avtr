@@ -745,6 +745,54 @@ def _patch_rag_manager_background_task(session: SessionLog) -> None:
     RAGManager._background_task = patched_background_task
 
 
+def _patch_channel_conditioning() -> None:
+    """
+    Whole-method replacement of Channel._async_update_reference — the demo
+    path's exact counterpart to core/model_interface.py's
+    _fetch_and_apply_reference_conditioning() fix for respond()/evals. See
+    that function's docstring for the full root-cause chain (confirmed via
+    a real dual-GPU test: the ~1.5-1.9s conditioning latency is moshi-rag's
+    own ServerState._step_loop blocking the event loop synchronously per
+    real-time step, starving the conditioning HTTP call — not GPU
+    contention, and not fixable by touching the step loop itself, which is
+    load-bearing for real-time per-step conditioning injection).
+
+    Confirmed via a direct clone of kyutai-labs/moshi-rag that Channel's own
+    _async_update_reference is the same get_conditioning_remote_async +
+    update_streaming_sum_tensors pattern as InferenceJob's, driven by the
+    same shared step loop — so the demo is exposed to the identical bug,
+    not just respond()/evals. This is also the original bug: the live
+    hallucination-feedback-loop session that kicked off this whole
+    investigation ran through this exact code path.
+
+    Reuses core/model_interface.py's shared helper rather than a second,
+    independently-drifting implementation of the same fetch-and-apply
+    sequence. Does not touch session.last_context_injection_s (still set
+    from the older, separately-known-imprecise format_context() timing in
+    _patch_rag_manager_get_reference_text — see that function's docstring)
+    — Channel._handle_reference_text schedules _async_update_reference as a
+    fire-and-forget background task, so by the time
+    RAGManager._background_task reads last_context_injection_s to report
+    retrieval_breakdown_s, this task's real timing hasn't necessarily
+    completed yet; correcting that measurement for the demo path is a
+    separate, unresolved problem, not addressed by this patch.
+    """
+    from moshi.inference_utils.channel import Channel
+    from core.model_interface import _fetch_and_apply_reference_conditioning
+
+    async def patched_async_update_reference(self, reference_text: str) -> None:
+        await _fetch_and_apply_reference_conditioning(
+            reference_text,
+            encoder_url=self.server.reference_encoder_url,
+            lm_gen=self.server.runner.lm_gen,
+            batch_size=self.server.batch_size,
+            slot_idx=self.slot_idx,
+        )
+        self._log.info("[Reference] updated streaming_sum condition on LM")
+
+    Channel._async_update_reference = patched_async_update_reference
+
+
 def apply_patches(
     session: SessionLog,
     checkpoint: str,
@@ -753,6 +801,7 @@ def apply_patches(
 ) -> None:
     _patch_server_state(session, checkpoint, retrieval_backend_display)
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
+    _patch_channel_conditioning()
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
     _patch_rag_manager_background_task(session)

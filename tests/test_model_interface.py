@@ -407,11 +407,13 @@ def test_patch_output_loop_logs_and_reraises_trigger_exception(caplog):
     assert any("rag_manager.trigger() raised" in r.message for r in caplog.records)
 
 
-def test_patch_output_loop_handle_reference_fn_applies_conditioning_immediately():
+def test_patch_output_loop_handle_reference_fn_applies_conditioning_immediately(monkeypatch):
     """No step-index deferral (unlike the old _catch_reference_text /
     _retrieval_done_step handoff) — matches Channel's _handle_reference_text,
     called directly from RAGManager's own background task."""
     job = _make_output_loop_job()
+    fake_conditioning = AsyncMock()
+    monkeypatch.setattr("core.model_interface._fetch_and_apply_reference_conditioning", fake_conditioning)
 
     _TimedInferenceJob(job, MagicMock())
     asyncio.run(job._output_loop())
@@ -420,15 +422,28 @@ def test_patch_output_loop_handle_reference_fn_applies_conditioning_immediately(
     asyncio.run(handle_reference_fn("Paris is the capital of France.", lm_label="test-lm"))
 
     assert job.trace["reference_text"] == "Paris is the capital of France."
-    job._async_update_reference.assert_awaited_once_with("Paris is the capital of France.")
+    fake_conditioning.assert_awaited_once_with(
+        "Paris is the capital of France.",
+        encoder_url=job.server.reference_encoder_url,
+        lm_gen=job.server.runner.lm_gen,
+        batch_size=job.server.batch_size,
+        slot_idx=job.slot_idx,
+    )
+    # Matches moshi-rag's own _async_update_reference side effect (see
+    # core/model_interface.py's docstring) — set by the caller now, since
+    # _fetch_and_apply_reference_conditioning is shared with the demo path's
+    # Channel, which has no InferenceJob-style trace dict.
+    assert job.trace["conditioning_step"] == job.step_index
 
 
-def test_patch_output_loop_handle_reference_fn_times_conditioning_call():
+def test_patch_output_loop_handle_reference_fn_times_conditioning_call(monkeypatch):
     """conditioning_latency_s (latency.retrieval_breakdown's context_injection_s
-    source) should reflect the real elapsed time of job._async_update_reference
-    — the ARC-encoder /embed round trip — not stay at its 0.0 default once a
-    reference has actually been applied."""
+    source) should reflect the real elapsed time of
+    _fetch_and_apply_reference_conditioning — the ARC-encoder /embed round
+    trip — not stay at its 0.0 default once a reference has actually been
+    applied."""
     job = _make_output_loop_job()
+    monkeypatch.setattr("core.model_interface._fetch_and_apply_reference_conditioning", AsyncMock())
 
     timed = _TimedInferenceJob(job, MagicMock())
     assert timed.conditioning_latency_s == 0.0
@@ -439,6 +454,81 @@ def test_patch_output_loop_handle_reference_fn_times_conditioning_call():
 
     assert timed.conditioning_latency_s >= 0.0
     assert isinstance(timed.conditioning_latency_s, float)
+
+
+# ── _fetch_and_apply_reference_conditioning ─────────────────────────────────
+# See its own docstring in core/model_interface.py — the narrow fix for the
+# ~1.5-1.9s conditioning latency (moshi-rag's own step loop starving this
+# HTTP call's event-loop time, not GPU contention — see CLAUDE.md's
+# "SUPERSEDED: GPU contention conclusion was wrong"). moshi isn't installed
+# in this sandbox, so get_conditioning_remote_async's module is faked via
+# sys.modules injection — this still exercises the real per_slot/
+# update_streaming_sum_tensors logic, just not the real HTTP call itself.
+
+
+def _install_fake_moshi_inference_job(monkeypatch, fake_get_conditioning_remote_async):
+    import sys
+    import types
+
+    for name in ("moshi", "moshi.inference_utils", "moshi.inference_utils.inference_job"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    sys.modules["moshi.inference_utils.inference_job"].get_conditioning_remote_async = (
+        fake_get_conditioning_remote_async
+    )
+
+
+def test_fetch_and_apply_reference_conditioning_places_tensor_at_slot_idx(monkeypatch):
+    from core.model_interface import _fetch_and_apply_reference_conditioning
+
+    fake_tensor = MagicMock()
+    fake_tensor.squeeze.return_value = "squeezed-tensor"
+
+    async def fake_get_conditioning_remote_async(text, encoder_url):
+        assert text == "some reference text"
+        assert encoder_url == "http://localhost:8001"
+        return fake_tensor
+
+    _install_fake_moshi_inference_job(monkeypatch, fake_get_conditioning_remote_async)
+    lm_gen = MagicMock()
+
+    asyncio.run(_fetch_and_apply_reference_conditioning(
+        "some reference text",
+        encoder_url="http://localhost:8001",
+        lm_gen=lm_gen,
+        batch_size=3,
+        slot_idx=1,
+    ))
+
+    lm_gen.update_streaming_sum_tensors.assert_called_once()
+    per_slot = lm_gen.update_streaming_sum_tensors.call_args[0][0]
+    assert per_slot == [None, "squeezed-tensor", None]
+
+
+def test_fetch_and_apply_reference_conditioning_runs_fetch_off_the_main_thread(monkeypatch):
+    """The whole point of this function: get_conditioning_remote_async must
+    not run on the caller's own event loop, so moshi-rag's own step loop
+    blocking that loop can't starve it. Confirmed by checking the fetch
+    executes on a different thread than the one that called this function."""
+    import threading
+
+    from core.model_interface import _fetch_and_apply_reference_conditioning
+
+    caller_thread = threading.current_thread()
+    fetch_thread_name = {}
+
+    async def fake_get_conditioning_remote_async(text, encoder_url):
+        fetch_thread_name["thread"] = threading.current_thread()
+        tensor = MagicMock()
+        tensor.squeeze.return_value = "tensor"
+        return tensor
+
+    _install_fake_moshi_inference_job(monkeypatch, fake_get_conditioning_remote_async)
+
+    asyncio.run(_fetch_and_apply_reference_conditioning(
+        "text", encoder_url="http://localhost:8001", lm_gen=MagicMock(), batch_size=1, slot_idx=0,
+    ))
+
+    assert fetch_thread_name["thread"] != caller_thread
 
 
 # ── asr_wait_s / retrieval_trigger_ts (latency.retrieval_breakdown support) ────
