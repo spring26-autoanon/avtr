@@ -651,11 +651,220 @@ the same `ServerState._step_loop`, confirmed by reading `channel.py`'s own
 `Channel._async_update_reference` — the same pattern, same bug): `core/
 model_interface.py`'s `_immediate_handle_reference_text` (eval path) and a
 new `scripts/instrumented_server.py`'s `_patch_channel_conditioning()`
-(demo path, replacing `Channel._async_update_reference` wholesale). Not
-yet verified on real hardware — do that (rerun `scripts/gpu_diag_solo.sh`
-+ `scripts/gpu_diag_contended.sh` on `wb-gpu-a1ultra`, expect
-`context_injection_s` to land near the solo baseline now) before trusting
-this fixed.
+(demo path, replacing `Channel._async_update_reference` wholesale).
+
+**Verified on real hardware (2026-07-27, `wb-gpu-a1ultra`, eval path)**:
+`scripts/gpu_diag_solo.sh` + `scripts/gpu_diag_contended.sh` rerun with the
+fix in place (`conditioner_contended: true`, single-GPU box, same as the
+original bug report). Solo baseline unchanged at ~41ms steady-state.
+Contended `context_injection_mean_s` = **0.196s** (p95 0.199s, n=3 valid
+samples out of 5 — 2 excluded by the separately-tracked degenerate-silence
+issue), down from the pre-fix 1.58s mean / 1.68s p95 — an ~8x reduction,
+from ~37x the solo baseline to ~4.7x it. Confirms the event-loop-starvation
+diagnosis and the fix.
+
+**Demo path separately verified (2026-07-27, same VM, real live session, 4
+turns / 3 real `<ret>` triggers, `gemini_api`/`gemini-3.5-flash` backend)**:
+confirmed active (the `[Reference] ARC encoding received in %.3fs` log line
+only exists inside the new shared helper), and real — **1.126s, 0.976s,
+0.700s** across the three triggers, vs. the eval path's clean 0.196s.
+
+**Root cause of the 4-6x gap, corrected after actually reading the
+per-trigger log lines closely (the earlier "GIL contention from live STT/
+VAD" explanation below was a plausible-sounding guess, not checked against
+the demo's own log, and turned out to be off-target):**
+`get_conditioning_remote_async` logs its own internal
+`[Remote Encoder] Received response in Xs` timing *inside* the worker
+thread, separately from `_fetch_and_apply_reference_conditioning`'s outer
+`[Reference] ARC encoding received in Xs` (logged after `await
+asyncio.to_thread(...)` returns on the main thread). Diffing these two
+per trigger:
+
+| Trigger | Inner (raw HTTP fetch) | Outer (main thread resumes) | Gap |
+|---|---|---|---|
+| 1 | 0.505s | 1.126s | 0.621s |
+| 2 | 0.116s | 0.976s | 0.860s |
+| 3 | 0.104s | 0.700s | 0.596s |
+
+**The raw fetch itself is fast — often faster than the eval path's own
+~0.1-0.13s inner fetches, confirming `asyncio.to_thread` is doing exactly
+what it's supposed to.** The entire 4-6x gap lives in the **handoff after
+the worker thread is already done**: `asyncio.to_thread` wraps
+`loop.run_in_executor`, whose completion is delivered back to the awaiting
+coroutine via `loop.call_soon_threadsafe` — a callback queued on the
+*main* event loop, which still can't run until that loop is free. This is
+the same category of bug the fix was written to solve, just moved one
+layer down: the fix eliminated the multi-round-trip HTTP exchange sharing
+the loop with `run_step()`, but the single "wake up and deliver the
+result" handoff is still exposed to the same congestion.
+
+**This is present in the eval path too, at much smaller scale** — checked
+`gpu_diag/contended_eval.log` the same way: inner/outer gaps there run
+~30-100ms (e.g. 0.132s→0.199s, 0.101s→0.186s), roughly one `run_step()`
+step's worth (eval's own log shows frequent `batched step (1/1 active)
+took ~95ms` warnings). So it's the same mechanism at both scales, not a
+demo-only bug — the demo's gap is just far larger.
+
+**What doesn't explain the size of the demo's gap**: `moshi.server`'s
+default `batch_size=16` (vs. eval's hardcoded 1) was the obvious first
+suspect — ruled out, `batched step (1/16 active)` timings (81.8-88.5ms)
+are the same order of magnitude as eval's.
+
+**Root cause, precisely identified (2026-07-27, `scripts/instrumented_
+server.py`'s `_patch_event_loop_diagnostics()`, `DEMO_ASYNCIO_DEBUG=1` —
+see that function's docstring for a real monkeypatching pitfall hit and
+fixed along the way: the first version hooked `asyncio.set_event_loop`,
+the package-level re-export, not `asyncio.events.set_event_loop`, the
+name Python 3.11's real `asyncio.run()` internals actually call through —
+it silently never fired on the first VM run despite passing a local
+sanity test that (wrongly) validated itself by calling the same patched
+name directly)**: with the patch actually firing, asyncio's own debug
+logging (20ms threshold) shows the front-end step loop firing
+`Executing ... took ~0.050s` continuously, back-to-back, throughout the
+whole session — real, but individually under the app's own 77ms warning
+threshold, which is why `batched step` warnings never appeared near the
+gap windows despite the step loop genuinely running near-continuously.
+But lining these up precisely against all three gap windows found the
+*actual* dominant blocker isn't the step loop at all: **one
+`Channel._recv_loop()` execution per window, 0.58-0.80s each — accounting
+for nearly the entire gap by itself** (the step loop's own contribution
+in the same windows is ~0.05s × 2, comparatively tiny).
+
+Read `Channel._recv_loop` (`moshi/inference_utils/channel.py:255-324`,
+real source) to find why: it calls `await self.stt.send_audio(chunk)` per
+audio frame. With `--stt local` (the default, used in every session so
+far), that's `LocalSpeechToText.send_audio()`
+(`moshi/stt/local_stt.py:108-137`) — declared `async def`, but its
+`while self._pending.size >= fs:` loop calls `self.mimi.encode(chunk)`
+and `self._run_codes(...)` (a real local Mimi + STT-language-model
+forward pass) **fully synchronously, no `await`**. The only yield point
+inside that loop, `await self._out_queue.put(word)`, only fires when a
+word is actually decoded that frame — most frames don't produce one.
+`_recv_loop` calls `send_audio` directly, not as its own task, so when
+several audio frames back up in `self._pending` (plausible any time the
+step loop's own frequent-but-small blocking has just eaten a slice of
+event-loop time), `send_audio` drains the whole backlog as one
+uninterrupted synchronous burst — exactly what the log shows. Confirmed
+this is STT-mode-specific, not inherent to `_recv_loop`: the remote-STT
+alternative, `GradiumSpeechToText.send_audio()`
+(`moshi/stt/gradium_stt.py:39-46`), is just `await
+self.audio_queue.put(audio)` — genuinely fast, no local inference, the
+real model work happens in a separate background task talking to a
+remote service.
+
+This also explains why eval's own gap is so much smaller: `InferenceJob`'s
+feed loop **also** calls `LocalSpeechToText.send_audio()`
+(`inference_job.py:240/258`) — `core/model_interface.py:1006/1052`
+constructs its own `LocalSpeechToText(deepcopy(self._mimi))` too, so this
+was never demo-only. But eval feeds audio self-paced, synchronously, from
+the same coroutine that consumes it — no independent network-paced
+producer that can race ahead of consumption the way a live WebSocket's
+`_recv_loop` can, so no backlog forms; eval's small ~30-100ms gap is fully
+explained by the front-end step loop alone. The demo has that mechanism
+*plus* this STT one layered on top from real backlog accumulation, and
+the STT one dominates.
+
+**Correctness re-assessed and found safer than first flagged**: the
+original note here said moving `LocalSpeechToText` inference off-thread
+would carry the same risk category as `update_streaming_sum_tensors`
+(touches live, shared model state). Checked directly against real
+source and found this wrong — `server.py:93`'s `self.mimi_copy =
+deepcopy(mimi)` at server startup, plus `server.py:236`'s
+`Channel(self, ws, mimi=deepcopy(self.mimi_copy))` per connection (and
+this module's own matching `deepcopy(self._mimi)`/
+`deepcopy(self._stt_template)` per call), mean `LocalSpeechToText`'s
+`mimi`/`_lm_gen` are always genuinely separate Python objects from the
+front-end's own live model — nothing shared to race on. Remaining known,
+accepted risk: `_run_codes`' inline `self.vad_callback(...)` call (mutates
+`TurnManager.vad_history`, a plain list) now fires from the worker thread
+instead of the main one — not a crash risk (GIL-atomic list ops, no other
+concurrent writer), but VAD updates land at a slightly different cadence
+than today. Left as-is rather than reimplementing `_run_codes` to defer
+it back to the main thread — more invasive than the risk it guards
+against, no observed regression to justify it. Watch for turn-taking/VAD
+regressions during VM validation.
+
+**Fix implemented (2026-07-27), not yet VM-verified**:
+`core/model_interface.py`'s `_run_stt_frames_sync()` +
+`_patched_stt_send_audio()` + `_patch_local_stt_off_thread()` — same
+`asyncio.to_thread` shape as the conditioning fix, moving only the
+per-frame Mimi-encode + STT-LM compute off the main thread;
+buffering/locking/queue-puts stay on the calling thread unchanged.
+Applied via class-level monkeypatch (matches the `Channel.
+_async_update_reference` precedent) at both construction sites:
+`_load_models()` (eval) and `scripts/instrumented_server.py`'s
+`apply_patches()` (demo) — one shared implementation, not two that could
+drift. Covered by local tests (no GPU needed — `torch` faked via
+`sys.modules` injection for `_run_stt_frames_sync`'s own tests, matching
+the existing `get_conditioning_remote_async` test precedent):
+patch-mechanics/ordering, lock-serialization under concurrent calls, and
+the actual mechanism (`test_patched_stt_send_audio_does_not_block_
+concurrent_coroutine` — a fake compute doing a real blocking
+`time.sleep`, confirming a concurrent lightweight coroutine keeps
+ticking on schedule during the call). All pass; full suite (349 tests)
+green.
+
+`core/model_interface.py`'s new `_maybe_enable_eval_asyncio_debug()`
+(`EVAL_ASYNCIO_DEBUG=1`, see `scripts/gpu_diag_contended.sh`'s header) is
+the eval-path counterpart of the demo's `DEMO_ASYNCIO_DEBUG` diagnostic —
+simpler to wire than the demo's since `_ensure_step_loop()` builds its
+loop directly via `asyncio.new_event_loop()` and never passes it through
+`asyncio.set_event_loop()`, so no monkeypatching pitfall to hit here, just
+configure the loop object directly. Since eval also drives
+`LocalSpeechToText`, this gives a fully scriptable (no live conversation)
+VM check of the fix — won't reproduce the demo's full backlog magnitude
+(eval's self-paced feeding doesn't create one), but confirms the fix
+doesn't crash/misbehave on real hardware before spending a live demo
+round trip on the magnitude question. **Not yet run on the VM** — next
+session's work: `EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh`
+first (fully scripted), then a live demo round trip with
+`DEMO_ASYNCIO_DEBUG=1` reusing the same diagnostic already proven to work,
+to confirm the `Channel._recv_loop` gap collapses toward eval's baseline.
+
+Not fully collapsed to the ~41ms solo baseline. Initial guess (untested,
+now corrected below) was a fixed per-call setup cost from `asyncio.to_thread`
+spinning up a new thread and a fresh throwaway event loop every call.
+
+**That guess was wrong, disproven by direct local benchmark** (no GPU/VM
+needed — `_run_in_new_loop`'s exact pattern, real `httpx.AsyncClient`,
+against a local instant-response HTTP server): a fresh event loop + fresh
+`httpx.AsyncClient` per call, with nothing else running, costs only
+**~4.3ms mean / 5.6ms p95** above a ~2ms persistent-client baseline — two
+orders of magnitude too small to explain a ~150ms residual. (Also
+confirmed by reading the real moshi-rag source directly,
+`moshi/inference_utils/utils.py`'s `get_conditioning_remote_async`: it
+opens a fresh `httpx.AsyncClient` per call on top of `_run_in_new_loop`'s
+fresh event loop — two layers of "cold setup," both still cheap.)
+
+**Real explanation, confirmed by the same benchmark**: `asyncio.to_thread`
+moves the fetch off the *event loop*, fixing the original starvation bug,
+but it still runs on a real Python (GIL-bound) thread. moshi-rag's
+`run_one_step()` is still synchronous and GIL-holding for its real ~95ms
+logged per-step duration — so the worker thread's own event-loop
+iterations (parsing the HTTP response, running httpx's code) still queue
+for GIL time behind the main thread, same root mechanism as the original
+bug, one layer down. Reproducing this synthetically (same fresh-loop/
+fresh-client call, plus a concurrent main-thread loop doing ~95ms
+GIL-holding bursts with `sleep(0)` yields between them, mirroring the real
+step cadence) reproduced the same order of magnitude: **mean 64.7ms, p95
+93.2ms** — a ~15x jump from the no-contention case, consistent with the
+real 150-196ms residual (not an exact match — real step counts/timing
+vary per question, and the real payload is a much larger safetensors
+tensor, not a tiny JSON blob, so more GIL-holding parse time on the worker
+side is expected too).
+
+**Implication for any future optimization**: reusing a persistent
+worker thread/event loop (the original untested guess's proposed fix)
+would only save the ~2-4ms measured for Candidate A — not worth pursuing.
+The real lever, if sub-100ms conditioning latency is ever needed, is a
+genuinely separate *process* for the fetch (not a thread) — GIL contention
+is thread-specific, so a subprocess would be immune to it. Not pursued now
+— 196ms is already comfortably inside the paper's 1.5s degradation
+threshold and 2s total retrieval budget (see the "real ARC-encoder
+conditioning latency" section above). Benchmark script (not checked in,
+scratch/local only): `bench_conditioning_overhead.py`, reproducible
+without a VM or GPU — pure Python + `httpx` against a local
+`http.server`.
 
 `core/gpu.py`'s auto-detected device pinning stays in the codebase — it's
 not wrong, just not the fix for this — and remains useful groundwork if a

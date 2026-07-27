@@ -11,6 +11,10 @@ from core.model_interface import (
     _DEFAULT_GENERATION,
     _TimedInferenceJob,
     _clean_model_text,
+    _maybe_enable_eval_asyncio_debug,
+    _patch_local_stt_off_thread,
+    _patched_stt_send_audio,
+    _run_stt_frames_sync,
     _silent_wav,
 )
 from core.retrieval_backend import NullBackend
@@ -529,6 +533,328 @@ def test_fetch_and_apply_reference_conditioning_runs_fetch_off_the_main_thread(m
     ))
 
     assert fetch_thread_name["thread"] != caller_thread
+
+
+# ── _run_stt_frames_sync / _patched_stt_send_audio (LocalSpeechToText fix) ─────
+# See both functions' own docstrings in core/model_interface.py — the demo-
+# path residual-latency root cause (CLAUDE.md's "SUPERSEDED: GPU contention
+# conclusion was wrong"): LocalSpeechToText.send_audio ran real Mimi+STT-LM
+# compute fully synchronously inside an async def, blocking the shared event
+# loop for as long as a buffered-frame backlog took to drain. torch isn't
+# installed in this sandbox, so torch is faked via sys.modules injection for
+# _run_stt_frames_sync's own tests (its calls chain through a bare MagicMock,
+# which auto-vivifies attributes/return values — exercises the real control
+# flow, not real tensor math). _patched_stt_send_audio's own tests instead
+# fake _run_stt_frames_sync itself, since what's under test there is the
+# wrapper's buffering/locking/threading behavior, not the compute.
+
+
+def _install_fake_torch(monkeypatch):
+    import sys
+    import types
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.from_numpy = MagicMock(return_value=MagicMock())
+    fake_torch.ones = MagicMock(return_value=MagicMock())
+    fake_torch.float32 = "float32"
+    fake_torch.bool = "bool"
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    return fake_torch
+
+
+class _FakeCodesTensor:
+    """Stand-in for the real torch.Tensor codes shape [:, :needed_tokens]
+    ends up as — real MagicMock auto-chaining doesn't satisfy
+    _run_stt_frames_sync's own `codes.shape[-1] == 1` assertion, since
+    comparing an auto-vivified MagicMock to 1 is never truthy."""
+
+    shape = (1, 1, 1)
+
+    def __getitem__(self, item):
+        return self
+
+    def to(self, device):
+        return self
+
+
+def _make_fake_stt(sample_rate=24000, frame_rate=12.5):
+    import numpy as np
+
+    stt = MagicMock()
+    stt._device = "cpu"
+    stt.mimi.sample_rate = sample_rate
+    stt.mimi.frame_rate = frame_rate
+    stt.mimi.encode.return_value = _FakeCodesTensor()
+    stt._lm_gen.needed_tokens = 1
+    stt._playhead_s = 0.0
+    stt._pending = np.zeros(0, dtype=np.float32)
+    stt._lock = asyncio.Lock()
+    stt._out_queue = asyncio.Queue()
+    stt.sent_samples = 0
+    return stt
+
+
+def test_run_stt_frames_sync_calls_run_codes_once_per_frame_and_updates_playhead(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
+    stt._run_codes.side_effect = ["word-1", None, "word-3"]
+    frames = [object(), object(), object()]
+
+    words = _run_stt_frames_sync(stt, frames, fs=1920, sr=24000)
+
+    assert words == ["word-1", "word-3"]
+    assert stt._run_codes.call_count == 3
+    assert stt._playhead_s == pytest.approx(3 * 1920 / 24000)
+
+
+def test_run_stt_frames_sync_empty_frames_is_a_noop(monkeypatch):
+    _install_fake_torch(monkeypatch)
+    stt = _make_fake_stt()
+
+    words = _run_stt_frames_sync(stt, [], fs=1920, sr=24000)
+
+    assert words == []
+    stt._run_codes.assert_not_called()
+    assert stt._playhead_s == 0.0
+
+
+def test_patched_stt_send_audio_validates_input():
+    import numpy as np
+
+    stt = _make_fake_stt()
+    with pytest.raises(ValueError):
+        asyncio.run(_patched_stt_send_audio(stt, np.zeros((2, 2), dtype=np.float32)))
+    with pytest.raises(ValueError):
+        asyncio.run(_patched_stt_send_audio(stt, np.zeros(10, dtype=np.float64)))
+
+
+def test_patched_stt_send_audio_buffers_partial_frame_without_computing(monkeypatch):
+    import numpy as np
+
+    compute_calls = []
+
+    async def fake_to_thread(fn, *args):
+        compute_calls.append(args)
+        return fn(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
+
+    asyncio.run(_patched_stt_send_audio(stt, np.zeros(500, dtype=np.float32)))
+
+    assert compute_calls == []
+    assert stt._pending.size == 500
+    assert stt.sent_samples == 500
+
+
+def test_patched_stt_send_audio_extracts_complete_frames_and_calls_compute_once(monkeypatch):
+    import numpy as np
+
+    frame_batches = []
+
+    def fake_run_stt_frames_sync(stt, frames, fs, sr):
+        frame_batches.append((len(frames), fs, sr))
+        return ["decoded-word"]
+
+    monkeypatch.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
+    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
+
+    # 3 full frames (5760 samples) plus a 100-sample remainder.
+    asyncio.run(_patched_stt_send_audio(stt, np.zeros(5860, dtype=np.float32)))
+
+    assert frame_batches == [(3, 1920, 24000)]
+    assert stt._pending.size == 100
+
+
+def test_patched_stt_send_audio_puts_words_on_queue_in_order(monkeypatch):
+    import numpy as np
+
+    monkeypatch.setattr(
+        "core.model_interface._run_stt_frames_sync",
+        lambda stt, frames, fs, sr: ["word-1", "word-2", "word-3"],
+    )
+    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
+
+    asyncio.run(_patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)))
+
+    got = []
+    while not stt._out_queue.empty():
+        got.append(stt._out_queue.get_nowait())
+    assert got == ["word-1", "word-2", "word-3"]
+
+
+def test_patched_stt_send_audio_runs_compute_off_the_main_thread():
+    """The whole point of this fix: mirrors
+    test_fetch_and_apply_reference_conditioning_runs_fetch_off_the_main_thread
+    — confirms the compute executes on a different thread than the caller,
+    the same property that keeps moshi-rag's shared event loop free."""
+    import threading
+
+    import numpy as np
+
+    caller_thread = threading.current_thread()
+    compute_thread_name = {}
+
+    def fake_run_stt_frames_sync(stt, frames, fs, sr):
+        compute_thread_name["thread"] = threading.current_thread()
+        return []
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
+        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
+        asyncio.run(_patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)))
+
+    assert compute_thread_name["thread"] != caller_thread
+
+
+def test_patched_stt_send_audio_does_not_block_concurrent_coroutine():
+    """The real mechanism check, not just structure: a fake compute that
+    does a genuine blocking time.sleep (standing in for real GPU work,
+    matching the ~0.58-0.80s real bursts observed in CLAUDE.md's root-cause
+    section) must not stall a concurrent lightweight coroutine on the same
+    event loop — that's the actual bug being fixed. Compare against
+    _fetch_and_apply_reference_conditioning's equivalent property, already
+    covered above; this is the same check for the STT path."""
+    import time
+
+    import numpy as np
+
+    SLEEP_S = 0.08
+
+    def fake_run_stt_frames_sync(stt, frames, fs, sr):
+        time.sleep(SLEEP_S)  # genuine blocking call, runs via asyncio.to_thread
+        return []
+
+    async def heartbeat(tick_gap_s: float, stop: asyncio.Event) -> list:
+        ticks = []
+        t0 = time.perf_counter()
+        while not stop.is_set():
+            await asyncio.sleep(tick_gap_s)
+            ticks.append(time.perf_counter() - t0)
+        return ticks
+
+    async def main():
+        stop = asyncio.Event()
+        hb_task = asyncio.ensure_future(heartbeat(0.01, stop))
+        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
+        t0 = time.perf_counter()
+        await _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32))
+        elapsed = time.perf_counter() - t0
+        stop.set()
+        ticks = await hb_task
+        return elapsed, ticks
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
+        elapsed, ticks = asyncio.run(main())
+
+    assert elapsed >= SLEEP_S
+    # If the event loop were blocked for the sleep's duration (the pre-fix
+    # bug), the heartbeat would accumulate ~0 ticks during that window. With
+    # the fix, ticks should keep landing roughly every 0.01s throughout.
+    assert len(ticks) >= int(SLEEP_S / 0.01) - 1
+
+
+def test_patched_stt_send_audio_serializes_overlapping_calls():
+    """self._lock must still prevent two overlapping send_audio calls from
+    interleaving their compute, now that compute runs via asyncio.to_thread
+    — holding an asyncio.Lock across an awaited to_thread call keeps it
+    logically held for the whole duration, so this should hold by
+    construction; asserted directly rather than trusted."""
+    import numpy as np
+
+    concurrent_count = {"current": 0, "max": 0}
+
+    def fake_run_stt_frames_sync(stt, frames, fs, sr):
+        concurrent_count["current"] += 1
+        concurrent_count["max"] = max(concurrent_count["max"], concurrent_count["current"])
+        import time
+
+        time.sleep(0.02)
+        concurrent_count["current"] -= 1
+        return []
+
+    async def main():
+        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
+        await asyncio.gather(
+            _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)),
+            _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)),
+        )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
+        asyncio.run(main())
+
+    assert concurrent_count["max"] == 1
+
+
+def _install_fake_moshi_stt_local_stt(monkeypatch):
+    import sys
+    import types
+
+    for name in ("moshi", "moshi.stt", "moshi.stt.local_stt"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    class _FakeLocalSpeechToText:
+        async def send_audio(self, audio):
+            raise AssertionError("should have been replaced by the patch")
+
+    sys.modules["moshi.stt.local_stt"].LocalSpeechToText = _FakeLocalSpeechToText
+    return _FakeLocalSpeechToText
+
+
+def test_patch_local_stt_off_thread_replaces_send_audio(monkeypatch):
+    fake_cls = _install_fake_moshi_stt_local_stt(monkeypatch)
+
+    _patch_local_stt_off_thread()
+
+    assert fake_cls.send_audio is _patched_stt_send_audio
+
+
+def test_patch_local_stt_off_thread_is_idempotent(monkeypatch):
+    fake_cls = _install_fake_moshi_stt_local_stt(monkeypatch)
+
+    _patch_local_stt_off_thread()
+    _patch_local_stt_off_thread()
+
+    assert fake_cls.send_audio is _patched_stt_send_audio
+
+
+# ── _maybe_enable_eval_asyncio_debug (eval-path counterpart of the demo's
+#    DEMO_ASYNCIO_DEBUG diagnostic — see that function's own docstring) ────────
+
+
+def test_maybe_enable_eval_asyncio_debug_noop_when_unset(monkeypatch):
+    monkeypatch.delenv("EVAL_ASYNCIO_DEBUG", raising=False)
+    loop = asyncio.new_event_loop()
+    try:
+        _maybe_enable_eval_asyncio_debug(loop)
+        assert loop.get_debug() is False
+    finally:
+        loop.close()
+
+
+def test_maybe_enable_eval_asyncio_debug_sets_debug_and_threshold(monkeypatch):
+    monkeypatch.setenv("EVAL_ASYNCIO_DEBUG", "1")
+    monkeypatch.setenv("EVAL_ASYNCIO_DEBUG_THRESHOLD_S", "0.015")
+    loop = asyncio.new_event_loop()
+    try:
+        _maybe_enable_eval_asyncio_debug(loop)
+        assert loop.get_debug() is True
+        assert loop.slow_callback_duration == pytest.approx(0.015)
+    finally:
+        loop.close()
+
+
+def test_maybe_enable_eval_asyncio_debug_default_threshold(monkeypatch):
+    monkeypatch.setenv("EVAL_ASYNCIO_DEBUG", "1")
+    monkeypatch.delenv("EVAL_ASYNCIO_DEBUG_THRESHOLD_S", raising=False)
+    loop = asyncio.new_event_loop()
+    try:
+        _maybe_enable_eval_asyncio_debug(loop)
+        assert loop.slow_callback_duration == pytest.approx(0.02)
+    finally:
+        loop.close()
 
 
 # ── asr_wait_s / retrieval_trigger_ts (latency.retrieval_breakdown support) ────

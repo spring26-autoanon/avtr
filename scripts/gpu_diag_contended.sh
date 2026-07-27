@@ -39,6 +39,19 @@
 # whether the conditioner shares a GPU with the front-end or not — the fix
 # targets the event-loop starvation directly, not GPU placement.
 #
+# Env vars (plain `export`/inline before this script — it invokes `uv run`
+# directly, not via tmux, so no extra wiring is needed the way run_demo.sh's
+# DEMO_ASYNCIO_DEBUG needed): EVAL_ASYNCIO_DEBUG=1 turns on asyncio debug
+# mode on respond()'s own persistent event loop for this run — same
+# diagnostic as the demo path's DEMO_ASYNCIO_DEBUG (see
+# core/model_interface.py's _maybe_enable_eval_asyncio_debug() and
+# scripts/instrumented_server.py's _patch_event_loop_diagnostics()), useful
+# for checking the LocalSpeechToText-off-thread fix (CLAUDE.md's
+# "SUPERSEDED: GPU contention conclusion was wrong" section) on real
+# hardware without a live demo conversation. Off by default; adds real
+# per-callback overhead, don't leave it on for normal runs.
+#   EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh
+#
 # Usage: bash scripts/gpu_diag_contended.sh
 set -euo pipefail
 

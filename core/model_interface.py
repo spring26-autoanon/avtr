@@ -287,6 +287,177 @@ async def _fetch_and_apply_reference_conditioning(
     lm_gen.update_streaming_sum_tensors(per_slot)
 
 
+def _run_stt_frames_sync(stt, frames: list, fs: int, sr: int) -> list:
+    """
+    Runs moshi-rag's own per-frame Mimi-encode + STT-LM decode loop
+    (LocalSpeechToText._run_codes(), called unchanged) for a batch of
+    already-buffered audio frames. Meant to run inside a worker thread via
+    asyncio.to_thread — see _patched_stt_send_audio()'s docstring for why.
+
+    Pure compute against `stt`'s own state, nothing shared with the
+    front-end's live model: `stt.mimi`/`stt._lm_gen` are always a fresh
+    deepcopy per session/job, confirmed via real moshi-rag source
+    (moshi/server.py's `Channel(self, ws, mimi=deepcopy(self.mimi_copy))`,
+    itself a deepcopy of `self.mimi_copy = deepcopy(mimi)` at server
+    startup) and this module's own `_load_models()`
+    (`LocalSpeechToText(deepcopy(self._mimi))`, re-deepcopied per
+    respond() call via `deepcopy(self._stt_template)`) — never the
+    front-end's own live model, so there is nothing here for the front-end
+    step loop to race against. `stt._run_codes` is already decorated
+    `@torch.inference_mode()` upstream.
+    """
+    import torch
+
+    words = []
+    for frame in frames:
+        chunk = torch.from_numpy(frame).to(device=stt._device, dtype=torch.float32).view(1, 1, -1)
+        stt.mimi.set_exec_mask(torch.ones(1, device=stt._device, dtype=torch.bool))
+        codes = stt.mimi.encode(chunk)
+        codes = codes[:, : stt._lm_gen.needed_tokens].to(stt._device)
+        assert codes.shape[-1] == 1
+        word = stt._run_codes(codes, stt._lm_gen)
+        if word is not None:
+            words.append(word)
+        stt._playhead_s += float(fs) / float(sr)
+    return words
+
+
+async def _patched_stt_send_audio(self, audio) -> None:
+    """
+    Whole-method replacement for LocalSpeechToText.send_audio — see
+    CLAUDE.md's "SUPERSEDED: GPU contention conclusion was wrong" section
+    (demo-path residual-latency root cause) for the full evidence chain.
+    Upstream's version is `async def` but its frame-draining loop calls
+    `self.mimi.encode(...)` and `self._run_codes(...)` (a real local Mimi +
+    STT-LM forward pass) fully synchronously, with a yield point
+    (`await self._out_queue.put(word)`) that only fires on frames that
+    decode a real word — most don't. Channel._recv_loop calls send_audio
+    directly (not as its own task), so when several frames back up in
+    self._pending (observed in a real live session, most plausibly right
+    after the front-end step loop's own frequent-but-small blocking has
+    eaten a slice of event-loop time), send_audio drains the whole backlog
+    as one uninterrupted synchronous burst — confirmed via asyncio debug
+    logging to dominate the real conditioning-fetch handoff delay too,
+    since it blocks everything else on the loop, not just STT's own output.
+
+    Fix: only the compute (_run_stt_frames_sync, pure per-frame Mimi/LM
+    work, see that function's docstring for why it's safe to move) runs
+    off the main event loop via asyncio.to_thread. Buffering
+    (self._pending), self.sent_samples, and self._out_queue puts all stay
+    on the calling thread, unchanged from upstream — self._lock continues
+    to correctly serialize overlapping send_audio calls since holding it
+    across the awaited asyncio.to_thread call keeps it logically held for
+    the whole duration.
+
+    Known, accepted limitation, not fixed here: upstream's own
+    `_run_codes` calls `self.vad_callback(...)` (mutates
+    TurnManager.vad_history) inline, mid-compute — left untouched and
+    therefore now fires from the worker thread instead of the main one.
+    Not a crash risk (GIL-atomic list append/pop, and vad_history has no
+    other concurrent writer), but VAD updates land at a slightly
+    worker-thread-driven cadence rather than the main thread's own step
+    cadence. Reimplementing _run_codes to defer vad_callback back to the
+    main thread was considered and rejected for this pass — more invasive
+    than the bug it would guard against, no observed regression to justify
+    it yet. Watch for turn-taking/VAD regressions during VM validation.
+    """
+    import numpy as np
+
+    if audio.ndim != 1:
+        raise ValueError(f"Expected 1D array, got {audio.shape=}")
+    if audio.dtype != np.float32:
+        raise ValueError(f"Expected float32 array, got {audio.dtype=}")
+
+    self.sent_samples += len(audio)
+
+    async with self._lock:
+        if self._pending.size:
+            self._pending = np.concatenate([self._pending, audio])
+        else:
+            self._pending = audio
+
+        fs = int(self.mimi.sample_rate / self.mimi.frame_rate)
+        sr = int(self.mimi.sample_rate)
+        frames = []
+        while self._pending.size >= fs:
+            frames.append(self._pending[:fs].copy())
+            self._pending = self._pending[fs:]
+
+        if not frames:
+            return
+
+        words = await asyncio.to_thread(_run_stt_frames_sync, self, frames, fs, sr)
+        for word in words:
+            await self._out_queue.put(word)
+
+
+def _patch_local_stt_off_thread() -> None:
+    """
+    Applies _patched_stt_send_audio as a class-level replacement of
+    LocalSpeechToText.send_audio — see that function's docstring for the
+    full rationale. Class-level (not per-instance) since both call sites
+    that construct LocalSpeechToText (this module's own _load_models() for
+    respond()/evals, and moshi-rag's own Channel.__init__ for the demo,
+    via scripts/instrumented_server.py's apply_patches()) should get the
+    fix regardless of which one happens to run first in a given process —
+    matches the existing class-level precedent
+    (Channel._async_update_reference in scripts/instrumented_server.py)
+    rather than re-patching per instance. Idempotent: safe to call from
+    both entry points (only relevant in-process if a single process
+    somehow loaded both, which doesn't happen today, but costs nothing to
+    guard against).
+    """
+    from moshi.stt.local_stt import LocalSpeechToText
+
+    if getattr(LocalSpeechToText, "_off_thread_patched", False):
+        return
+    LocalSpeechToText.send_audio = _patched_stt_send_audio
+    LocalSpeechToText._off_thread_patched = True
+
+
+def _maybe_enable_eval_asyncio_debug(loop: "asyncio.AbstractEventLoop") -> None:
+    """
+    Eval-path counterpart to scripts/instrumented_server.py's
+    _patch_event_loop_diagnostics() — same diagnostic (asyncio debug mode +
+    a configurable slow_callback_duration, so any slow callback gets logged
+    with a repr identifying it), same purpose (see what's occupying the
+    event loop during a real gap window), but a much simpler hook here:
+    _ensure_step_loop() builds its own loop directly via
+    asyncio.new_event_loop() and drives it with loop.run_until_complete(),
+    never passing it through asyncio.set_event_loop() at all — no
+    asyncio.run() internals to intercept the way the demo path needed (see
+    that function's own docstring for the real monkeypatching pitfall hit
+    there: patching the asyncio.set_event_loop re-export instead of
+    asyncio.events.set_event_loop, the name Python 3.11's asyncio.run()
+    actually calls through, which silently never fired). No such pitfall
+    here — just configure the loop object directly.
+
+    Opt-in only (EVAL_ASYNCIO_DEBUG=1), off by default — debug mode adds
+    real per-callback overhead that would skew the very latency numbers
+    under investigation if left on for normal eval runs. Lets
+    make smoke/gpu_diag_contended.sh-style runs (already fully scripted,
+    no live conversation needed) check whether the LocalSpeechToText-off-
+    thread fix behaves as expected on real hardware before spending a live
+    demo round trip on it — see CLAUDE.md's "SUPERSEDED: GPU contention
+    conclusion was wrong" section. Eval's own feed loop calls
+    LocalSpeechToText.send_audio() too (InferenceJob's feed loop, the same
+    method demo's Channel._recv_loop calls), so this exercises the same
+    patched code path — under eval's self-paced (not network-paced) audio
+    feeding, a real but different scenario, not a full substitute for
+    confirming the demo-specific backlog magnitude collapses too.
+    """
+    if os.environ.get("EVAL_ASYNCIO_DEBUG") != "1":
+        return
+    threshold_s = float(os.environ.get("EVAL_ASYNCIO_DEBUG_THRESHOLD_S", "0.02"))
+    loop.set_debug(True)
+    loop.slow_callback_duration = threshold_s
+    logger.warning(
+        "[Diag] asyncio debug mode ON for this loop "
+        "(slow_callback_duration=%.3fs, EVAL_ASYNCIO_DEBUG=1)",
+        threshold_s,
+    )
+
+
 class _TimedInferenceJob:
     """
     Thin wrapper around InferenceJob that:
@@ -954,6 +1125,7 @@ class MoshiRAGAdapter(ModelInterface):
         if self._loop is not None:
             return
         self._loop = asyncio.new_event_loop()
+        _maybe_enable_eval_asyncio_debug(self._loop)
 
         async def _start_step_loop() -> asyncio.Task:
             return asyncio.create_task(self._state._step_loop(), name="step-loop")
@@ -1049,6 +1221,9 @@ class MoshiRAGAdapter(ModelInterface):
         # warmup()) crashes — ServerState's runner.warmup() puts the shared
         # mimi into a persistent streaming_forever state, and
         # LocalSpeechToText.__init__ asserts its mimi isn't already streaming.
+        # Patched before construction (class-level, applies to every
+        # instance) — see _patch_local_stt_off_thread()'s docstring.
+        _patch_local_stt_off_thread()
         self._stt_template = LocalSpeechToText(deepcopy(self._mimi))
 
         # See the class docstring's "Conditioning" section — mandatory, not

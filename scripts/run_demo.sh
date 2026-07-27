@@ -53,6 +53,21 @@
 #                 hard-wraps long pasted lines (confirmed to corrupt
 #                 multi-line commands on at least one real VM session).
 #
+# Env vars (forwarded to the server window only if set in the invoking
+# shell, opt-in, off by default):
+#   DEMO_ASYNCIO_DEBUG=1              Turn on asyncio debug mode on the real
+#                                      server event loop for one diagnostic
+#                                      session — logs any callback exceeding
+#                                      DEMO_ASYNCIO_DEBUG_THRESHOLD_S (default
+#                                      0.02s) with a repr identifying it. See
+#                                      scripts/instrumented_server.py's
+#                                      _patch_event_loop_diagnostics() and
+#                                      CLAUDE.md's "SUPERSEDED: GPU contention
+#                                      conclusion was wrong" section for why
+#                                      this exists. Adds real per-callback
+#                                      overhead — don't leave this on for
+#                                      normal use.
+#
 # This is a straight revival of the production-server-based launcher this
 # repo used before 5b3790e switched the demo to a custom in-process
 # FastAPI/WebSocket adapter — see specs/moshirag-evals-requirements-v2.md's
@@ -232,6 +247,12 @@ SERVER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$FRONTEND_CUDA_VISIBLE_DEVICES DEMO
 # whatever $DEMO_GENERATION_FLAGS produced (argparse: later flag wins) —
 # an ad-hoc override layered on top of the config, not the sole source.
 [[ -n "$RAG_TIMEOUT_OVERRIDE" ]] && SERVER_CMD+=" --rag-timeout $RAG_TIMEOUT_OVERRIDE"
+
+# Opt-in diagnostic env vars (see the header comment above) — only forwarded
+# if set in the invoking shell; the server process never sees them otherwise.
+if [[ -n "${DEMO_ASYNCIO_DEBUG:-}" ]]; then
+    SERVER_CMD="DEMO_ASYNCIO_DEBUG=$DEMO_ASYNCIO_DEBUG DEMO_ASYNCIO_DEBUG_THRESHOLD_S=${DEMO_ASYNCIO_DEBUG_THRESHOLD_S:-0.02} $SERVER_CMD"
+fi
 [[ "$STT_MODE" == "gradium" ]] && SERVER_CMD+=" --gradium-stt"
 
 # ── Launch tmux session ───────────────────────────────────────────────────────

@@ -793,15 +793,77 @@ def _patch_channel_conditioning() -> None:
     Channel._async_update_reference = patched_async_update_reference
 
 
+def _patch_event_loop_diagnostics() -> None:
+    """
+    Opt-in-only (DEMO_ASYNCIO_DEBUG=1) diagnostic for the conditioning-fetch
+    residual-latency investigation (CLAUDE.md's "SUPERSEDED: GPU contention
+    conclusion was wrong" section): a real demo session measured the
+    post-fetch asyncio.to_thread handoff (loop.call_soon_threadsafe
+    delivering the worker thread's already-finished result back to the
+    awaiting coroutine) at 0.6-0.9s per trigger — ~6-9x the eval path's own
+    ~30-100ms version of the identical gap — and unlike the eval path, the
+    demo's gap doesn't correlate with any nearby `batched step` warning, so
+    plain run_step() blocking doesn't obviously explain its size. This turns
+    on asyncio's own debug mode on the real server event loop, which logs
+    any callback exceeding slow_callback_duration together with a repr that
+    identifies it, to see directly what's occupying the loop during a gap
+    window instead of continuing to infer it from run_step()'s own warning
+    line, which only covers one code path.
+
+    Hooks asyncio.events.set_event_loop, NOT the asyncio.set_event_loop
+    re-export — confirmed the hard way (first version of this patch hooked
+    the wrong one and silently never fired on a real VM run, no error, just
+    zero diagnostic output). On Python 3.11 asyncio.run() is implemented via
+    asyncio.runners.Runner._lazy_init(), which does `from . import events`
+    and calls events.set_event_loop(loop) directly — a name resolved through
+    the events submodule at call time, never touching whatever
+    `asyncio.set_event_loop` happens to be rebound to in the asyncio package
+    namespace. `asyncio/__init__.py`'s `asyncio.set_event_loop` is a
+    separate name binding to the same original function object at import
+    time; rebinding one doesn't rebind the other. Patching
+    asyncio.events.set_event_loop directly hits the actual call site
+    asyncio.run() uses, verified against the real Runner code path (not just
+    against a direct call to the same patched name, which is what silently
+    passed the first, wrong version of this check).
+
+    Off by default — meant for one targeted diagnostic session, not left on:
+    debug mode adds real per-callback overhead that would skew the very
+    latency numbers under investigation if enabled for normal demo/eval use.
+    """
+    if os.environ.get("DEMO_ASYNCIO_DEBUG") != "1":
+        return
+
+    threshold_s = float(os.environ.get("DEMO_ASYNCIO_DEBUG_THRESHOLD_S", "0.02"))
+    original_set_event_loop = asyncio.events.set_event_loop
+
+    def patched_set_event_loop(loop) -> None:
+        original_set_event_loop(loop)
+        if loop is not None:
+            loop.set_debug(True)
+            loop.slow_callback_duration = threshold_s
+            logger.warning(
+                "[Diag] asyncio debug mode ON for this loop "
+                "(slow_callback_duration=%.3fs, DEMO_ASYNCIO_DEBUG=1)",
+                threshold_s,
+            )
+
+    asyncio.events.set_event_loop = patched_set_event_loop
+    asyncio.set_event_loop = patched_set_event_loop
+
+
 def apply_patches(
     session: SessionLog,
     checkpoint: str,
     retrieval_backend,
     retrieval_backend_display: dict,
 ) -> None:
+    from core.model_interface import _patch_local_stt_off_thread
+
+    _patch_event_loop_diagnostics()
     _patch_server_state(session, checkpoint, retrieval_backend_display)
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_channel_conditioning()
+    _patch_local_stt_off_thread()
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
     _patch_rag_manager_background_task(session)
