@@ -45,3 +45,22 @@ def parse_track_name(name: str) -> tuple[str, str, str]:
     if not speaker:
         raise ValueError(f"empty speaker name in: {name}")
     return speaker, idx, conv_id
+
+
+def combine_to_stereo(main_path: Path, partner_path: Path) -> tuple[np.ndarray, int, int]:
+    """Read two mono tracks, return (stereo[n,2], sr, delta_frames).
+
+    col 0 = left = main (cloned voice); col 1 = right = partner. Truncated to the
+    shorter of the two tracks; delta_frames is the length difference removed.
+    """
+    main, sr_m = sf.read(str(main_path), always_2d=True)
+    partner, sr_p = sf.read(str(partner_path), always_2d=True)
+    for path, sr in ((main_path, sr_m), (partner_path, sr_p)):
+        if sr != TARGET_SR:
+            raise SystemExit(f"{path}: sample rate {sr} != {TARGET_SR}; resample first.")
+    m = main[:, 0]
+    p = partner[:, 0]
+    delta = abs(len(m) - len(p))
+    n = min(len(m), len(p))
+    stereo = np.column_stack([m[:n], p[:n]])
+    return stereo, TARGET_SR, delta
