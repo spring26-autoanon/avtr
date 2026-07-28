@@ -6,8 +6,8 @@
 
 # ---- data ----
 data:
-  train_data: "finetune/data/prepared/train.jsonl"   # 8 files (~51 min); use all.jsonl to train on all 9
-  eval_data:  "finetune/data/prepared/eval.jsonl"     # 1 held-out file (movies.wav)
+  train_data: "finetune/data/prepared_dialogue/train.jsonl"  # 4 files (~136 min dialogue: clay + joshua_train_a/b + leena)
+  eval_data:  "finetune/data/prepared_dialogue/eval.jsonl"    # 1 held-out file (danielle_joshuarhodes_eval.wav, 10 min)
   shuffle: true
 
 # ---- model: train the LoRA against the EXACT weights moshi-rag serves ----
