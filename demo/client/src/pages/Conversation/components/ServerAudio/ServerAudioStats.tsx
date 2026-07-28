@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { colors } from "../../../../theme/colors";
+import { AudioDiagSample } from "../../hooks/useServerAudio";
 
 type ServerAudioStatsProps = {
   getAudioStats: React.MutableRefObject<
@@ -12,9 +13,28 @@ type ServerAudioStatsProps = {
       maxPlaybackDelay: number;
     }
   >;
+  getAudioDiagLog?: React.MutableRefObject<() => AudioDiagSample[]>;
 };
 
-export const ServerAudioStats = ({ getAudioStats }: ServerAudioStatsProps) => {
+/**
+ * Downloads the accumulated jitter-buffer diagnostic (see useServerAudio.ts's
+ * AudioDiagSample) as a JSON file, for manual placement alongside the
+ * server-side session logs (demo/sessions/<id>/) — see CLAUDE.md's "Running
+ * the demo" section for the analysis workflow this feeds.
+ */
+const downloadAudioDiagLog = (samples: AudioDiagSample[]) => {
+  const blob = new Blob([JSON.stringify(samples, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `client_audio_diag_${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+};
+
+export const ServerAudioStats = ({ getAudioStats, getAudioDiagLog }: ServerAudioStatsProps) => {
   const [audioStats, setAudioStats] = useState(getAudioStats.current());
 
   const movingAverageSum = useRef<number>(0.);
@@ -80,6 +100,15 @@ export const ServerAudioStats = ({ getAudioStats }: ServerAudioStatsProps) => {
           </tr>
         </tbody>
       </table>
+      {getAudioDiagLog && (
+        <button
+          onClick={() => downloadAudioDiagLog(getAudioDiagLog.current())}
+          className="mt-2 text-xs underline hover:opacity-80"
+          style={{ color: colors.textPrimary }}
+        >
+          Download audio diagnostics
+        </button>
+      )}
     </div>
   );
 };

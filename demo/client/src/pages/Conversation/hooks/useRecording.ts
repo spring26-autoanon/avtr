@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
 import { useMediaContext } from "../MediaContext";
 import { getExtension, getMimeType } from "../getMimeType";
 import fixWebmDuration from "webm-duration-fix";
@@ -7,6 +7,17 @@ import { colors } from "../../../theme/colors";
 type UseRecordingArgs = {
   transcriptText: string;
   retrievalText: string;
+  /**
+   * Same performance.now() reference useServerAudio.ts's AudioDiagSample
+   * t_rel_s is anchored to (both derive from the WebSocket-open moment).
+   * Reading it here, at actual save time rather than hook-setup time (via
+   * a ref, matching this codebase's existing getAudioStats/getAudioDiagLog
+   * pattern), lets saveAudio() embed the recording's real offset into that
+   * same timeline in the downloaded filename — the piece needed to line
+   * the recorded audio up against server.log/raw_events.jsonl's own
+   * t_rel_s, which this whole investigation lacked until now.
+   */
+  getSocketOpenPerfMs?: MutableRefObject<() => number | null>;
 };
 
 const CANVAS_WIDTH = 1920;
@@ -64,9 +75,10 @@ const drawWrappedText = (
   });
 };
 
-export const useRecording = ({ transcriptText, retrievalText }: UseRecordingArgs) => {
+export const useRecording = ({ transcriptText, retrievalText, getSocketOpenPerfMs }: UseRecordingArgs) => {
   const { audioStreamDestination, visualizerCanvasRef } = useMediaContext();
   const audioRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordingStartPerfMsRef = useRef<number | null>(null);
   const videoRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const videoChunksRef = useRef<Blob[]>([]);
@@ -119,6 +131,7 @@ export const useRecording = ({ transcriptText, retrievalText }: UseRecordingArgs
     };
 
     recorder.start();
+    recordingStartPerfMsRef.current = performance.now();
     audioRecorderRef.current = recorder;
     setIsAudioRecording(true);
   }, [audioStreamDestination]);
@@ -344,8 +357,18 @@ export const useRecording = ({ transcriptText, retrievalText }: UseRecordingArgs
       return;
     }
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    downloadBlob(audioBlob, `moshirag-audio-${timestamp}.${getExtension("audio")}`);
-  }, [audioBlob, downloadBlob]);
+    let startTag = "";
+    const socketOpenPerfMs = getSocketOpenPerfMs?.current?.() ?? null;
+    if (recordingStartPerfMsRef.current !== null && socketOpenPerfMs !== null) {
+      const startTRelS = (recordingStartPerfMsRef.current - socketOpenPerfMs) / 1000;
+      // Embedded directly in the filename (not a sidecar file) so it
+      // can't get separated from the recording it describes — this is
+      // the exact t_rel_s the recording begins at, for lining it up
+      // against server.log/raw_events.jsonl's own t_rel_s.
+      startTag = `_startT${startTRelS.toFixed(3)}s`;
+    }
+    downloadBlob(audioBlob, `moshirag-audio${startTag}-${timestamp}.${getExtension("audio")}`);
+  }, [audioBlob, downloadBlob, getSocketOpenPerfMs]);
 
   const saveVideo = useCallback(() => {
     if (!videoBlob) {

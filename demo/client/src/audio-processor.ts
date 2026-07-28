@@ -50,6 +50,7 @@ class MoshiProcessor extends AudioWorkletProcessor {
       if (this.currentSamples() >= this.totalMaxBufferSamples()) {
         console.log(this.timestamp(), "Dropping packets", asMs(this.currentSamples()), asMs(this.totalMaxBufferSamples()));
         let target = this.initialBufferSamples + this.partialBufferSamples
+        let droppedMs = asMs(this.currentSamples() - target);
         while (this.currentSamples() > (this.initialBufferSamples + this.partialBufferSamples)) {
           let first = this.frames[0];
           let to_remove = this.currentSamples() - target;
@@ -65,6 +66,7 @@ class MoshiProcessor extends AudioWorkletProcessor {
         this.maxBufferSamples += this.maxBufferSamplesIncrement;
         this.maxBufferSamples = Math.min(this.maxMaxBufferWithIncrements, this.maxBufferSamples);
         console.log("Increased maxBuffer to", asMs(this.maxBufferSamples));
+        this.events.push({ kind: "buffer_drop", droppedMs, newMaxBufferMs: asMs(this.maxBufferSamples) });
       }
       let delay = this.currentSamples() / sampleRate;
       this.port.postMessage({
@@ -73,7 +75,10 @@ class MoshiProcessor extends AudioWorkletProcessor {
         delay: event.data.micDuration - this.timeInStream,
         minDelay: this.minDelay,
         maxDelay: this.maxDelay,
+        liveBufferS: this._liveBufferS,
+        events: this.events,
       });
+      this.events = [];
     };
   }
 
@@ -92,6 +97,22 @@ class MoshiProcessor extends AudioWorkletProcessor {
     this.minDelay = 2000.;
     // Debug
     this.pidx = 0;
+    // Structured events (buffer drop/underrun/resume) since the last
+    // postMessage, for the jitter-buffer diagnostic — see useServerAudio.ts.
+    // Kept separate from the free-text console.log calls below (unchanged),
+    // which remain for live devtools viewing only.
+    this.events = [];
+    // Live buffer occupancy (currentSamples()/sampleRate), refreshed every
+    // process() call — the actual, bounded (~0 to totalMaxBufferSamples())
+    // jitter-buffer level. Distinct from the postMessage payload's own
+    // "delay" field below (event.data.micDuration - this.timeInStream),
+    // which despite the name is NOT buffer occupancy — it only advances
+    // while the model is producing audio, so it grows for the entire
+    // duration the model isn't speaking (user turn, retrieval wait,
+    // silence) and is unbounded over a session. Conflating the two was a
+    // real mistake made building this diagnostic; kept both, clearly
+    // named, so it doesn't happen again.
+    this._liveBufferS = 0.;
 
     // For now let's reset the buffer params.
     this.partialBufferSamples = asSamples(10);
@@ -131,6 +152,7 @@ class MoshiProcessor extends AudioWorkletProcessor {
 
   process(inputs, outputs, parameters) {
     let delay = this.currentSamples() / sampleRate;
+    this._liveBufferS = delay;
     if (this.canPlay()) {
       this.maxDelay = Math.max(this.maxDelay, delay);
       this.minDelay = Math.min(this.minDelay, delay);
@@ -145,6 +167,7 @@ class MoshiProcessor extends AudioWorkletProcessor {
     }
     if (this.firstOut) {
       console.log(this.timestamp(), "Audio resumed", asMs(this.currentSamples()), this.remainingPartialBufferSamples);
+      this.events.push({ kind: "resumed", bufferedMs: asMs(this.currentSamples()) });
     }
     let first = this.frames[0];
     let out_idx = 0;
@@ -170,6 +193,7 @@ class MoshiProcessor extends AudioWorkletProcessor {
       this.partialBufferSamples += this.partialBufferIncrement;
       this.partialBufferSamples = Math.min(this.partialBufferSamples, this.maxPartialWithIncrements);
       console.log("Increased partial buffer to", asMs(this.partialBufferSamples));
+      this.events.push({ kind: "underrun", missedSamples: output.length - out_idx, newPartialBufferMs: asMs(this.partialBufferSamples) });
       // We ran out of a buffer, let's revert to the started state to replenish it.
       this.resetStart();
       for (let i = 0; i < out_idx; i++) {

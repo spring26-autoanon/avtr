@@ -13,7 +13,7 @@ import TranscriptionPanel from "./components/TranscriptionPanel/TranscriptionPan
 import SearchPanel from "./components/SearchPanel/SearchPanel";
 import PipeAnimation from "./components/PipeAnimation/PipeAnimation";
 import { ServerAudioStats } from "./components/ServerAudio/ServerAudioStats";
-import { AudioStats } from "./hooks/useServerAudio";
+import { AudioStats, AudioDiagSample } from "./hooks/useServerAudio";
 import { colors } from "../../theme/colors";
 import type { WSMessage } from "../../protocol/types";
 import {
@@ -76,6 +76,7 @@ export const Conversation: FC<ConversationProps> = ({
   email,
   hideMainUIUntilConnected = false,
 }) => {
+  const getAudioDiagLog = useRef<() => AudioDiagSample[]>(() => []);
   const getAudioStats = useRef<() => AudioStats>(() => ({
     playedAudioDuration: 0,
     missedAudioDuration: 0,
@@ -243,6 +244,7 @@ export const Conversation: FC<ConversationProps> = ({
           start={start}
           stop={stop}
           getAudioStats={getAudioStats}
+          getAudioDiagLog={getAudioDiagLog}
           showAudioStats={showAudioStats}
           setShowAudioStats={setShowAudioStats}
         />
@@ -263,6 +265,7 @@ const ConversationContent: FC<{
   start: () => void;
   stop: () => void;
   getAudioStats: React.MutableRefObject<() => AudioStats>;
+  getAudioDiagLog: React.MutableRefObject<() => AudioDiagSample[]>;
   showAudioStats: boolean;
   setShowAudioStats: (show: boolean) => void;
 }> = ({
@@ -275,6 +278,7 @@ const ConversationContent: FC<{
   start,
   stop,
   getAudioStats: getAudioStatsProp,
+  getAudioDiagLog: getAudioDiagLogProp,
   showAudioStats,
   setShowAudioStats,
 }) => {
@@ -299,9 +303,16 @@ const ConversationContent: FC<{
     const { instrumentation, retrieval, retrievalBackend } = useInstrumentation();
 
     // Audio hooks (need MediaContext - will call useMediaContext internally)
+    const getSocketOpenPerfMsRef = useRef<() => number | null>(() => null);
     const { analyser: serverAnalyser, hasCriticalDelay, setHasCriticalDelay } = useServerAudio({
       setGetAudioStats: (callback) => {
         getAudioStatsProp.current = callback;
+      },
+      setGetAudioDiagLog: (callback) => {
+        getAudioDiagLogProp.current = callback;
+      },
+      setGetSocketOpenPerfMs: (callback) => {
+        getSocketOpenPerfMsRef.current = callback;
       },
     });
 
@@ -382,6 +393,7 @@ const ConversationContent: FC<{
     } = useRecording({
       transcriptText: transcriptTextForRecording,
       retrievalText: retrievalTextForRecording,
+      getSocketOpenPerfMs: getSocketOpenPerfMsRef,
     });
     const autoCaptureStartedRef = useRef(false);
     const { startRecordingUser, stopRecording } = useUserAudio({
@@ -753,7 +765,7 @@ const ConversationContent: FC<{
                   </svg>
                 </button>
               </div>
-              <ServerAudioStats getAudioStats={getAudioStatsProp} />
+              <ServerAudioStats getAudioStats={getAudioStatsProp} getAudioDiagLog={getAudioDiagLogProp} />
             </div>
           )}
         </main>
