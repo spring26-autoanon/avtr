@@ -1,12 +1,15 @@
 import abc
 import argparse
 import asyncio
+import functools
 import logging
 import os
 import re
 import struct
 import tempfile
+import threading
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
@@ -287,6 +290,44 @@ async def _fetch_and_apply_reference_conditioning(
     lm_gen.update_streaming_sum_tensors(per_slot)
 
 
+_COMPILED_FUNCTIONS_LOCK = threading.RLock()
+"""
+Shared between the patched moshi.modules.{rope,transformer,gating}
+leaf functions (_patch_compiled_functions_thread_safe(), below) — guards
+only torch_compile_lazy's unlocked lazy-compile cache, the dynamo hazard.
+RLock (not a plain Lock) because a real VM deadlock, confirmed via a
+py-spy stack dump, showed set_exec_mask's own call graph recursing back
+into a locked call on the same thread when it briefly lived here too
+(see _run_stt_frames_sync's docstring, hazard 3, for the full history of
+why set_exec_mask was tried in this lock and then removed in favor of
+pre-warming) — RLock costs nothing over a plain Lock for these three
+functions (they never call each other or themselves) and keeps this
+lock reentrancy-safe against any similar future addition.
+
+Does NOT cover CUDA graph capture: see _patch_stt_no_cuda_graph()'s,
+_patch_stt_second_gpu()'s, _patch_cuda_graph_thread_local()'s, and
+_run_stt_frames_sync's docstrings for why that hazard is eliminated a
+different way (disabling CUDA graphing for STT's own forward/encode/
+decode passes via profile=True; moving STT's own model instances to a
+genuinely separate physical GPU when one exists, so its CUDA stream
+never shares anything with the front-end's; and making the one shared
+Python-level bookkeeping global thread-local) rather than by locking
+around it. Locking was tried repeatedly and failed every time: first a
+coarse run_step()-vs-frame-compute lock (measurably starved the
+front-end's live-demo generation — see git history), then adding just
+set_exec_mask to this narrow lock (deadlocked on its own recursion, then
+once fixed with RLock, still didn't prevent the crash), then pre-warming
+set_exec_mask into a safe replay before the concurrent window opens
+(closed *that* specific capture, but moshi-rag's own CUDAGraphed/
+`_in_cuda_graph` machinery turned out to guard *every* CUDA-graphed call
+in the whole model via one process-wide, unsynchronized global — a hazard
+never scoped to the handful of call sites this project could enumerate
+and lock one at a time). Physical device separation sidesteps the
+problem structurally instead of trying to guard an ever-expanding set of
+call sites.
+"""
+
+
 def _run_stt_frames_sync(stt, frames: list, fs: int, sr: int) -> list:
     """
     Runs moshi-rag's own per-frame Mimi-encode + STT-LM decode loop
@@ -303,8 +344,92 @@ def _run_stt_frames_sync(stt, frames: list, fs: int, sr: int) -> list:
     (`LocalSpeechToText(deepcopy(self._mimi))`, re-deepcopied per
     respond() call via `deepcopy(self._stt_template)`) — never the
     front-end's own live model, so there is nothing here for the front-end
-    step loop to race against. `stt._run_codes` is already decorated
-    `@torch.inference_mode()` upstream.
+    step loop to race on for *state*. `stt._run_codes` is already
+    decorated `@torch.inference_mode()` upstream.
+
+    Correction (2026-07-27, two real VM crashes): state-separation is not
+    the whole story. moshi's GPU-touching code is not safe to call from
+    two threads concurrently, in (at least) two distinct, unrelated ways
+    that both surfaced in turn once this ran on real hardware:
+
+    1. `torch_compile_lazy` (moshi/utils/compile.py) has a bare, unlocked
+       `nonlocal` lazy-compile cache per decorated function (`apply_rope`,
+       `_rms_norm`, `gating_forward_kernel`) — shared at the *module*
+       level by every StreamingTransformer instance in the process,
+       deepcopy or not. First crash: `RuntimeError("Detected that you are
+       using FX to symbolically trace a dynamo-optimized function...")`.
+       Fixed by _patch_compiled_functions_thread_safe(), below.
+    2. Mimi's encode/decode (models/compression.py) and the LM's own
+       forward pass (models/lm.py's `forward_text`/`depformer_step`) are
+       both wrapped in moshi's own `CUDAGraphed` (moshi/utils/compile.py)
+       — CUDA graph capture requires true stream-level exclusivity for
+       its entire capture window, not just protection around specific
+       leaf calls. Second crash, only reached once (1) was fixed:
+       `AcceleratorError("CUDA error: operation not permitted when
+       stream is capturing")`. Fixed by _patch_stt_no_cuda_graph() +
+       _load_models()'s `mimi_copy.set_profile(True)` call — disabling
+       CUDA graphing for STT's own model instances entirely, rather than
+       locking around it, since a real live-demo test showed a lock wide
+       enough to cover this hazard (whole run_step() vs. whole per-frame
+       compute) measurably starved the front-end's own generation
+       throughput during retrieval waits (near-silence for seconds at a
+       time, vs. continuous natural speech pre-fix — see git history).
+    3. `mimi.set_exec_mask()`/`_lm_gen.set_exec_mask()` (called explicitly
+       below, and again inside `stt._run_codes()`) go through
+       `StreamingModule.set_exec_mask` (moshi/modules/streaming.py), whose
+       own `CUDAGraphed` is *not* gated by `self.profile` at all —
+       confirmed the one CUDAGraphed construction site in the whole
+       codebase that isn't, via an exhaustive grep — so
+       _patch_stt_no_cuda_graph()'s profile=True does not reach it. Third
+       crash, only reached once (1) and (2) were fixed and the previous
+       fix looked clean across 5 real turns: `AcceleratorError("CUDA
+       error: operation failed due to a previous error during capture")`
+       on this exact call, on turn 6.
+
+       First attempted fix — adding StreamingModule.set_exec_mask to
+       _patch_compiled_functions_thread_safe()'s lock — deadlocked
+       immediately (LMGen.set_exec_mask's own set_exec_mask_callback
+       recurses into a nested StreamingModule's set_exec_mask on the
+       *same* thread; a plain Lock isn't reentrant). Switching to an
+       RLock fixed the deadlock but *not* the crash: turn 7 of the next
+       run hit the identical error again. Root cause of why locking
+       specifically here can't work, confirmed by reading what's actually
+       racing: the *main* step-loop thread's own encode/decode/step calls
+       (BatchRunner.run_step(), batch_runner.py) are plain graph *replays*
+       by this point (captured once during _state.warmup(), never
+       recaptured) — ordinary CUDA stream activity, not calls to any of
+       our four locked functions, so nothing serializes them against the
+       STT thread's own set_exec_mask *capture*. CUDA stream-capture mode
+       invalidates on *any* stream activity from *any* thread during the
+       capture window, not just concurrent calls to the same Python
+       function — so a lock scoped to specific call sites can never fully
+       close this gap; it would need to cover literally every CUDA op
+       either side might issue, i.e. back to the whole-run_step() lock
+       already rejected for the generation-starvation regression above.
+
+       Real fix, Option E (implemented after re-reading moshi/utils/
+       compile.py's CUDAGraphed/`_in_cuda_graph` machinery closely enough
+       to realize the hazard was never scoped to specific call sites at
+       all — see _patch_stt_second_gpu()'s and
+       _patch_cuda_graph_thread_local()'s own docstrings for the full
+       reasoning): eliminate the *sharing* instead of trying to guard it.
+       _patch_stt_second_gpu() moves STT's own model instances onto a
+       genuinely separate physical GPU when one's visible to this
+       process, so its CUDA stream never overlaps with the front-end's —
+       no shared stream, no capture to invalidate, regardless of timing.
+       _patch_cuda_graph_thread_local() closes the remaining, more benign
+       residual risk (the shared `_in_cuda_graph` Python global itself).
+       `_warm_up_stt_exec_mask()` is kept on top of both, now for latency
+       cleanliness rather than correctness — see its own docstring.
+
+    No lock needed in this function's own body for any of the three
+    hazards: (1) is handled transparently inside the patched
+    apply_rope/_rms_norm/gating_forward_kernel calls reached via
+    stt.mimi.encode()/stt._run_codes() below; (2) no longer applies once
+    STT's own instances never enter CUDA graph capture for those passes;
+    (3) is closed by _patch_stt_second_gpu() + _patch_cuda_graph_thread_
+    local() (device separation, plus a thread-local flag) running before
+    this function's thread ever starts, not by anything here.
     """
     import torch
 
@@ -391,6 +516,38 @@ async def _patched_stt_send_audio(self, audio) -> None:
             await self._out_queue.put(word)
 
 
+def _stt_off_thread_enabled() -> bool:
+    """Gates the whole STT-off-thread + Option E patch chain below (see
+    _patch_local_stt_off_thread()'s docstring for the full history: 3 real
+    crashes from running moshi's CUDA-graph-capturing model code on two OS
+    threads, fixed via 2nd-physical-GPU device separation + a thread-local
+    flag).
+
+    Added for A/B testing after independently confirming (see the
+    project_stt_cuda_graph_thread_safety memory / CLAUDE.md's "STT/front-
+    end CUDA-graph cross-thread crash" section) that the eval path never
+    actually needed this in the first place: InferenceJob._feed_loop()'s
+    own _wait_step_index_at_least() gate structurally caps how far its
+    self-paced feeding can get ahead of the model's real step progress, so
+    LocalSpeechToText's synchronous per-frame compute can't form a backlog
+    there regardless of threading — confirmed by reading
+    inference_job.py's real source, not assumed. Only Channel._recv_loop()
+    (demo path) has no equivalent gate: a live client's audio arrives over
+    the network independent of the model's own progress, so a blocking
+    send_audio() call can let a real backlog queue up at the transport
+    layer while it's busy.
+
+    Set STT_OFF_THREAD=0 to disable the entire chain (reverts to fully
+    synchronous, single-thread STT — single GPU sufficient either way) and
+    compare demo fluency against the current state. If disabling it
+    doesn't make a perceptible difference, the whole crash-chasing
+    investment and the second-A100 requirement are candidates to retire —
+    see CLAUDE.md's "STT/front-end CUDA-graph cross-thread crash" section
+    for the fuller reasoning behind this experiment.
+    """
+    return os.environ.get("STT_OFF_THREAD", "1") != "0"
+
+
 def _patch_local_stt_off_thread() -> None:
     """
     Applies _patched_stt_send_audio as a class-level replacement of
@@ -413,6 +570,352 @@ def _patch_local_stt_off_thread() -> None:
         return
     LocalSpeechToText.send_audio = _patched_stt_send_audio
     LocalSpeechToText._off_thread_patched = True
+
+
+def _patch_compiled_functions_thread_safe() -> None:
+    """
+    Wraps moshi's three inference-path torch_compile_lazy-decorated leaf
+    functions — moshi.modules.rope.apply_rope, moshi.modules.transformer.
+    _rms_norm, moshi.modules.gating.gating_forward_kernel (exhaustively
+    grepped from real moshi-rag source; no others exist) — with
+    _COMPILED_FUNCTIONS_LOCK, applied by reassigning each defining
+    module's own attribute. See that lock's own module-level docstring
+    for why moshi.modules.streaming.StreamingModule.set_exec_mask was
+    tried here too and then removed — a real VM crash showed locking
+    isn't sufficient for that hazard; _run_stt_frames_sync's docstring
+    (hazard 3) has the fix that replaced it (pre-warming).
+
+    Safe to patch by module attribute (not e.g. a class-level monkeypatch
+    like _patch_local_stt_off_thread()'s): confirmed against real
+    moshi-rag source that all three are called via a bare, unqualified
+    name lookup from within their own defining module (RotaryEmbedding.
+    forward calls apply_rope inside rope.py; RMSNorm.forward calls
+    _rms_norm inside transformer.py; ActivationGating.forward calls
+    gating_forward_kernel inside gating.py) — Python resolves these as a
+    fresh module-global lookup on every call, not an import-time-bound
+    reference, so there's no other binding elsewhere this patch would
+    miss.
+
+    Idempotent and process-global (like _patch_local_stt_off_thread()):
+    applied once regardless of which entry point (this module's
+    _load_models(), or scripts/instrumented_server.py's apply_patches())
+    runs first.
+    """
+    import moshi.modules.gating as gating_mod
+    import moshi.modules.rope as rope_mod
+    import moshi.modules.transformer as transformer_mod
+
+    if getattr(rope_mod, "_compile_lock_patched", False):
+        return
+
+    def _lock_wrapped(fun):
+        @functools.wraps(fun)
+        def _wrapped(*args, **kwargs):
+            with _COMPILED_FUNCTIONS_LOCK:
+                return fun(*args, **kwargs)
+
+        return _wrapped
+
+    rope_mod.apply_rope = _lock_wrapped(rope_mod.apply_rope)
+    transformer_mod._rms_norm = _lock_wrapped(transformer_mod._rms_norm)
+    gating_mod.gating_forward_kernel = _lock_wrapped(gating_mod.gating_forward_kernel)
+    rope_mod._compile_lock_patched = True
+
+
+def _patch_stt_no_cuda_graph() -> None:
+    """
+    Disables CUDA graphing for STT's own model instances entirely, two
+    halves:
+
+    1. moshi.stt.local_stt.LMGen is patched to always construct with
+       `profile=True` (see MimiModel/LMGen's own real source, moshi/models/
+       {compression,lm}.py: `CUDAGraphed(..., disable=disable or
+       self.profile)`, built lazily inside each's own
+       `_init_streaming_state()`-equivalent — `self.profile` gates it, and
+       LMGen exposes `profile` as a plain __init__ kwarg). Safe to patch by
+       module attribute: LocalSpeechToText.__init__ (moshi/stt/local_stt.py)
+       constructs its own LMGen via the bare call `LMGen(lm, cfg_coef=1.0,
+       **checkpoint_info.lm_gen_config)` — resolved via that module's own
+       globals at call time (same reasoning as
+       _patch_compiled_functions_thread_safe()'s docstring), and confirmed
+       via real moshi-rag source to be the *only* LMGen construction inside
+       that file — the front-end builds its own LMGen through a completely
+       separate code path, so this patch cannot reach it even by accident.
+    2. LocalSpeechToText.__init__ itself is wrapped (class-level, matching
+       _patch_local_stt_off_thread()'s precedent) to call
+       `mimi.set_profile(True)` on its own received `mimi` argument before
+       delegating to the original __init__ — which is where
+       `mimi.streaming_forever()` (and thus Mimi's own CUDAGraphed
+       wrappers) actually gets built. Mimi has no equivalent constructor
+       kwarg (`self.profile = False` is hardcoded in MimiModel.__init__),
+       but does expose a real public `set_profile()` method for exactly
+       this. Wrapping __init__ here — rather than calling
+       `mimi.set_profile(True)` once at _load_models()'s own construction
+       site — covers *both* real call sites uniformly: this module's own
+       `_load_models()` (eval/respond()) and moshi-rag's own
+       `Channel.__init__` (moshi/inference_utils/channel.py:107,
+       `LocalSpeechToText(mimi=mimi, ...)`, the demo path) both construct
+       LocalSpeechToText the same way, and neither needs to know about
+       this fix.
+
+    Together these mean STT's own model instances never enter CUDA graph
+    capture for their forward/encode/decode passes — the front-end's own
+    Mimi/LMGen are constructed through entirely separate code paths and
+    remain fully graphed. This does NOT cover set_exec_mask's own
+    CUDAGraphed, which isn't gated by `self.profile` at all — see
+    _run_stt_frames_sync's docstring (hazard 3), _patch_stt_second_gpu(),
+    and _warm_up_stt_exec_mask() for the fixes that do.
+
+    Idempotent and process-global (like _patch_local_stt_off_thread()):
+    applied once regardless of which entry point runs first.
+    """
+    import moshi.stt.local_stt as local_stt_mod
+
+    if getattr(local_stt_mod.LocalSpeechToText, "_no_cuda_graph_patched", False):
+        return
+
+    original_lm_gen_cls = local_stt_mod.LMGen
+
+    class _NoCudaGraphLMGen(original_lm_gen_cls):
+        def __init__(self, *args, **kwargs):
+            kwargs["profile"] = True
+            super().__init__(*args, **kwargs)
+
+    local_stt_mod.LMGen = _NoCudaGraphLMGen
+
+    original_init = local_stt_mod.LocalSpeechToText.__init__
+
+    @functools.wraps(original_init)
+    def _init_with_mimi_no_cuda_graph(self, mimi, *args, **kwargs):
+        mimi.set_profile(True)
+        original_init(self, mimi, *args, **kwargs)
+
+    local_stt_mod.LocalSpeechToText.__init__ = _init_with_mimi_no_cuda_graph
+    local_stt_mod.LocalSpeechToText._no_cuda_graph_patched = True
+
+
+def _patch_stt_second_gpu() -> None:
+    """
+    Moves STT's own in-process model duplicate onto a genuinely separate
+    physical GPU when one is visible to this process. This is the actual
+    fix for the cross-thread CUDA-graph-capture crash (AcceleratorError:
+    "CUDA error: operation not permitted when stream is capturing" /
+    "operation failed due to a previous error during capture") — see
+    _run_stt_frames_sync's docstring (hazard 3) for the full history of
+    what was tried before this and why each attempt failed:
+
+    1. Adding StreamingModule.set_exec_mask to _COMPILED_FUNCTIONS_LOCK
+       deadlocked (LMGen.set_exec_mask's own callback recurses into a
+       nested StreamingModule's set_exec_mask on the *same* thread; a
+       plain Lock isn't reentrant).
+    2. Switching that lock to an RLock fixed the deadlock but not the
+       crash — confirmed by reading real moshi-rag source that the
+       *main* step-loop thread's own encode/decode/step calls are plain
+       graph *replays* by that point (captured once during
+       _state.warmup(), never recaptured), not calls to any of the four
+       functions that lock covered, so nothing serialized them against
+       the STT thread's own set_exec_mask *capture*.
+    3. Pre-warming (_warm_up_stt_exec_mask(), to turn that capture into a
+       safe replay before the concurrent window opens) revealed a deeper
+       problem on closer reading of moshi/utils/compile.py:
+       `CUDAGraphed.__call__` wraps *every* call — warmup, capture, and
+       ordinary replay alike — in `with _set_in_cuda_graph(): assert not
+       _in_cuda_graph; ...`, and `_in_cuda_graph` is a bare, process-wide
+       module global, not a threading.local(). Two threads racing a
+       check-then-set on that shared flag (a classic TOCTOU, entirely
+       possible across a GIL switch) is a real hazard for *any*
+       CUDAGraphed call from either thread, not just the ~4 call sites
+       patched so far — moshi-rag's own CUDA-graphing utility was simply
+       never designed to be called from more than one OS thread at once,
+       for anything.
+
+    No amount of locking specific call sites can fully close that: it
+    would need to cover literally every CUDAGraphed call either thread
+    might make, which is everywhere in the model's forward pass — back to
+    the coarse whole-run_step()-vs-whole-frame-compute lock already
+    rejected for starving live-demo generation. Physical device
+    separation sidesteps the problem structurally instead of trying to
+    guard it: a second GPU gets its own CUDA context and default stream
+    for free, so STT's own captures/replays never share a stream with the
+    front-end's, regardless of what the shared Python-level flag is
+    doing. See _patch_cuda_graph_thread_local()'s own docstring for the
+    still-necessary complement — this alone closes the actual CUDA-stream
+    conflict (the thing that corrupts the driver and produces
+    AcceleratorError), but not the Python-level bookkeeping race, which
+    is a real, if far more benign, residual risk on its own.
+
+    Applied as a further wrap of LocalSpeechToText.__init__, chained
+    after _patch_stt_no_cuda_graph()'s own wrap (must run after it in
+    _load_models()'s/apply_patches()'s call order, so this patch's own
+    `original_init` reference is the profile=True-wrapped version) —
+    covers both real call sites uniformly (this module's own
+    _load_models() and moshi-rag's own Channel.__init__, same reasoning
+    as _patch_stt_no_cuda_graph()'s docstring) with one shared
+    implementation, not two that could drift.
+
+    Purely a function of torch.cuda.device_count() *as seen by this
+    process* — deliberately not threaded through core/gpu.py's
+    DeviceAssignment or any other config/state object, so it naturally
+    degrades to a no-op (STT stays on the same device as the front-end,
+    exactly the pre-Option-E behavior) wherever a second GPU isn't
+    actually visible: the single-A100 VM, or a manually restricted
+    CUDA_VISIBLE_DEVICES (e.g. scripts/gpu_diag_*.sh's own deliberate
+    single-GPU-sharing tests) even on a 2-GPU box. Does require
+    core/gpu.py's ensure_cuda_visible_devices("frontend") to actually
+    expose both physical GPUs to this process when 2 exist (see that
+    module's own resolve_devices() docstring) — before that change, this
+    process would always see device_count()==1 even on the 2-GPU VM,
+    since the front-end used to restrict itself to a single physical GPU
+    by design.
+
+    Idempotent and process-global (like _patch_local_stt_off_thread()):
+    applied once regardless of which entry point runs first.
+    """
+    import torch
+    import moshi.stt.local_stt as local_stt_mod
+
+    if getattr(local_stt_mod.LocalSpeechToText, "_second_gpu_patched", False):
+        return
+
+    original_init = local_stt_mod.LocalSpeechToText.__init__
+
+    @functools.wraps(original_init)
+    def _init_with_second_gpu(self, mimi, *args, **kwargs):
+        if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+            mimi = mimi.to("cuda:1")
+            kwargs.setdefault("device", "cuda:1")
+        original_init(self, mimi, *args, **kwargs)
+
+    local_stt_mod.LocalSpeechToText.__init__ = _init_with_second_gpu
+    local_stt_mod.LocalSpeechToText._second_gpu_patched = True
+
+
+def _patch_cuda_graph_thread_local() -> None:
+    """
+    Makes moshi.utils.compile's `_in_cuda_graph` bookkeeping thread-local
+    instead of a single, process-wide global. Complement to
+    _patch_stt_second_gpu() (see that function's own docstring for the
+    full history of why device separation is the real fix and locking
+    wasn't): _patch_stt_second_gpu() removes the actual CUDA-stream-level
+    conflict — the thing that corrupts the driver and produces
+    AcceleratorError — but the shared `_in_cuda_graph` global is still a
+    real, independent hazard on its own, unrelated to which physical GPU
+    either thread's CUDA work targets: two threads racing a
+    check-then-set on that one process-wide bool (confirmed by reading
+    moshi/utils/compile.py directly — every CUDAGraphed.__call__, warmup,
+    capture, and replay alike, runs inside `with _set_in_cuda_graph():
+    assert not _in_cuda_graph; ...`) could still trip
+    `assert not _in_cuda_graph`. Far more benign than the crash this
+    complements (a clean, deterministic AssertionError, not silent driver
+    corruption), but a real, avoidable bug in its own right, closed by
+    giving each thread its own independent flag — which is what the
+    assert's own "prevent nested capturing" intent actually needs; it was
+    never supposed to couple unrelated threads together in the first
+    place.
+
+    Safe to patch by module attribute (same reasoning as
+    _patch_compiled_functions_thread_safe()'s docstring): confirmed
+    against real moshi-rag source that CUDAGraphed.__call__ calls
+    `in_cuda_graph()` and `_set_in_cuda_graph()` as bare, unqualified
+    names from within compile.py itself — resolved via that module's own
+    globals at call time, not an import-time-bound reference elsewhere
+    that this patch would miss.
+
+    Idempotent and process-global: applied once regardless of which entry
+    point (this module's _load_models(), or scripts/instrumented_server.py's
+    apply_patches()) runs first.
+    """
+    import moshi.utils.compile as compile_mod
+
+    if getattr(compile_mod, "_in_cuda_graph_thread_local_patched", False):
+        return
+
+    thread_state = threading.local()
+
+    def _thread_local_in_cuda_graph() -> bool:
+        return getattr(thread_state, "in_cuda_graph", False)
+
+    @contextmanager
+    def _thread_local_set_in_cuda_graph():
+        assert not _thread_local_in_cuda_graph()
+        thread_state.in_cuda_graph = True
+        try:
+            yield
+        finally:
+            thread_state.in_cuda_graph = False
+
+    compile_mod.in_cuda_graph = _thread_local_in_cuda_graph
+    compile_mod._set_in_cuda_graph = _thread_local_set_in_cuda_graph
+    compile_mod._in_cuda_graph_thread_local_patched = True
+
+
+def _warm_up_stt_exec_mask(stt) -> None:
+    """
+    Forces the one real CUDA graph capture that _patch_stt_no_cuda_graph()
+    can't disable (StreamingModule.set_exec_mask — see
+    _run_stt_frames_sync's docstring, hazard 3) to happen synchronously,
+    single-threaded, before any concurrent activity exists for this
+    turn's freshly-deepcopy'd `stt`. With _patch_stt_second_gpu() and
+    _patch_cuda_graph_thread_local() both in place, this is no longer
+    strictly required for *correctness* (a capture during the live,
+    concurrent window is now safe on both fronts) — kept because it's
+    still a real, cheap latency-cleanliness win: without it, the *first*
+    real per-frame call of every turn would eat a real capture's cost
+    (slower than a replay) during the timed portion of that turn,
+    inflating that turn's own latency measurements for no reason.
+
+    Calls each of stt.mimi.set_exec_mask/stt._lm_gen.set_exec_mask
+    *twice*, not once — a real bug in an earlier version of this
+    function, found via a real VM crash and confirmed by reading
+    CUDAGraphed.__init__'s own default (`warmup_steps: int = 1`, never
+    overridden at either construction site in moshi/modules/streaming.py):
+    the *first* call to a fresh CUDAGraphed only consumes that warmup
+    buffer and executes directly, uncaptured — the capture itself happens
+    on the *second* call. Calling once (the original version of this
+    function) only ever primed the buffer, leaving the real capture to
+    happen on the first real per-frame call instead, exactly the
+    concurrent window this function exists to avoid.
+
+    Checked whether stt._lm_gen.set_exec_mask's own nested recursion
+    (LMGen.set_exec_mask's set_exec_mask_callback calls a *different*,
+    nested StreamingModule's set_exec_mask — see lm.py:549,717) needs its
+    *own* separate warm-up accounting, since it's a distinct CUDAGraphed
+    instance: traced through moshi-rag's real source and confirmed it
+    doesn't — that nested call always happens *while* the outer
+    lm_gen.set_exec_mask call already holds `_set_in_cuda_graph()`
+    (entered before either its warmup or capture branch runs), so
+    `in_cuda_graph()` is already True by the time the nested call's own
+    CUDAGraphed.__call__ checks it, and it always takes the early-return,
+    uncaptured path — never reaches its own warmup/capture machinery at
+    all. Only the two *outer*, directly-called objects (mimi, _lm_gen)
+    ever actually build a graph.
+
+    Call site matters: must run after `stt = deepcopy(self._stt_template)`
+    but strictly before `_run()`/`self._loop.run_until_complete(...)`
+    starts. Confirmed genuinely safe via `_ensure_step_loop()`'s own
+    source: the persistent step-loop task is only ever *scheduled*
+    (asyncio.create_task, never awaited to run) until something next
+    drives `self._loop` — so between turns, and up to this exact point in
+    `_respond_once()`, nothing is executing concurrently on any thread.
+    `stt.mimi`/`stt._lm_gen` are always a fresh deepcopy per turn (see
+    _run_stt_frames_sync's docstring), so `_set_exec_mask_graphed` starts
+    `None` again every single call — this must run every turn, not once
+    per process.
+
+    Real per-frame calls (moshi-rag's own local_stt.py:129,83) always use
+    `torch.ones(1, device=..., dtype=torch.bool)` — batch_size=1, matching
+    this module's hardcoded eval batch size — so warming with the exact
+    same shape/dtype here means the graph captured now is the same one
+    replayed later; CUDAGraphed's own `_match_values_copy_tensors` would
+    reject a shape mismatch otherwise.
+    """
+    import torch
+
+    mask = torch.ones(1, device=stt._device, dtype=torch.bool)
+    stt.mimi.set_exec_mask(mask)
+    stt.mimi.set_exec_mask(mask)
+    stt._lm_gen.set_exec_mask(mask)
+    stt._lm_gen.set_exec_mask(mask)
 
 
 def _maybe_enable_eval_asyncio_debug(loop: "asyncio.AbstractEventLoop") -> None:
@@ -1186,12 +1689,16 @@ class MoshiRAGAdapter(ModelInterface):
         # hardcoded, not config-driven (see that constant's own comment for
         # why those three are path-specific rather than shared).
         args = argparse.Namespace(
-            # Always "cuda:0", deliberately not derived from gpu_devices
-            # (__init__ already resolved and applied the real physical GPU
-            # choice to this process's own CUDA_VISIBLE_DEVICES before this
-            # method ever ran) -- once that scoping is in effect, whichever
-            # physical GPU this process was assigned is always the only one
-            # visible to it, so it's always addressed as index 0 from here.
+            # Always "cuda:0" for the MAIN model, deliberately not derived
+            # from gpu_devices (__init__ already resolved and applied the
+            # real physical GPU choice to this process's own
+            # CUDA_VISIBLE_DEVICES before this method ever ran) -- whichever
+            # physical GPU the front-end was assigned is always the first
+            # one visible to this process, so it's always addressed as index
+            # 0 from here, regardless of whether a second physical GPU is
+            # ALSO visible for STT's own use (see core/gpu.py's
+            # resolve_devices() and _patch_stt_second_gpu() -- STT pins
+            # itself to "cuda:1" independently, when one exists).
             device="cuda:0",
             cfg_coef=self._generation["cfg_coef"],
             batch_size=1,
@@ -1223,7 +1730,24 @@ class MoshiRAGAdapter(ModelInterface):
         # LocalSpeechToText.__init__ asserts its mimi isn't already streaming.
         # Patched before construction (class-level, applies to every
         # instance) — see _patch_local_stt_off_thread()'s docstring.
-        _patch_local_stt_off_thread()
+        # _patch_compiled_functions_thread_safe(), _patch_stt_no_cuda_graph(),
+        # _patch_stt_second_gpu(), and _patch_cuda_graph_thread_local() must
+        # run alongside it — see their own docstrings for the crashes they
+        # fix. Order matters for the STT patches: _patch_stt_second_gpu()
+        # wraps LocalSpeechToText.__init__ again on top of
+        # _patch_stt_no_cuda_graph()'s own wrap, and must run after it so its
+        # own `original_init` reference chains through correctly.
+        # Whole chain gated by _stt_off_thread_enabled() (STT_OFF_THREAD
+        # env var) — see that function's docstring for why this is now an
+        # A/B toggle rather than unconditional.
+        if _stt_off_thread_enabled():
+            _patch_local_stt_off_thread()
+            _patch_compiled_functions_thread_safe()
+            _patch_cuda_graph_thread_local()
+            _patch_stt_no_cuda_graph()
+            _patch_stt_second_gpu()
+        else:
+            logger.info("[STT] STT_OFF_THREAD=0 -- synchronous on-event-loop STT (Option E chain skipped)")
         self._stt_template = LocalSpeechToText(deepcopy(self._mimi))
 
         # See the class docstring's "Conditioning" section — mandatory, not
@@ -1284,6 +1808,7 @@ class MoshiRAGAdapter(ModelInterface):
             wav_path = Path(f.name)
         try:
             stt = deepcopy(self._stt_template)
+            _warm_up_stt_exec_mask(stt)
             return asyncio.run(stt.transcribe_file(wav_path))
         finally:
             wav_path.unlink(missing_ok=True)
@@ -1359,6 +1884,7 @@ class MoshiRAGAdapter(ModelInterface):
 
         try:
             stt = deepcopy(self._stt_template)
+            _warm_up_stt_exec_mask(stt)
             state = self._state
             retrieval_backend = self.retrieval_backend
 

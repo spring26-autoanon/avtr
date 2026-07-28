@@ -493,6 +493,75 @@ def _patch_server_state(session: SessionLog, checkpoint: str, retrieval_backend_
     ServerState.__init__ = patched_init
 
 
+def _patch_server_state_step_pacing() -> None:
+    """Adds real-time pacing to ServerState.run_one_step() — demo-only,
+    does not touch BatchRunner.run_step() itself (shared with
+    core/model_interface.py's eval path, which wants maximum batch
+    throughput, not real-time pacing).
+
+    Root cause this addresses (confirmed against real moshi-rag source,
+    not guessed — see batch_runner.py's run_step(): it measures
+    elapsed_ms and only *warns* past ~77ms, with no complementary sleep
+    when a step finishes early): nothing anywhere in the pipeline paces
+    output to real-time. _deliver_step_row() does an uncapped
+    output_queue.put_nowait() and Channel ships it over the WebSocket
+    immediately. On hardware fast enough to reliably beat the ~80ms
+    real-time budget per step (this project's A100s routinely see
+    ~50-95ms steps), the server ships audio strictly faster than
+    real-time, continuously, with nothing downstream to throttle it back
+    down. This is the confirmed mechanism behind the demo's chronic
+    client-side jitter-buffer overrun (see
+    project_demo_audio_quality_investigation memory / CLAUDE.md's "Demo
+    audio quality" section) — a genuine average-rate mismatch, not
+    ordinary jitter, which the client's own buffer can absorb but never
+    stabilize against.
+
+    Implementation: wraps (does not reimplement) run_one_step — times the
+    real call, and if it completed faster than one frame's real-time
+    duration (1 / mimi.frame_rate), sleeps the remainder before
+    returning. When no step ran (ran=False, no active connections), no
+    change — _step_loop's own existing idle-poll sleep(0.005) still
+    applies untouched.
+
+    Gate: DEMO_STEP_PACING=0 disables (default enabled), to A/B against
+    the pre-pacing baseline.
+    """
+    from moshi.server import ServerState
+
+    # print(), not logger.info(): this function runs from apply_patches(),
+    # called before moshi.server.main() reaches its own setup_logging()
+    # call (server.py's main(), near the bottom) — the root logger has no
+    # handler/level configured yet at this point, so logger.info() here
+    # would be silently swallowed (confirmed live: this was the original,
+    # buggy version, and its [Pacing] lines never appeared in a real VM
+    # run's startup log). Every other logger.info() in this file lives
+    # inside per-connection handlers that only run once a real session
+    # starts, well after setup_logging() -- this function is the
+    # exception, since it must run at startup, before any connection.
+    if os.environ.get("DEMO_STEP_PACING", "1") == "0":
+        print("[Pacing] DEMO_STEP_PACING=0 -- real-time step pacing disabled", file=sys.stderr)
+        return
+
+    if getattr(ServerState, "_step_pacing_patched", False):
+        return
+
+    original_run_one_step = ServerState.run_one_step
+
+    async def patched_run_one_step(self) -> bool:
+        step_start = time.monotonic()
+        ran = await original_run_one_step(self)
+        if ran:
+            frame_period_s = 1.0 / self.runner.mimi.frame_rate
+            remaining = frame_period_s - (time.monotonic() - step_start)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+        return ran
+
+    ServerState.run_one_step = patched_run_one_step
+    ServerState._step_pacing_patched = True
+    print("[Pacing] real-time step pacing enabled (set DEMO_STEP_PACING=0 to disable)", file=sys.stderr)
+
+
 def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retrieval_backend) -> None:
     """
     Per-instance replacement (not a wrap) of one RAGManager's
@@ -574,12 +643,29 @@ def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retr
 
 def _patch_channel(session: SessionLog, retrieval_backend, retrieval_backend_display: dict) -> None:
     from moshi.inference_utils.channel import Channel
+    from moshi.stt.local_stt import LocalSpeechToText
+    from core.model_interface import _warm_up_stt_exec_mask
 
     original_init = Channel.__init__
     original_aexit = Channel.__aexit__
 
     def patched_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        # See _warm_up_stt_exec_mask()'s own docstring (eval-path
+        # precedent) — same fix, same reasoning, applied here since
+        # Channel.__init__ (moshi-rag's own upstream code, just called
+        # above) constructs self.stt the same way core/model_interface.py
+        # does, and this point — after __init__ returns, before this
+        # channel's own recv_loop/step_loop tasks are created — is the
+        # equivalent genuinely single-threaded safe window for the demo
+        # path. Guarded by isinstance: unlike the eval path's
+        # _load_models() (which hardcodes LocalSpeechToText), Channel.stt
+        # can also be a GradiumSpeechToText (--stt gradium, moshi-rag's
+        # own real branch, channel.py) — no local mimi/_lm_gen at all, so
+        # calling this unconditionally would crash with an AttributeError
+        # whenever remote STT is configured.
+        if isinstance(self.stt, LocalSpeechToText):
+            _warm_up_stt_exec_mask(self.stt)
         session.register_channel(self)
         _patch_rag_manager_get_reference_text(session, self.rag_manager, retrieval_backend)
 
@@ -857,13 +943,41 @@ def apply_patches(
     retrieval_backend,
     retrieval_backend_display: dict,
 ) -> None:
-    from core.model_interface import _patch_local_stt_off_thread
+    from core.model_interface import (
+        _patch_compiled_functions_thread_safe,
+        _patch_cuda_graph_thread_local,
+        _patch_local_stt_off_thread,
+        _patch_stt_no_cuda_graph,
+        _patch_stt_second_gpu,
+        _stt_off_thread_enabled,
+    )
 
     _patch_event_loop_diagnostics()
     _patch_server_state(session, checkpoint, retrieval_backend_display)
+    _patch_server_state_step_pacing()
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_channel_conditioning()
-    _patch_local_stt_off_thread()
+    # Whole chain gated by _stt_off_thread_enabled() (STT_OFF_THREAD env
+    # var) — see that function's docstring in core/model_interface.py for
+    # why this is now an A/B toggle rather than unconditional.
+    # print(), not logger.info(), for both branches -- see
+    # _patch_server_state_step_pacing()'s docstring: apply_patches() runs
+    # before moshi.server.main()'s own setup_logging() call, so
+    # logger.info() here would be silently swallowed the same way. Both
+    # states print explicitly (not just the disabled one) so an A/B run
+    # never has to infer the active mode from silence.
+    if _stt_off_thread_enabled():
+        print("[STT] STT_OFF_THREAD=1 (default) -- Option E chain applied (off-thread STT, 2nd-GPU pinning if visible)", file=sys.stderr)
+        _patch_local_stt_off_thread()
+        _patch_compiled_functions_thread_safe()
+        _patch_cuda_graph_thread_local()
+        # Order matters: _patch_stt_second_gpu() wraps LocalSpeechToText.__init__
+        # again on top of _patch_stt_no_cuda_graph()'s own wrap, and must run
+        # after it — see both functions' own docstrings in core/model_interface.py.
+        _patch_stt_no_cuda_graph()
+        _patch_stt_second_gpu()
+    else:
+        print("[STT] STT_OFF_THREAD=0 -- synchronous on-event-loop STT (Option E chain skipped)", file=sys.stderr)
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
     _patch_rag_manager_background_task(session)

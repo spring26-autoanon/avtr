@@ -16,13 +16,13 @@ import os
 import subprocess
 from dataclasses import dataclass
 
-# Front-end always claims physical GPU 0; the conditioner claims GPU 1 only
-# if a second one is actually visible. Fixed and role-based, not negotiated
-# between processes -- the eval path's two processes are launched
-# independently, from two separate terminals (see CLAUDE.md's "Required
-# setup: server_conditioner process"), with no shared parent to coordinate a
-# split at launch time. Each has to independently arrive at the same answer
-# from the same rule.
+# Front-end's own main model always claims physical GPU 0; the conditioner
+# claims GPU 1 only if a second one is actually visible. Fixed and
+# role-based, not negotiated between processes -- the eval path's two
+# processes are launched independently, from two separate terminals (see
+# CLAUDE.md's "Required setup: server_conditioner process"), with no shared
+# parent to coordinate a split at launch time. Each has to independently
+# arrive at the same answer from the same rule.
 _FRONTEND_INDEX = "0"
 
 
@@ -31,6 +31,12 @@ class DeviceAssignment:
     frontend_cuda_visible_devices: str
     conditioner_cuda_visible_devices: str
     contended: bool  # True iff conditioner and front-end share one physical GPU
+    # frontend_cuda_visible_devices is "0,1" (not just "0") when a second
+    # physical GPU exists -- see resolve_devices()'s own docstring for why:
+    # it's what lets the front-end PROCESS pin its own in-process STT model
+    # duplicate to physical GPU 1 internally, while the main model stays on
+    # physical GPU 0 (always addressed as "cuda:0" from inside that
+    # process, regardless of how many GPUs are visible to it).
 
 
 def device_count() -> int:
@@ -73,11 +79,29 @@ def resolve_devices(count: int | None = None) -> DeviceAssignment:
     Pure function of device count -> role assignment. `count` defaults to
     a real device_count() call; passing it explicitly (as tests do) keeps
     this fully unit-testable with no GPU, subprocess, or mocking involved.
+
+    frontend_cuda_visible_devices includes physical GPU 1 too (`"0,1"`,
+    not just `"0"`) whenever a second GPU exists — this is deliberate,
+    not scope creep: the front-end process's own in-process STT model
+    duplicate is pinned to a second physical GPU when one is visible
+    (core/model_interface.py's _patch_stt_second_gpu()), to give it a
+    genuinely separate CUDA context/stream from the front-end's own main
+    model, eliminating a real cross-thread CUDA-graph-capture crash that
+    locking around specific call sites couldn't fully close (see that
+    function's own docstring for the full history). That only works if
+    this process can actually see the second physical GPU at all — once
+    CUDA_VISIBLE_DEVICES restricts a process to one device before its CUDA
+    runtime initializes, no other physical GPU is ever reachable from
+    inside it again, regardless of what index code asks for. The main
+    model itself is unaffected: it's still always addressed as "cuda:0"
+    (see MoshiRAGAdapter._load_models()'s own args.device), the first of
+    whatever's now visible.
     """
     n = device_count() if count is None else count
     conditioner_index = "1" if n >= 2 else _FRONTEND_INDEX
+    frontend_visible = "0,1" if n >= 2 else _FRONTEND_INDEX
     return DeviceAssignment(
-        frontend_cuda_visible_devices=_FRONTEND_INDEX,
+        frontend_cuda_visible_devices=frontend_visible,
         conditioner_cuda_visible_devices=conditioner_index,
         contended=(conditioner_index == _FRONTEND_INDEX),
     )

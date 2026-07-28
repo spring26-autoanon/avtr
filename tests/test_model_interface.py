@@ -12,10 +12,16 @@ from core.model_interface import (
     _TimedInferenceJob,
     _clean_model_text,
     _maybe_enable_eval_asyncio_debug,
+    _patch_compiled_functions_thread_safe,
+    _patch_cuda_graph_thread_local,
     _patch_local_stt_off_thread,
+    _patch_stt_no_cuda_graph,
+    _patch_stt_second_gpu,
     _patched_stt_send_audio,
     _run_stt_frames_sync,
     _silent_wav,
+    _stt_off_thread_enabled,
+    _warm_up_stt_exec_mask,
 )
 from core.retrieval_backend import NullBackend
 
@@ -820,6 +826,501 @@ def test_patch_local_stt_off_thread_is_idempotent(monkeypatch):
     assert fake_cls.send_audio is _patched_stt_send_audio
 
 
+# ── _patch_compiled_functions_thread_safe (dynamo lazy-compile race fix) ──────
+# See that function's own docstring in core/model_interface.py: locks only
+# the three real torch_compile_lazy-decorated leaf functions (apply_rope,
+# _rms_norm, gating_forward_kernel) against the real dynamo crash
+# (RuntimeError: "Detected that you are using FX to symbolically trace a
+# dynamo-optimized function..."). Deliberately narrow, not a whole-step
+# lock — see the docstring for why a coarser lock was tried and reverted
+# after a live demo test showed it starving the front-end's own generation.
+# torch isn't installed in this sandbox, so moshi.modules.{rope,transformer,
+# gating} are faked via sys.modules injection — what's under test here is
+# the patch's wrapping/locking mechanics, not real dynamo behavior, which
+# can only be confirmed on the VM.
+
+
+def _install_fake_moshi_modules_for_compile_patch(monkeypatch):
+    import sys
+    import types
+
+    for name in ("moshi", "moshi.modules"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    rope_mod = types.ModuleType("moshi.modules.rope")
+    rope_mod.apply_rope = lambda *args, **kwargs: ("apply_rope", args, kwargs)
+    monkeypatch.setitem(sys.modules, "moshi.modules.rope", rope_mod)
+
+    transformer_mod = types.ModuleType("moshi.modules.transformer")
+    transformer_mod._rms_norm = lambda *args, **kwargs: ("_rms_norm", args, kwargs)
+    monkeypatch.setitem(sys.modules, "moshi.modules.transformer", transformer_mod)
+
+    gating_mod = types.ModuleType("moshi.modules.gating")
+    gating_mod.gating_forward_kernel = lambda *args, **kwargs: ("gating_forward_kernel", args, kwargs)
+    monkeypatch.setitem(sys.modules, "moshi.modules.gating", gating_mod)
+
+    return rope_mod, transformer_mod, gating_mod
+
+
+def test_patch_compiled_functions_thread_safe_wraps_and_preserves_behavior(monkeypatch):
+    rope_mod, transformer_mod, gating_mod = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
+    original_apply_rope = rope_mod.apply_rope
+    original_rms_norm = transformer_mod._rms_norm
+    original_gating = gating_mod.gating_forward_kernel
+
+    _patch_compiled_functions_thread_safe()
+
+    assert rope_mod.apply_rope is not original_apply_rope
+    assert transformer_mod._rms_norm is not original_rms_norm
+    assert gating_mod.gating_forward_kernel is not original_gating
+
+    assert rope_mod.apply_rope(1, x=2) == ("apply_rope", (1,), {"x": 2})
+    assert transformer_mod._rms_norm(1, x=2) == ("_rms_norm", (1,), {"x": 2})
+    assert gating_mod.gating_forward_kernel(1, x=2) == ("gating_forward_kernel", (1,), {"x": 2})
+
+
+def test_patch_compiled_functions_thread_safe_is_idempotent(monkeypatch):
+    rope_mod, transformer_mod, gating_mod = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
+
+    _patch_compiled_functions_thread_safe()
+    wrapped_apply_rope = rope_mod.apply_rope
+    wrapped_rms_norm = transformer_mod._rms_norm
+    wrapped_gating = gating_mod.gating_forward_kernel
+
+    _patch_compiled_functions_thread_safe()
+
+    assert rope_mod.apply_rope is wrapped_apply_rope
+    assert transformer_mod._rms_norm is wrapped_rms_norm
+    assert gating_mod.gating_forward_kernel is wrapped_gating
+
+
+def test_gpu_exclusivity_lock_serializes_concurrent_calls(monkeypatch):
+    """The real cross-thread mechanism check: two threads both calling a
+    locked function (standing in for real concurrent apply_rope/_rms_norm/
+    gating_forward_kernel calls from the step-loop thread and the STT
+    worker thread) genuinely never run inside the locked section at the
+    same time — real threads, not just each locked in isolation."""
+    import threading
+    import time
+
+    rope_mod, _, _ = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
+
+    concurrent_count = {"current": 0, "max": 0}
+    count_lock = threading.Lock()
+
+    def _slow_apply_rope(*args, **kwargs):
+        with count_lock:
+            concurrent_count["current"] += 1
+            concurrent_count["max"] = max(concurrent_count["max"], concurrent_count["current"])
+        time.sleep(0.05)
+        with count_lock:
+            concurrent_count["current"] -= 1
+
+    rope_mod.apply_rope = _slow_apply_rope
+    _patch_compiled_functions_thread_safe()
+
+    thread_a = threading.Thread(target=rope_mod.apply_rope)
+    thread_b = threading.Thread(target=rope_mod.apply_rope)
+
+    thread_a.start()
+    thread_b.start()
+    thread_a.join()
+    thread_b.join()
+
+    assert concurrent_count["max"] == 1
+
+
+def test_gpu_exclusivity_lock_is_reentrant_on_same_thread(monkeypatch):
+    """Regression test for a real VM deadlock (found via py-spy on a hung
+    warmup() call, back when moshi.modules.streaming.StreamingModule.
+    set_exec_mask was briefly also patched under this same lock —
+    LMGen.set_exec_mask's own set_exec_mask_callback recurses into a
+    *nested* StreamingModule's set_exec_mask on the same thread, and a
+    plain threading.Lock isn't reentrant). set_exec_mask no longer shares
+    this lock (see _COMPILED_FUNCTIONS_LOCK's own docstring — locking
+    turned out not to fix that hazard at all; _warm_up_stt_exec_mask()
+    does instead), but _COMPILED_FUNCTIONS_LOCK stays an RLock as cheap
+    insurance, so this regression test stays too: simulates the same
+    same-thread-recursion shape generically, on a background thread with
+    a bounded join() so a real regression fails the test instead of
+    hanging the suite forever."""
+    import threading
+
+    rope_mod, _, _ = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
+
+    call_count = {"n": 0}
+
+    def _recursive_apply_rope(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] < 2:
+            rope_mod.apply_rope()  # nested call, same thread, lock already held
+        return call_count["n"]
+
+    rope_mod.apply_rope = _recursive_apply_rope
+    _patch_compiled_functions_thread_safe()
+
+    result = {}
+
+    def _run():
+        result["value"] = rope_mod.apply_rope()
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert not thread.is_alive(), "recursive call deadlocked — lock is not reentrant"
+    assert result["value"] == 2
+
+
+# ── _patch_stt_no_cuda_graph (CUDA graph stream-capture crash fix) ────────────
+# See that function's own docstring in core/model_interface.py: disables
+# CUDA graphing for STT's own LMGen/Mimi instances entirely (LMGen(profile=
+# True), mimi.set_profile(True)), eliminating the CUDA-graph hazard
+# (AcceleratorError: "CUDA error: operation not permitted when stream is
+# capturing") without needing any lock around STT frame compute. torch
+# isn't installed in this sandbox, so moshi.stt.local_stt is faked via
+# sys.modules injection.
+
+
+def _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch):
+    import sys
+    import types
+
+    for name in ("moshi", "moshi.stt"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    local_stt_mod = types.ModuleType("moshi.stt.local_stt")
+
+    class _FakeLMGen:
+        def __init__(self, *args, **kwargs):
+            self.init_args = args
+            self.init_kwargs = kwargs
+
+    class _FakeLocalSpeechToText:
+        def __init__(self, mimi, *args, **kwargs):
+            self.mimi = mimi
+            self.init_args = args
+            self.init_kwargs = kwargs
+
+    local_stt_mod.LMGen = _FakeLMGen
+    local_stt_mod.LocalSpeechToText = _FakeLocalSpeechToText
+    monkeypatch.setitem(sys.modules, "moshi.stt.local_stt", local_stt_mod)
+
+    return local_stt_mod
+
+
+def test_patch_stt_no_cuda_graph_forces_lm_gen_profile_true(monkeypatch):
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_no_cuda_graph()
+
+    lm_gen = local_stt_mod.LMGen(object(), cfg_coef=1.0)
+    assert lm_gen.init_kwargs["profile"] is True
+
+
+def test_patch_stt_no_cuda_graph_forces_lm_gen_profile_true_even_if_caller_passes_false(monkeypatch):
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_no_cuda_graph()
+
+    lm_gen = local_stt_mod.LMGen(object(), profile=False)
+    assert lm_gen.init_kwargs["profile"] is True
+
+
+def test_patch_stt_no_cuda_graph_sets_mimi_profile_before_delegating(monkeypatch):
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_no_cuda_graph()
+
+    mimi = MagicMock()
+    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
+
+    mimi.set_profile.assert_called_once_with(True)
+    assert stt.mimi is mimi
+    assert stt.init_kwargs == {"vad_callback": None}
+
+
+def test_patch_stt_no_cuda_graph_is_idempotent(monkeypatch):
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_no_cuda_graph()
+    wrapped_lm_gen = local_stt_mod.LMGen
+    wrapped_init = local_stt_mod.LocalSpeechToText.__init__
+
+    _patch_stt_no_cuda_graph()
+
+    assert local_stt_mod.LMGen is wrapped_lm_gen
+    assert local_stt_mod.LocalSpeechToText.__init__ is wrapped_init
+
+
+# ── _patch_stt_second_gpu (Option E: physical device separation) ─────────────
+# See that function's own docstring in core/model_interface.py for the full
+# history of why locking around specific call sites (three attempts) never
+# fully closed the cross-thread CUDA-graph-capture crash, and why moving
+# STT's own model instances to a genuinely separate physical GPU does.
+# torch isn't installed in this sandbox, so both moshi.stt.local_stt and a
+# torch.cuda with a controllable device_count() are faked.
+
+
+def _install_fake_torch_with_cuda(monkeypatch, device_count: int):
+    import sys
+    import types
+
+    fake_cuda = types.ModuleType("torch.cuda")
+    fake_cuda.is_available = lambda: device_count > 0
+    fake_cuda.device_count = lambda: device_count
+
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = fake_cuda
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "torch.cuda", fake_cuda)
+    return fake_torch
+
+
+def test_patch_stt_second_gpu_moves_mimi_to_cuda_1_when_two_gpus_visible(monkeypatch):
+    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_second_gpu()
+
+    mimi = MagicMock()
+    moved_mimi = MagicMock()
+    mimi.to.return_value = moved_mimi
+
+    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
+
+    mimi.to.assert_called_once_with("cuda:1")
+    assert stt.mimi is moved_mimi
+    assert stt.init_kwargs["device"] == "cuda:1"
+
+
+def test_patch_stt_second_gpu_is_a_noop_with_one_gpu(monkeypatch):
+    _install_fake_torch_with_cuda(monkeypatch, device_count=1)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_second_gpu()
+
+    mimi = MagicMock()
+    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
+
+    mimi.to.assert_not_called()
+    assert stt.mimi is mimi
+    assert "device" not in stt.init_kwargs
+
+
+def test_patch_stt_second_gpu_is_a_noop_with_no_cuda(monkeypatch):
+    _install_fake_torch_with_cuda(monkeypatch, device_count=0)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_second_gpu()
+
+    mimi = MagicMock()
+    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
+
+    mimi.to.assert_not_called()
+    assert stt.mimi is mimi
+
+
+def test_patch_stt_second_gpu_does_not_override_an_explicit_device(monkeypatch):
+    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_second_gpu()
+
+    mimi = MagicMock()
+    stt = local_stt_mod.LocalSpeechToText(mimi, device="cuda:0")
+
+    assert stt.init_kwargs["device"] == "cuda:0"
+
+
+def test_patch_stt_second_gpu_is_idempotent(monkeypatch):
+    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_second_gpu()
+    wrapped_init = local_stt_mod.LocalSpeechToText.__init__
+
+    _patch_stt_second_gpu()
+
+    assert local_stt_mod.LocalSpeechToText.__init__ is wrapped_init
+
+
+def test_patch_stt_second_gpu_chains_after_patch_stt_no_cuda_graph(monkeypatch):
+    """Confirms the documented call-order requirement: applying both
+    patches (in the order core/model_interface.py and
+    scripts/instrumented_server.py both use) still forces profile=True
+    *and* moves mimi to the second GPU — neither patch's effect is lost
+    by the other wrapping on top."""
+    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
+    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
+
+    _patch_stt_no_cuda_graph()
+    _patch_stt_second_gpu()
+
+    mimi = MagicMock()
+    moved_mimi = MagicMock()
+    mimi.to.return_value = moved_mimi
+
+    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
+
+    mimi.to.assert_called_once_with("cuda:1")
+    moved_mimi.set_profile.assert_called_once_with(True)
+    assert stt.mimi is moved_mimi
+    assert stt.init_kwargs["device"] == "cuda:1"
+
+
+# ── _patch_cuda_graph_thread_local (Option E's complement) ────────────────────
+# See that function's own docstring in core/model_interface.py: makes
+# moshi.utils.compile's `_in_cuda_graph` bookkeeping thread-local instead of
+# a single, process-wide global, closing the residual (far more benign)
+# risk left after _patch_stt_second_gpu() removes the actual CUDA-stream
+# conflict. torch isn't needed here at all — in_cuda_graph()/
+# _set_in_cuda_graph() are pure Python bookkeeping.
+
+
+def _install_fake_moshi_utils_compile(monkeypatch):
+    import sys
+    import types
+    from contextlib import contextmanager
+
+    for name in ("moshi", "moshi.utils"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    compile_mod = types.ModuleType("moshi.utils.compile")
+    _flag = {"value": False}
+
+    def in_cuda_graph() -> bool:
+        return _flag["value"]
+
+    @contextmanager
+    def _set_in_cuda_graph():
+        assert not _flag["value"]
+        _flag["value"] = True
+        try:
+            yield
+        finally:
+            _flag["value"] = False
+
+    compile_mod.in_cuda_graph = in_cuda_graph
+    compile_mod._set_in_cuda_graph = _set_in_cuda_graph
+    monkeypatch.setitem(sys.modules, "moshi.utils.compile", compile_mod)
+    return compile_mod
+
+
+def test_patch_cuda_graph_thread_local_replaces_both_functions(monkeypatch):
+    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
+    original_in_cuda_graph = compile_mod.in_cuda_graph
+    original_set = compile_mod._set_in_cuda_graph
+
+    _patch_cuda_graph_thread_local()
+
+    assert compile_mod.in_cuda_graph is not original_in_cuda_graph
+    assert compile_mod._set_in_cuda_graph is not original_set
+
+
+def test_patch_cuda_graph_thread_local_preserves_same_thread_reentrancy_guard(monkeypatch):
+    """Same-thread double-entry must still trip the assert — this is the
+    real, intended protection (preventing a genuinely nested capture on
+    one thread), not something the thread-local swap should remove."""
+    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
+    _patch_cuda_graph_thread_local()
+
+    with compile_mod._set_in_cuda_graph():
+        assert compile_mod.in_cuda_graph() is True
+        with pytest.raises(AssertionError):
+            with compile_mod._set_in_cuda_graph():
+                pass
+    assert compile_mod.in_cuda_graph() is False
+
+
+def test_patch_cuda_graph_thread_local_isolates_different_threads(monkeypatch):
+    """The actual bug being fixed: two threads must NOT observe each
+    other's flag at all. Real threads, not simulated -- one thread holds
+    _set_in_cuda_graph() open for a while; a second thread entering its
+    own _set_in_cuda_graph() concurrently must not see in_cuda_graph()==True
+    and must not trip the reentrancy assert."""
+    import threading
+
+    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
+    _patch_cuda_graph_thread_local()
+
+    other_thread_saw_false = {"value": None}
+    other_thread_raised = {"value": None}
+
+    def _other_thread():
+        try:
+            other_thread_saw_false["value"] = compile_mod.in_cuda_graph() is False
+            with compile_mod._set_in_cuda_graph():
+                pass
+        except Exception as exc:  # noqa: BLE001 - want to see any failure
+            other_thread_raised["value"] = exc
+
+    with compile_mod._set_in_cuda_graph():
+        thread = threading.Thread(target=_other_thread)
+        thread.start()
+        thread.join(timeout=5.0)
+
+    assert not thread.is_alive(), "other thread never finished -- assert likely blocked it"
+    assert other_thread_raised["value"] is None
+    assert other_thread_saw_false["value"] is True
+
+
+def test_patch_cuda_graph_thread_local_is_idempotent(monkeypatch):
+    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
+
+    _patch_cuda_graph_thread_local()
+    wrapped_in_cuda_graph = compile_mod.in_cuda_graph
+    wrapped_set = compile_mod._set_in_cuda_graph
+
+    _patch_cuda_graph_thread_local()
+
+    assert compile_mod.in_cuda_graph is wrapped_in_cuda_graph
+    assert compile_mod._set_in_cuda_graph is wrapped_set
+
+
+# ── _warm_up_stt_exec_mask (latency-cleanliness fix now that Option E's ──────
+#    device separation + thread-local flag handle correctness — see all
+#    three functions' own docstrings in core/model_interface.py. Forces the
+#    one real capture (StreamingModule.set_exec_mask, on both mimi and
+#    _lm_gen) to happen synchronously before any concurrent activity
+#    exists, so the real STT worker thread only ever replays an
+#    already-built graph. Calls each *twice*, not once — CUDAGraphed's own
+#    default `warmup_steps=1` means the first call only primes that
+#    buffer, uncaptured; the real capture happens on the second call. torch
+#    isn't installed in this sandbox, so it's faked via sys.modules
+#    injection.
+
+
+def test_warm_up_stt_exec_mask_calls_both_mimi_and_lm_gen_twice(monkeypatch):
+    fake_torch = _install_fake_torch(monkeypatch)
+    stt = MagicMock()
+    stt._device = "cpu"
+
+    _warm_up_stt_exec_mask(stt)
+
+    fake_torch.ones.assert_called_once_with(1, device="cpu", dtype="bool")
+    mask = fake_torch.ones.return_value
+    assert stt.mimi.set_exec_mask.call_args_list == [((mask,),), ((mask,),)]
+    assert stt._lm_gen.set_exec_mask.call_args_list == [((mask,),), ((mask,),)]
+
+
+def test_warm_up_stt_exec_mask_uses_the_same_mask_instance_for_all_calls(monkeypatch):
+    """Real per-frame calls (local_stt.py:129,83) build a fresh
+    torch.ones(...) tensor each time, but there's no requirement that
+    warm-up's own single mask be reused vs. rebuilt per call — this just
+    pins down current, simple behavior (one tensor, passed to every call)
+    so a future refactor notices if it changes."""
+    _install_fake_torch(monkeypatch)
+    stt = MagicMock()
+    stt._device = "cuda:0"
+
+    _warm_up_stt_exec_mask(stt)
+
+    all_masks = [c.args[0] for c in stt.mimi.set_exec_mask.call_args_list]
+    all_masks += [c.args[0] for c in stt._lm_gen.set_exec_mask.call_args_list]
+    assert len(set(id(m) for m in all_masks)) == 1
+
+
 # ── _maybe_enable_eval_asyncio_debug (eval-path counterpart of the demo's
 #    DEMO_ASYNCIO_DEBUG diagnostic — see that function's own docstring) ────────
 
@@ -1090,3 +1591,21 @@ def test_finalize_ttfat_defaults_to_zero_when_first_audio_never_recorded():
     assert timed.ttfat_s == 0.0
 
     assert timed.asr_wait_s >= 0.0
+
+
+# --- _stt_off_thread_enabled (STT_OFF_THREAD A/B toggle) -------------------
+
+
+def test_stt_off_thread_enabled_by_default(monkeypatch):
+    monkeypatch.delenv("STT_OFF_THREAD", raising=False)
+    assert _stt_off_thread_enabled() is True
+
+
+def test_stt_off_thread_disabled_via_env_var(monkeypatch):
+    monkeypatch.setenv("STT_OFF_THREAD", "0")
+    assert _stt_off_thread_enabled() is False
+
+
+def test_stt_off_thread_any_other_value_is_enabled(monkeypatch):
+    monkeypatch.setenv("STT_OFF_THREAD", "false")
+    assert _stt_off_thread_enabled() is True
