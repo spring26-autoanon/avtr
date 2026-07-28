@@ -37,9 +37,13 @@ many partners" target from `NEXT_STEPS.md`.
    **right (ch 1)**, audio only. `annotate.py` hard-codes `channel=0`, and Moshi's
    Inner Monologue models only the main speaker's text, so left **must** be the
    voice.
-2. **Eval set:** carve the **last ~10 min (600 s)** of the 86-min Joshua
-   conversation into a separate eval WAV (~6 windows → a stable `eval_loss` curve;
-   the last run logged NaN from a too-small eval set). Everything else trains.
+2. **Eval set:** carve a **~10 min (600 s) slice from the middle** of the 86-min
+   Joshua conversation into a separate eval WAV (~6 windows → a stable `eval_loss`
+   curve; the last run logged NaN from a too-small eval set). Middle rather than
+   end so the eval isn't skewed by low-activity wind-down. The two remaining
+   Joshua segments (before / after the slice) both go to train as separate files —
+   **not** spliced, so no jump-cut lands inside a 100 s window. Everything else
+   trains.
 3. **No manual clip segmentation** — see "Windowing" below.
 
 ## Why the papers back this
@@ -95,15 +99,20 @@ Responsibilities:
 - Read both mono tracks, assert `sr == 24000`, **truncate to the shorter length**
   (handles the 600-frame / 25 ms mismatch in the Clay conv), `column_stack([main,
   partner])`. Print the per-conv frame delta so track sync can be eyeballed.
-- **Eval carve:** `--eval-conv 1411304343 --eval-tail-sec 600` splits that
-  conversation at a frame boundary into `<...>_train.wav` + `<...>_eval.wav`.
+- **Eval carve:** `--eval-conv 1411304343 --eval-sec 600` (centered by default;
+  optional `--eval-center-frac 0.5`) cuts a 600 s slice from the middle at frame
+  boundaries, yielding three pieces: `<...>_train_a.wav` (before),
+  `<...>_eval.wav` (middle), `<...>_train_b.wav` (after). The two train pieces are
+  emitted separately, never concatenated.
 - Write `PCM_24 / 24 kHz` stereo to `--dst finetune/data/prepared_dialogue/`
   (new dir; leaves the old monologue run in `prepared/` intact).
 - Snake_case output names.
 
-Outputs (4 files):
-`danielle_clay.wav`, `danielle_joshua_train.wav`, `danielle_joshua_eval.wav`,
-`danielle_leena.wav`.
+Outputs (5 files):
+`danielle_clay.wav`, `danielle_joshua_train_a.wav`, `danielle_joshua_eval.wav`,
+`danielle_joshua_train_b.wav`, `danielle_leena.wav`.
+Joshua conv (5173.7 s) → train_a ≈ 2286.9 s (~38.1 min), eval = 600 s (10 min),
+train_b ≈ 2286.9 s (~38.1 min). Train total ≈ 136 min, eval 10 min.
 
 ### 2. `scripts/build_manifest.py` (reused unchanged)
 
@@ -138,8 +147,8 @@ manifest building, are A100 steps.
 Built into the script and a pytest against the real files:
 
 - Each output: 2-channel / 24 kHz / PCM_24.
-- Durations sum correctly: `danielle_joshua_train` + `danielle_joshua_eval` ≈
-  original Joshua length (within one frame).
+- Durations sum correctly: `danielle_joshua_train_a` + `danielle_joshua_eval` +
+  `danielle_joshua_train_b` ≈ original Joshua length (within one frame).
 - **Left-channel RMS matches the Danielle source; right matches the partner** —
   the make-or-break guard against swapped channels.
 - One group per conv, exactly 2 tracks each, Danielle in all three.
