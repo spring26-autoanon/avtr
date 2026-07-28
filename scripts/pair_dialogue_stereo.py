@@ -81,3 +81,84 @@ def carve_eval(
     start = max(0, min(start, total - eval_frames))
     end = start + eval_frames
     return stereo[:start], stereo[start:end], stereo[end:]
+
+
+def discover_conversations(
+    src: Path, main_name: str
+) -> dict[str, tuple[Path, str, Path, str]]:
+    """Group *.wav by conv_id and split each into (main, partner) by identity."""
+    groups: dict[str, list[tuple[Path, str]]] = {}
+    for wav in sorted(src.glob("*.wav")):
+        speaker, _idx, conv_id = parse_track_name(wav.name)
+        groups.setdefault(conv_id, []).append((wav, speaker))
+
+    convs: dict[str, tuple[Path, str, Path, str]] = {}
+    key = main_name.lower()
+    for conv_id, tracks in groups.items():
+        if len(tracks) != 2:
+            raise SystemExit(
+                f"conversation {conv_id} has {len(tracks)} tracks, expected 2: "
+                + ", ".join(p.name for p, _ in tracks)
+            )
+        mains = [(p, s) for p, s in tracks if key in s]
+        partners = [(p, s) for p, s in tracks if key not in s]
+        if len(mains) != 1 or len(partners) != 1:
+            raise SystemExit(
+                f"conversation {conv_id}: need exactly one '{main_name}' track and "
+                f"one partner; got mains={[s for _, s in mains]}, "
+                f"partners={[s for _, s in partners]}"
+            )
+        (main_path, main_spk), (partner_path, partner_spk) = mains[0], partners[0]
+        convs[conv_id] = (main_path, main_spk, partner_path, partner_spk)
+    return convs
+
+
+def _write(dst: Path, name: str, stereo: np.ndarray) -> None:
+    sf.write(str(dst / name), stereo, TARGET_SR, subtype="PCM_24")
+    print(f"  wrote {name:42s} {stereo.shape[0] / TARGET_SR:8.1f}s")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--src", default="finetune/data/datastereo/clean_moshi_audio_24khz")
+    ap.add_argument("--dst", default="finetune/data/prepared_dialogue")
+    ap.add_argument("--main-name", default="danielle",
+                    help="case-insensitive substring identifying the cloned voice")
+    ap.add_argument("--eval-conv", default="1411304343",
+                    help="conv_id to carve an eval slice from")
+    ap.add_argument("--eval-sec", type=float, default=600.0)
+    ap.add_argument("--eval-center-frac", type=float, default=0.5)
+    args = ap.parse_args(argv)
+
+    src = Path(args.src)
+    dst = Path(args.dst)
+    dst.mkdir(parents=True, exist_ok=True)
+
+    convs = discover_conversations(src, args.main_name)
+    if args.eval_conv not in convs:
+        raise SystemExit(
+            f"--eval-conv {args.eval_conv} not found among: {sorted(convs)}"
+        )
+
+    prefix = args.main_name.lower()
+    for conv_id, (main_path, _ms, partner_path, partner_spk) in sorted(convs.items()):
+        stereo, _sr, delta = combine_to_stereo(main_path, partner_path)
+        print(f"conv {conv_id}  partner={partner_spk}  "
+              f"len={stereo.shape[0] / TARGET_SR:.1f}s  align_delta={delta} frames")
+        if conv_id == args.eval_conv:
+            before, ev, after = carve_eval(
+                stereo, TARGET_SR, args.eval_sec, args.eval_center_frac
+            )
+            if before.shape[0]:
+                _write(dst, f"{prefix}_{partner_spk}_train_a.wav", before)
+            _write(dst, f"{prefix}_{partner_spk}_eval.wav", ev)
+            if after.shape[0]:
+                _write(dst, f"{prefix}_{partner_spk}_train_b.wav", after)
+        else:
+            _write(dst, f"{prefix}_{partner_spk}.wav", stereo)
+
+    print(f"\nDone -> {dst}")
+
+
+if __name__ == "__main__":
+    main()

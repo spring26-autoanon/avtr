@@ -91,3 +91,99 @@ def test_carve_rejects_too_long():
     stereo = np.zeros((1 * 24000, 2), dtype="float32")
     with pytest.raises(SystemExit):
         carve_eval(stereo, 24000, eval_sec=2.0)
+
+
+from pair_dialogue_stereo import discover_conversations, main
+
+
+def _fake_source(dirpath):
+    # conv A (no eval): main=danielle val 0.5, partner=clay val -0.25
+    _mono_wav(dirpath / "audioDanielleDeLosa20000000001_24khz.wav", 1.0, 0.5)
+    _mono_wav(dirpath / "audioClayS10000000001_24khz.wav", 1.0, -0.25)
+    # conv B (eval target): main=danielle val 0.5, partner=joshua val -0.5
+    _mono_wav(dirpath / "audioDanielleDeLosa10000000002_24khz.wav", 10.0, 0.5)
+    _mono_wav(dirpath / "audioJoshuaRhodes20000000002_24khz.wav", 10.0, -0.5)
+
+
+def test_discover_pairs_by_conv_and_identity(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    _fake_source(src)
+    convs = discover_conversations(src, "danielle")
+    assert set(convs) == {"0000000001", "0000000002"}
+    main_path, main_spk, partner_path, partner_spk = convs["0000000001"]
+    assert main_spk == "danielledelosa" and partner_spk == "clays"
+
+
+def test_main_writes_expected_files_and_channels(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    _fake_source(src)
+    main([
+        "--src", str(src), "--dst", str(dst),
+        "--main-name", "danielle",
+        "--eval-conv", "0000000002", "--eval-sec", "2.0", "--eval-center-frac", "0.5",
+    ])
+    names = sorted(p.name for p in dst.glob("*.wav"))
+    assert names == [
+        "danielle_clays.wav",
+        "danielle_joshuarhodes_eval.wav",
+        "danielle_joshuarhodes_train_a.wav",
+        "danielle_joshuarhodes_train_b.wav",
+    ]
+    # channel assignment + format on the non-eval conv
+    data, sr = sf.read(str(dst / "danielle_clays.wav"), always_2d=True)
+    assert sr == 24000 and data.shape[1] == 2
+    assert np.allclose(data[:, 0], 0.5, atol=1e-4)   # left = main
+    assert np.allclose(data[:, 1], -0.25, atol=1e-4)  # right = partner
+    assert sf.info(str(dst / "danielle_clays.wav")).subtype == "PCM_24"
+    # eval slice length
+    ev = sf.info(str(dst / "danielle_joshuarhodes_eval.wav"))
+    assert ev.frames == 2 * 24000
+
+
+REAL_SRC = Path(__file__).resolve().parents[1] / "finetune/data/datastereo/clean_moshi_audio_24khz"
+REAL_DST = Path(__file__).resolve().parents[1] / "finetune/data/prepared_dialogue"
+
+
+@pytest.mark.skipif(
+    not (REAL_DST / "danielle_clays.wav").exists(),
+    reason="run pair_dialogue_stereo.py on the real recordings first",
+)
+def test_real_outputs_format_and_channels():
+    expected = {
+        "danielle_clays.wav",
+        "danielle_joshuarhodes_train_a.wav",
+        "danielle_joshuarhodes_eval.wav",
+        "danielle_joshuarhodes_train_b.wav",
+        "danielle_leenatantawy.wav",
+    }
+    assert {p.name for p in REAL_DST.glob("*.wav")} == expected
+    for name in expected:
+        info = sf.info(str(REAL_DST / name))
+        assert info.channels == 2, name
+        assert info.samplerate == 24000, name
+        assert info.subtype == "PCM_24", name
+
+    # eval slice is exactly 600 s
+    assert sf.info(str(REAL_DST / "danielle_joshuarhodes_eval.wav")).frames == 600 * 24000
+
+    # Joshua split lengths sum to the original conversation (within 1 frame)
+    orig = sf.info(str(REAL_SRC / "audioDanielleDeLosa11411304343_24khz.wav")).frames
+    parts = sum(
+        sf.info(str(REAL_DST / n)).frames
+        for n in ("danielle_joshuarhodes_train_a.wav",
+                  "danielle_joshuarhodes_eval.wav",
+                  "danielle_joshuarhodes_train_b.wav")
+    )
+    assert abs(parts - orig) <= 1
+
+    # left channel == Danielle source, right == Clay source (first 1 s, exact copy)
+    out, _ = sf.read(str(REAL_DST / "danielle_clays.wav"), start=0, stop=24000, always_2d=True)
+    dan, _ = sf.read(str(REAL_SRC / "audioDanielleDeLosa21556527425_24khz.wav"),
+                     start=0, stop=24000, always_2d=True)
+    clay, _ = sf.read(str(REAL_SRC / "audioClayS11556527425_24khz.wav"),
+                      start=0, stop=24000, always_2d=True)
+    assert np.array_equal(out[:, 0], dan[:, 0])
+    assert np.array_equal(out[:, 1], clay[:, 0])
