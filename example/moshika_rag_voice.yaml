@@ -55,7 +55,7 @@ save_adapters: true   # keep a portable lora.safetensors (applied over moshika-r
 seed: 0
 log_freq: 1
 
-run_dir: "runs/moshika_rag_voice"
+run_dir: "runs/moshika_dialogue"
 
 # SMOKE TEST before the real run (validates moshika-rag's RAG-conditioner config loads):
 #   copy this file, set max_steps: 1 and do_ckpt: false, and run once.
