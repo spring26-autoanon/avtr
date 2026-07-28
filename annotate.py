@@ -14,7 +14,7 @@ from pathlib import Path
 import sphn
 import submitit
 import torch
-import torchaudio.functional as F
+import julius
 import whisper_timestamped as whisper
 
 transcribe = importlib.import_module("whisper_timestamped.transcribe")
@@ -89,7 +89,7 @@ def process_one(
     if dur > 3600 * 4:
         raise RuntimeError("File is too long for now.")
     vocals = x[channel][None]
-    vocals = F.resample(vocals, sr, SAMPLE_RATE)
+    vocals = julius.resample_frac(vocals, sr, SAMPLE_RATE)
     sr = SAMPLE_RATE
 
     def new_get_vad_segments(*args, **kwargs):
