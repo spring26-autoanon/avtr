@@ -73,3 +73,21 @@ def test_combine_rejects_wrong_sr(tmp_path):
     _mono_wav(partner, 1.0, -0.25)
     with pytest.raises(SystemExit):
         combine_to_stereo(main, partner)
+
+
+from pair_dialogue_stereo import carve_eval
+
+
+def test_carve_splits_contiguously():
+    stereo = np.arange(10 * 24000 * 2, dtype="float32").reshape(10 * 24000, 2)
+    before, ev, after = carve_eval(stereo, 24000, eval_sec=2.0, center_frac=0.5)
+    assert ev.shape[0] == 2 * 24000
+    assert before.shape[0] == 4 * 24000   # centered: start at 5s-1s = 4s
+    assert after.shape[0] == 4 * 24000
+    assert np.array_equal(np.concatenate([before, ev, after]), stereo)
+
+
+def test_carve_rejects_too_long():
+    stereo = np.zeros((1 * 24000, 2), dtype="float32")
+    with pytest.raises(SystemExit):
+        carve_eval(stereo, 24000, eval_sec=2.0)

@@ -64,3 +64,20 @@ def combine_to_stereo(main_path: Path, partner_path: Path) -> tuple[np.ndarray, 
     n = min(len(m), len(p))
     stereo = np.column_stack([m[:n], p[:n]])
     return stereo, TARGET_SR, delta
+
+
+def carve_eval(
+    stereo: np.ndarray, sr: int, eval_sec: float, center_frac: float = 0.5
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Cut an eval slice from the middle. Returns (before, eval, after)."""
+    total = stereo.shape[0]
+    eval_frames = int(round(eval_sec * sr))
+    if eval_frames >= total:
+        raise SystemExit(
+            f"eval slice ({eval_sec}s) >= conversation length ({total / sr:.1f}s)."
+        )
+    center = int(round(total * center_frac))
+    start = center - eval_frames // 2
+    start = max(0, min(start, total - eval_frames))
+    end = start + eval_frames
+    return stereo[:start], stereo[start:end], stereo[end:]
