@@ -180,7 +180,13 @@ class OpenAudioBenchEval(BaseEval):
                     if resp_metadata.get("degenerate_silence"):
                         state["degenerate_silence"] += 1
                 except Exception as exc:
-                    logger.warning("open_audio_bench[%s][%d] failed: %s", subset_key, i, exc)
+                    # str(exc) alone is useless for a TaskGroup's
+                    # ExceptionGroup (just "unhandled errors in a TaskGroup
+                    # (N sub-exceptions)", no detail on what actually broke)
+                    # — exc_info=True gets the real sub-exception tracebacks
+                    # into the log via Python 3.11's ExceptionGroup-aware
+                    # traceback formatting.
+                    logger.warning("open_audio_bench[%s][%d] failed: %s", subset_key, i, exc, exc_info=True)
                     errors.append(f"{subset_key}[{i}]: {exc}")
                     entry["error"] = str(exc)
                     correct = False
