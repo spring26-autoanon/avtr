@@ -1,7 +1,21 @@
 backends:
+  # Promoted to the shipped default (2026-07-28): gemini-3.5-flash-lite,
+  # confirmed on a real VM run to cut retrieval latency meaningfully (~0.35-0.5s
+  # vs ~2s for gemini-3.5-flash, real Table 1-style retrieval_breakdown numbers)
+  # with no quality/grounding regression once tested against a healthy
+  # conditioner process (an earlier apparent regression — silently ungrounded
+  # answers alongside a reference-encoder ConnectError — was root-caused to a
+  # degraded/dead long-running conditioner unrelated to this backend; see
+  # CLAUDE.md's reference-encoder ConnectError note). Previously listed as
+  # "validated, not yet promoted" — promoted now specifically so retrieval
+  # latency stops being a plausible explanation for demo dead-air, forcing
+  # any remaining gap to be root-caused to something else. Retrieval only:
+  # this doesn't touch judge.model or the tts: block, which stay on
+  # gemini-3.5-flash/gemini-3.1-flash-tts-preview regardless of which
+  # retrieval backend is selected.
   gemini_api:
     type: gemini_api
-    model: gemini-3.5-flash
+    model: gemini-3.5-flash-lite
     api_key_env: GEMINI_API_KEY
     prompt_template: configs/prompts/retrieval_reference_simple.txt
     context_formatting:
@@ -11,15 +25,16 @@ backends:
       history_max_entries: null
       role_labels: {user: "Human", model: "moshi"}
 
-  # Alternate starting point, not the shipped default — demonstrates the
-  # full moshi-defaults pairing described in core/retrieval_backend.py's
-  # "On prompt parity" note. Select it explicitly
+  # Same promotion as gemini_api above, applied to the moshi-style prompt-
+  # formatting variant (core/retrieval_backend.py's "On prompt parity"
+  # note) so that axis isn't left on the slower model while everything
+  # else moves to flash-lite. Select it explicitly
   # (model.retrieval.backend: gemini_api_moshi_style) rather than editing
   # the entry above in place, so the existing baseline configs' behavior
   # doesn't change silently underneath anyone already relying on it.
   gemini_api_moshi_style:
     type: gemini_api
-    model: gemini-3.5-flash
+    model: gemini-3.5-flash-lite
     api_key_env: GEMINI_API_KEY
     prompt_template: configs/prompts/retrieval_reference_moshi_style.txt
     context_formatting:
@@ -33,19 +48,25 @@ backends:
                                   # cap this either
       role_labels: {user: "Human", model: "moshi"}
 
-  # Alternate starting point, not the shipped default — gemini-3.5-flash-lite,
-  # confirmed on a real VM run to cut retrieval latency meaningfully (~0.35-0.5s
-  # vs ~2s for gemini-3.5-flash, real Table 1-style retrieval_breakdown numbers)
-  # with no quality/grounding regression once tested against a healthy
-  # conditioner process (an earlier apparent regression — silently ungrounded
-  # answers alongside a reference-encoder ConnectError — was root-caused to a
-  # degraded/dead long-running conditioner unrelated to this backend; see
-  # CLAUDE.md's reference-encoder ConnectError note). Validated, not yet
-  # promoted to the shipped default — select explicitly
-  # (model.retrieval.backend: gemini_api_flash_lite) rather than editing
-  # the entry above in place. Retrieval only: this doesn't touch judge.model
-  # or the tts: block, which stay on gemini-3.5-flash/gemini-3.1-flash-tts-preview
-  # respectively regardless of which retrieval backend is selected.
+  # Kept as an explicit, named alternative to the now-promoted default
+  # above — the original gemini-3.5-flash entries, for anyone who
+  # specifically wants to A/B against the slower model again. Select
+  # explicitly (model.retrieval.backend: gemini_api_flash_baseline) rather
+  # than editing gemini_api above in place.
+  gemini_api_flash_baseline:
+    type: gemini_api
+    model: gemini-3.5-flash
+    api_key_env: GEMINI_API_KEY
+    prompt_template: configs/prompts/retrieval_reference_simple.txt
+    context_formatting:
+      drop_leading_incomplete_turn: false
+      drop_trailing_incomplete_turn: false
+      thread_reference_history: false
+      history_max_entries: null
+      role_labels: {user: "Human", model: "moshi"}
+
+  # Now identical to gemini_api above (kept as a stable, explicit name —
+  # some configs/scripts already reference gemini_api_flash_lite by name).
   gemini_api_flash_lite:
     type: gemini_api
     model: gemini-3.5-flash-lite

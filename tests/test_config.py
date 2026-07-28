@@ -84,7 +84,9 @@ def test_load_config_resolves_known_backend(tmp_path):
     cfg = load_config(str(f))
     resolved = cfg["model"]["retrieval"]["_resolved_backend"]
     assert resolved["type"] == "gemini_api"
-    assert resolved["model"] == "gemini-3.5-flash"
+    # gemini_api was promoted to gemini-3.5-flash-lite 2026-07-28 — see
+    # configs/retrieval_backends.yaml's own comment on this entry.
+    assert resolved["model"] == "gemini-3.5-flash-lite"
 
 
 def test_load_config_resolves_null_backend(tmp_path):

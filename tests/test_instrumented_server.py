@@ -689,7 +689,9 @@ def test_build_retrieval_backend_for_demo_builds_from_real_config(tmp_path, monk
     backend, display = _build_retrieval_backend_for_demo()
 
     assert isinstance(backend, GeminiAPIBackend)
-    assert display == {"name": "gemini_api", "type": "gemini_api", "model": "gemini-3.5-flash"}
+    # gemini_api was promoted to gemini-3.5-flash-lite 2026-07-28 — see
+    # configs/retrieval_backends.yaml's own comment on this entry.
+    assert display == {"name": "gemini_api", "type": "gemini_api", "model": "gemini-3.5-flash-lite"}
 
 
 def test_build_retrieval_backend_for_demo_disabled_retrieval_returns_null_backend(tmp_path, monkeypatch):

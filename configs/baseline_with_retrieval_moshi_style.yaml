@@ -11,15 +11,20 @@ model:
     tail_silence_steps: 25
   retrieval:
     enabled: true
-    backend: gemini_api_moshi_style          # key into configs/retrieval_backends.yaml
+    backend: gemini_api_moshi_style          # key into configs/retrieval_backends.yaml — now
+                                              # gemini-3.5-flash-lite, see that file's comment
+                                              # on gemini_api_moshi_style (promoted 2026-07-28)
     # 1500 was tuned for gemini-2.0-flash (now deprecated/shut down). Its
     # replacement, gemini-3.5-flash, is a "thinking" model that defaults to
     # medium thinking effort and — unlike the 2.5 family's
     # reasoning_effort="none" — cannot fully disable it. Observed real-world
     # latency on a short retrieval prompt was ~6.8s at the default thinking
     # level, before core/retrieval_backend.py requested thinking_level="low".
-    # 8000 is a buffer above that unoptimized figure; tighten once real
-    # latency stats are available with the low-thinking request in place.
+    # 8000 is a buffer above that unoptimized figure. This history predates
+    # this backend's promotion to gemini-3.5-flash-lite above (see
+    # configs/baseline_with_retrieval.yaml's matching comment) — left
+    # as-is, not retuned, since a loose gate under-warns rather than hiding
+    # a real problem.
     latency_gate_ms: 8000
     fallback: null                # scaffold slot — a second backend name to
                                    # race/fall back to; unimplemented beyond

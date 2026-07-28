@@ -167,7 +167,9 @@ def test_build_model_stub_with_retrieval_enabled_uses_resolved_backend(tmp_path,
     model = build_model(cfg)
     assert isinstance(model, StubModelAdapter)
     assert isinstance(model.retrieval_backend, GeminiAPIBackend)
-    assert model.retrieval_backend.model == "gemini-3.5-flash"
+    # gemini_api was promoted to gemini-3.5-flash-lite 2026-07-28 — see
+    # configs/retrieval_backends.yaml's own comment on this entry.
+    assert model.retrieval_backend.model == "gemini-3.5-flash-lite"
     assert model.retrieval_backend.latency_gate_ms == 5000
 
 
