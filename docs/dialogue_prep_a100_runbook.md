@@ -1,7 +1,9 @@
 # A100 runbook — dialogue data prep → fork Path-B retrain
 
-Prereqs: the 5 stereo WAVs exist locally in `finetune/data/prepared_dialogue/`
-(produced by `scripts/pair_dialogue_stereo.py`). Do these ON THE A100 box.
+Prereqs: the 4 stereo WAVs exist locally in `finetune/data/prepared_dialogue/`
+(produced by `scripts/pair_dialogue_stereo.py`). The Leena conversation
+(`1341305451`) is excluded — its recording didn't channel-split cleanly — via
+`--exclude-conv 1341305451` on the local prep command. Do these ON THE A100 box.
 
 ## 1. Copy the WAVs to the box
 From the Mac:
@@ -18,7 +20,7 @@ uv run python scripts/build_manifest.py \
   --out-dir finetune/data/prepared_dialogue \
   --eval-file danielle_joshuarhodes_eval.wav
 ```
-Expect: `train.jsonl` = 4 files, `eval.jsonl` = 1 file, `all.jsonl` = 5 files.
+Expect: `train.jsonl` = 3 files, `eval.jsonl` = 1 file, `all.jsonl` = 4 files.
 
 ## 3. Transcribe channel 0 (Danielle) — generates the required X.json
 `annotate.py` reads channel 0, needs CUDA, and uses `-l` for local (no Slurm).

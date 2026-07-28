@@ -128,11 +128,19 @@ def main(argv: list[str] | None = None) -> None:
                     help="conv_id to carve an eval slice from")
     ap.add_argument("--eval-sec", type=float, default=600.0)
     ap.add_argument("--eval-center-frac", type=float, default=0.5)
+    ap.add_argument("--exclude-conv", default="",
+                    help="comma-separated conv_ids to skip entirely (e.g. bad recordings)")
     args = ap.parse_args(argv)
 
     src = Path(args.src)
     dst = Path(args.dst)
     dst.mkdir(parents=True, exist_ok=True)
+
+    exclude = {x for x in args.exclude_conv.split(",") if x}
+    if args.eval_conv in exclude:
+        raise SystemExit(
+            f"--eval-conv {args.eval_conv} is also in --exclude-conv; pick a different eval conv."
+        )
 
     convs = discover_conversations(src, args.main_name)
     if args.eval_conv not in convs:
@@ -142,6 +150,9 @@ def main(argv: list[str] | None = None) -> None:
 
     prefix = args.main_name.lower()
     for conv_id, (main_path, _ms, partner_path, partner_spk) in sorted(convs.items()):
+        if conv_id in exclude:
+            print(f"conv {conv_id}  SKIPPED (excluded)")
+            continue
         stereo, _sr, delta = combine_to_stereo(main_path, partner_path)
         print(f"conv {conv_id}  partner={partner_spk}  "
               f"len={stereo.shape[0] / TARGET_SR:.1f}s  align_delta={delta} frames")

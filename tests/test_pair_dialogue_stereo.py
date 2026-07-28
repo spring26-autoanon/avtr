@@ -143,6 +143,40 @@ def test_main_writes_expected_files_and_channels(tmp_path):
     assert ev.frames == 2 * 24000
 
 
+def test_main_excludes_conversation(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    _fake_source(src)
+    main([
+        "--src", str(src), "--dst", str(dst),
+        "--main-name", "danielle",
+        "--eval-conv", "0000000002", "--eval-sec", "2.0",
+        "--exclude-conv", "0000000001",
+    ])
+    names = sorted(p.name for p in dst.glob("*.wav"))
+    assert "danielle_clays.wav" not in names
+    assert names == [
+        "danielle_joshuarhodes_eval.wav",
+        "danielle_joshuarhodes_train_a.wav",
+        "danielle_joshuarhodes_train_b.wav",
+    ]
+
+
+def test_main_rejects_excluding_eval_conv(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    _fake_source(src)
+    with pytest.raises(SystemExit):
+        main([
+            "--src", str(src), "--dst", str(dst),
+            "--main-name", "danielle",
+            "--eval-conv", "0000000002", "--eval-sec", "2.0",
+            "--exclude-conv", "0000000002",
+        ])
+
+
 REAL_SRC = Path(__file__).resolve().parents[1] / "finetune/data/datastereo/clean_moshi_audio_24khz"
 REAL_DST = Path(__file__).resolve().parents[1] / "finetune/data/prepared_dialogue"
 
@@ -152,12 +186,13 @@ REAL_DST = Path(__file__).resolve().parents[1] / "finetune/data/prepared_dialogu
     reason="run pair_dialogue_stereo.py on the real recordings first",
 )
 def test_real_outputs_format_and_channels():
+    # danielle_leenatantawy is intentionally excluded (its recording didn't
+    # channel-split cleanly, --exclude-conv 1341305451).
     expected = {
         "danielle_clays.wav",
         "danielle_joshuarhodes_train_a.wav",
         "danielle_joshuarhodes_eval.wav",
         "danielle_joshuarhodes_train_b.wav",
-        "danielle_leenatantawy.wav",
     }
     assert {p.name for p in REAL_DST.glob("*.wav")} == expected
     for name in expected:

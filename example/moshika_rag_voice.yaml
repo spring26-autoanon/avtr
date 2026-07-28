@@ -6,7 +6,7 @@
 
 # ---- data ----
 data:
-  train_data: "finetune/data/prepared_dialogue/train.jsonl"  # 4 files (~136 min dialogue: clay + joshua_train_a/b + leena)
+  train_data: "finetune/data/prepared_dialogue/train.jsonl"  # 3 files (~135 min dialogue: clay + joshua_train_a/b; leena conv excluded, bad split)
   eval_data:  "finetune/data/prepared_dialogue/eval.jsonl"    # 1 held-out file (danielle_joshuarhodes_eval.wav, 10 min)
   shuffle: true
 
