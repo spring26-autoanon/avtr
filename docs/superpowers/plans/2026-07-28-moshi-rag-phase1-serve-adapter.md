@@ -2,6 +2,19 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to work this plan task-by-task. Steps use checkbox (`- [ ]`) syntax. This is a **box-side integration runbook** run on the A100 (`wb-gpu-training`), not the mac — the fork source isn't on the mac, so several steps are *inspect-then-act* with the exact edit determined on the box. Verification at each step is a **runtime checkpoint** (does it load / boot / sound right), not a unit test.
 
+> **OUTCOME (2026-07-28) — PHASE 1 DONE. Compat verdict = MATCH.** Fork env `~/fork-venv` (moshi 0.2.13 / torch
+> 2.9.1) loads moshika-rag + `checkpoint_000700` fused on CUDA (~10.7B params). Key diff: 674 voice keys matched
+> EXACTLY, 0 extra; the 372 MISSING slots were all `condition_provider.conditioners.*` (the fork LoRA-wraps the RAG
+> conditioners, which we don't tune) → **zero-padded** them (`scratch/serve_check.py` → `lora_padded.safetensors`),
+> which filled every slot and removed all meta tensors, so **no fork-source edit and no meta patch were needed.**
+> Serving recipe: `lora_padded.safetensors` + `get_moshi(fuse_lora=True,
+> lm_kwargs_overrides={"lora":True,"lora_rank":64,"lora_scaling":2.0})`.
+> **Tasks 5–6 (wire `--lora-weight` into `server.py` + live boot) were DEFERRED TO PHASE 2:** the fork's only
+> conversational server is the full RAG server — hard-coupled to the reference-encoder + retrieval-LLM + STT services
+> (constructs `LLMReferenceGenerator`, `load_retrieval_env`, `reference_encoder_url`, STT at startup) — so it can't boot
+> standalone, and an offline voice render would need the same conditioning machinery. Voice is already validated on the
+> plain server; the audible moshika-rag test happens in Phase 2 with the stack up.
+
 **Goal:** Prove `checkpoint_000700` (mainline-trained voice+turn-taking LoRA) overlays onto the fork-built moshika-rag, patch whatever blocks the load, wire `--lora-weight` into the real `server.py`, and confirm live conversation preserves her voice + turn-taking.
 
 **Architecture:** Path B overlay under the fork — load moshika-rag's full weights/config (conditioners live) and fuse the LoRA delta at load. Boot the real `server.py` in minimal config (neutral conditioning, no gemma/STT). Retrieval + persona are Phase 2.
