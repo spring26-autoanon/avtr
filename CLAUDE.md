@@ -59,16 +59,43 @@ Co-authored-by: Claude <claude@anthropic.com>
 
 Two GCP Vertex AI VMs, same project and zone. See specs/
 moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
-section for why both exist: `wb-gpu-a1ultra2g` is the dual-GPU target that
-resolves the confirmed conditioner-contention finding (MIG was ruled out);
+section for the full history of why both exist — it's had two, unrelated
+reasons at two different times, not one continuous story:
+
+- **Original reason (superseded)**: `wb-gpu-a1ultra2g` was provisioned to
+  resolve a suspected conditioner-vs-front-end GPU contention finding.
+  That was confirmed wrong (see this file's "SUPERSEDED: GPU contention
+  conclusion was wrong" section) — the real cause was event-loop
+  starvation, unrelated to GPU topology. `wb-gpu-a1ultra2g` was stopped
+  (not deleted) once this was confirmed, and single-GPU `wb-gpu-a1ultra`
+  was declared sufficient for all further work.
+- **Current reason (active as of this writing)**: a completely separate
+  investigation — STT's own in-process model duplicate sharing a CUDA
+  context/stream with the front-end's main model via `asyncio.to_thread`
+  — found a real, independent reason dual-GPU matters again: moshi-rag's
+  own CUDA-graph-capture machinery isn't safe to call from two OS threads
+  concurrently, in a way that repeated attempts at locking specific call
+  sites couldn't fully close. The fix (Option E — see
+  `core/model_interface.py`'s `_patch_stt_second_gpu()` docstring for the
+  full reasoning, and this file's "STT/front-end CUDA-graph cross-thread
+  crash" section below for the investigation) pins STT's own model
+  duplicate to a second physical GPU. **`wb-gpu-a1ultra2g` needs to be
+  running again for this fix to take effect** — implemented in code as of
+  this writing, not yet VM-validated (see that section for current
+  status). On single-GPU `wb-gpu-a1ultra`, this specific fix degrades to
+  a no-op (STT falls back to sharing the front-end's device, same as
+  before Option E) — `_patch_cuda_graph_thread_local()` is the narrower,
+  still-applicable single-GPU mitigation for part of the same hazard.
+
 `wb-gpu-a1ultra` remains valid for `tiny`/`smoke` dev-iteration and
-no-retrieval configs, not for scored retrieval-enabled `sample`/`full` runs
-or the demo. The codebase itself needs no per-instance configuration to
-target either one — `core/gpu.py` auto-detects real GPU count at runtime on
-whichever box it's rsynced to (see that section). The Makefile's `INSTANCE`/
-`SSH_ALIAS`/`REMOTE_DIR` variables (all `?=`, overridable) mean every `make`
-target already works against either box, e.g. `make sync
-SSH_ALIAS=wb-gpu-a1ultra2g`.
+no-retrieval configs; for scored retrieval-enabled `sample`/`full` runs or
+the demo, prefer `wb-gpu-a1ultra2g` now that Option E depends on the
+second GPU actually being present. The codebase itself needs no
+per-instance configuration to target either one — `core/gpu.py`
+auto-detects real GPU count at runtime on whichever box it's rsynced to
+(see that section). The Makefile's `INSTANCE`/`SSH_ALIAS`/`REMOTE_DIR`
+variables (all `?=`, overridable) mean every `make` target already works
+against either box, e.g. `make sync SSH_ALIAS=wb-gpu-a1ultra2g`.
 
 ### `wb-gpu-a1ultra` (single A100 80GB)
 
@@ -868,7 +895,10 @@ without a VM or GPU — pure Python + `httpx` against a local
 
 `core/gpu.py`'s auto-detected device pinning stays in the codebase — it's
 not wrong, just not the fix for this — and remains useful groundwork if a
-real reason to use multiple GPUs ever comes up again.
+real reason to use multiple GPUs ever comes up again. (Update: one did —
+see this file's "STT/front-end CUDA-graph cross-thread crash" section
+below, where this exact groundwork gets extended and put to use for an
+entirely unrelated reason.)
 
 **TODO, not yet fixed**: the demo's own `session.last_context_injection_s`
 (feeds the live session log's `retrieval_breakdown_s.context_injection_s`)
@@ -887,6 +917,401 @@ actually finishes, which doesn't fit the current single synchronous
 reporting point in `_background_task`. Left alone for now; the eval
 path's own `context_injection_s` (via `latency.retrieval_breakdown`) is
 unaffected by this and already reports the real value correctly.
+
+### STT/front-end CUDA-graph cross-thread crash: three real crashes, root-caused to moshi-rag's own CUDA-graphing machinery not being thread-safe, fixed via physical GPU separation (Option E)
+
+The STT-off-thread fix above (`_run_stt_frames_sync()` +
+`_patched_stt_send_audio()` + `_patch_local_stt_off_thread()`) was
+"not yet VM-verified" as of the last section. Running that verification
+(`EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh`) surfaced three
+distinct, real crashes in sequence — each only reachable once the prior
+one was fixed, since moshi's GPU-touching code turned out not to be safe
+to call from two threads concurrently in more than one way at once. Full
+technical detail for all of this lives in the code itself now (extensively
+commented, not just fixed) — `core/model_interface.py`'s
+`_run_stt_frames_sync()`, `_patch_compiled_functions_thread_safe()`,
+`_patch_stt_no_cuda_graph()`, `_patch_stt_second_gpu()`,
+`_patch_cuda_graph_thread_local()`, and `_warm_up_stt_exec_mask()`
+docstrings, and `_COMPILED_FUNCTIONS_LOCK`'s own module-level docstring —
+this section is the narrative summary, not a duplicate of that detail.
+
+**Crash 1 — dynamo lazy-compile race**: `torch_compile_lazy`
+(moshi/utils/compile.py) has a bare, unlocked `nonlocal` lazy-compile
+cache per decorated function (`apply_rope`, `_rms_norm`,
+`gating_forward_kernel`), shared at the module level regardless of
+deepcopy. `RuntimeError("Detected that you are using FX to symbolically
+trace a dynamo-optimized function...")`. Fixed by
+`_patch_compiled_functions_thread_safe()` — a narrow lock around exactly
+these three leaf functions.
+
+**Crash 2 — CUDA graph capture race**: Mimi's encode/decode and the LM's
+own forward pass are wrapped in moshi's own `CUDAGraphed`, which needs
+true stream-level exclusivity for its entire capture window.
+`AcceleratorError("CUDA error: operation not permitted when stream is
+capturing")`. A first attempt (one coarse lock around the whole of
+`BatchRunner.run_step()` vs. the whole of one STT frame's compute) *did*
+eliminate the crash — but a live demo test caught what eval-path testing
+couldn't: the front-end's own generation went near-silent for seconds at
+a time during real retrieval waits, because the demo's continuous live
+audio keeps the STT thread almost always active, unlike eval's
+self-paced feeding. Rejected. Fixed instead by `_patch_stt_no_cuda_graph()`
+— disabling CUDA graphing for STT's own model instances entirely
+(`LMGen(profile=True)`, `mimi.set_profile(True)`), so there's no capture
+to race in the first place, rather than locking around it.
+
+**Crash 3 — `set_exec_mask`'s own capture, and the real, deeper root
+cause**: `set_exec_mask`'s own `CUDAGraphed` isn't gated by `self.profile`
+at all — the one CUDAGraphed construction site in the whole codebase that
+isn't, confirmed via an exhaustive grep. Same `AcceleratorError`, on a
+turn that had run clean for 5-6 turns prior. Three fixes attempted here,
+each teaching something real:
+1. Adding `set_exec_mask` to the existing narrow lock **deadlocked**
+   immediately — `LMGen.set_exec_mask`'s own callback recurses into a
+   *nested* `StreamingModule.set_exec_mask` on the *same* thread, and a
+   plain `threading.Lock` isn't reentrant. Found via `py-spy dump` on the
+   real hung process (installed with permission —
+   `uv tool install py-spy`), which showed the exact nested frame twice.
+2. Switching to an `RLock` fixed the deadlock but **not the crash** — the
+   same error recurred a couple turns later. Root cause, confirmed by
+   reading real moshi-rag source: the *main* step-loop thread's own
+   encode/decode/step calls are plain graph *replays* by that point
+   (captured once during `_state.warmup()`), not calls to any of the
+   four locked functions — nothing serialized them against the STT
+   thread's own `set_exec_mask` *capture*.
+3. Pre-warming (calling `set_exec_mask` once per turn before the
+   concurrent window opens, to turn the capture into a safe replay)
+   revealed the real, deeper problem on closer reading of
+   `moshi/utils/compile.py`: `CUDAGraphed.__call__` wraps *every*
+   call — warmup, capture, and ordinary replay alike — in
+   `with _set_in_cuda_graph(): assert not _in_cuda_graph; ...`, and
+   `_in_cuda_graph` is a bare, **process-wide module global, not a
+   `threading.local()`**. Two threads racing a check-then-set on that
+   shared flag is a real hazard for *any* `CUDAGraphed` call from either
+   thread — not just the handful of call sites this project could
+   enumerate and lock one at a time. moshi-rag's own CUDA-graphing
+   utility was simply never designed to be called from more than one OS
+   thread at once, for anything. (The pre-warming call itself also had a
+   real, separate off-by-one bug, since fixed: `CUDAGraphed`'s default
+   `warmup_steps=1` means the *first* call only primes that buffer,
+   uncaptured — the real capture happens on the *second* call. Calling
+   once left the real capture to happen during the live per-frame call
+   anyway.)
+
+**Fix — Option E, implemented, not yet VM-validated**: no amount of
+locking specific call sites can close a hazard that's baked into
+*every* `CUDAGraphed` call in the model, so the fix sidesteps sharing
+instead of trying to guard it:
+- `_patch_stt_second_gpu()` moves STT's own model duplicate onto a
+  genuinely separate physical GPU when one is visible to this process
+  (`cuda:1`), so its CUDA stream never overlaps with the front-end's at
+  all, regardless of timing. Requires `core/gpu.py`'s
+  `ensure_cuda_visible_devices("frontend")` to expose *both* GPUs to the
+  front-end process now (`"0,1"`, not just `"0"`) — see that module's
+  own `resolve_devices()` docstring. Degrades to a no-op wherever a
+  second GPU isn't visible (single-GPU `wb-gpu-a1ultra`, or a manually
+  restricted `CUDA_VISIBLE_DEVICES`).
+- `_patch_cuda_graph_thread_local()` closes the remaining, far more
+  benign residual risk — the shared `_in_cuda_graph` Python global itself
+  — by making it `threading.local()`.
+- `_warm_up_stt_exec_mask()` is kept on top of both (fixed to call twice,
+  per the off-by-one above), now for latency cleanliness rather than
+  correctness: with device separation and the thread-local flag both in
+  place, a capture during the live window is safe either way, but doing
+  it upfront avoids inflating the first timed frame of every turn with a
+  real capture's cost instead of a fast replay's.
+
+**Status as of this writing**: implemented in code, covered by local
+tests (no GPU needed — every patch mechanism, including a real two-thread
+test proving the thread-local flag actually isolates two threads without
+losing genuine same-thread reentrancy protection), full suite green.
+**Not yet run on the VM.** Needs `wb-gpu-a1ultra2g` (see "Remote
+instances" above — stopped, not deleted, now needed again for this
+unrelated reason) restarted, then: `make sync`, then
+`EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh` for 15+ turns
+(the last crash hit on turn 7, so a materially longer run than that is
+the actual bar for confidence this time), checking `nvidia-smi` shows
+STT's own memory footprint landing on GPU 1 (not GPU 0) alongside
+confirming no more `AcceleratorError`s. Once that's clean: the live-demo
+generation-fluency check and the `gemini_api_flash_lite` backend test
+that were paused for this whole investigation are still outstanding.
+
+**Update (2026-07-27), eval-path VM validation — DONE, confirmed
+correct**: `wb-gpu-a1ultra2g` restarted (needed a manual `make install`-
+equivalent first — the fresh boot disk had no `moshi`/`transformers`
+installed at all, unrelated to this fix, see the VM-environment note
+this update's session left in `project_stt_cuda_graph_thread_safety`
+memory), then `EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh`
+run for 23 real `respond()` calls (`evals/results/run-2026-07-27T23-30-13Z.json`)
+— zero `AcceleratorError`s, zero crashes of any kind.
+`gpu_diag/contended_poll.csv` confirms device separation: GPU 0
+(front-end) peaked at ~17.9GB, GPU 1 (STT) ranged 23.7GB→47.1GB — STT's
+memory genuinely landed on the second physical GPU, not shared with the
+front-end. This is well past the "15+ turns, longer than the turn-7
+crash" bar set above. **The crash is fixed; treat Option E as validated
+on the eval path.**
+
+**Live-demo generation-fluency check — done, but the result reframes the
+question**: a real live demo session was run post-fix
+(`demo/sessions/2026-07-27T23-44-30Z/`) and subjectively did not feel
+fluent. Directly measuring it (inter-token gaps from `[Buffered
+Model]`/`[Display Model]` timestamps, retrieval `backend_latency=`,
+VAD-state timestamps) found **no evidence pointing back at Option E**:
+within-generation word cadence (0.309s mean) was close to the pre-fix
+baseline (0.243s) and nowhere near the actual known-bad coarse-lock
+session's pathology (that session's problem was isolated multi-second
+dead-air stalls, not per-word cadence — its own within-generation
+cadence measured fine, 0.229s). Retrieval latency (1.83s/3.56s
+`backend_latency=`) and conditioning (`ARC encoding received in`
+0.454s/0.123s) both measured as expected, not regressed.
+
+What the log data did surface, unprompted: a dead-air gap between the
+model finishing a turn (`[Display Model]`'s last token) and VAD detecting
+the next user utterance, growing turn-over-turn within the same session
+— **9.6s, then 23.8s** — far longer than the actual greeting/answer
+content takes to say. Neither gap is step-loop starvation (callbacks
+were a steady 55-59ms throughout, no warnings) or STT lag (transcription
+tracks live speech within ~100-250ms once audio starts arriving). Given
+the growing-over-session shape, the leading hypothesis is the
+already-known, separately-tracked client jitter-buffer overrun (see
+"Demo audio quality" investigation / `project_demo_audio_quality_investigation`
+memory) — the client may still be draining a backlog of the model's own
+audio well after the server considers the turn finished, so what looks
+like server-side dead air is partly (or entirely) the user still hearing
+the previous turn. **Not yet confirmed** — requires client-side
+playback-timing evidence, which didn't exist before this session. See
+"Client-side audio jitter-buffer diagnostic" below for the logging just
+added to get it. Until that's collected, don't read the eval-path fix
+above as in question — it's on separate, direct, server-side-only
+evidence (a stopwatch around the actual coroutine, plus a crash that
+reproduces identically on the client-free eval path) that this perceived
+demo-fluency gap doesn't touch.
+
+### Client-side audio jitter-buffer diagnostic (added 2026-07-27, not yet used on a real session)
+
+To test the jitter-buffer hypothesis above, `demo/client/` now records a
+timestamped log of the browser's own audio-playback queue depth
+(`audio-processor.ts`'s existing `delay` figure — mic-duration minus
+played-stream-time — already computed for the live "Latency" stat, just
+not persisted over time before this), plus structured buffer-drop/
+underrun/resume events, in `useServerAudio.ts`'s new `getAudioDiagLog()`.
+Timestamps are `t_rel_s` relative to the client's own WebSocket-open
+moment (not epoch time — client and server may be different machines
+with unsynced clocks, but socket-open and server-side `Channel`
+construction happen within one handshake of each other, close enough to
+line up against `server.log`/`raw_events.jsonl`'s own `t_rel_s`).
+
+**To use**: open the demo's audio-stats panel (the same one showing
+"Latency"/"Min/Max buffer" today) and click the new "Download audio
+diagnostics" button — appears whenever `getAudioDiagLog` is wired in —
+at the end of a session. It downloads `client_audio_diag_<timestamp>.json`,
+an array of `{t_rel_s, delay, actualAudioPlayed, totalAudioPlayed,
+events?}` samples (one per audio frame, ~80ms cadence during active
+playback). Save it as `demo/sessions/<session_id>/client_audio.json`
+(matching the session directory the server side already writes) before
+the next analysis pass — it isn't part of `make sync`'s rsync since it
+never leaves the client machine's browser.
+
+**Not yet build/lint-verified** — implemented and manually reviewed line
+by line, but no Node.js toolchain was available to run `npm run build`/
+`tsc` this session. Run that first, before spending a live session on
+it, in case of a typo this review missed.
+
+**Next session's analysis, once a real session's `client_audio.json`
+exists**: plot/diff its `delay` values against the server's own
+`t_rel_s` VAD/RAG timestamps for the same session. If `delay` is
+elevated and climbing through the 9.6s/23.8s dead-air windows identified
+above (rather than sitting near the worklet's own ~10-80ms target
+buffer range), that confirms client playback backlog as the real
+mechanism behind the perceived demo unfluency — independent of, and not
+a regression from, Option E.
+
+### Real-time step pacing (added 2026-07-27) and the STT-off-thread A/B toggle
+
+Two follow-ups from re-examining the whole STT-off-thread/Option E arc
+against the actual upstream source (a clone in scratch, not just prior
+notes), prompted by stepping back to ask whether that entire investment
+was earning its keep.
+
+**Root cause of the jitter-buffer overrun, now confirmed directly against
+real moshi-rag source (not just the client-side symptom)**:
+`batch_runner.py`'s `BatchRunner.run_step()` measures `elapsed_ms` and
+only *warns* past ~77ms — there is no complementary sleep anywhere when a
+step finishes faster than the real-time budget one step represents
+(~80ms at Mimi's 12.5Hz). `_deliver_step_row()` does an uncapped
+`output_queue.put_nowait()`; nothing downstream throttles it either. On
+hardware fast enough to reliably beat 80ms/step (this project's A100s
+routinely log ~50-95ms steps), the server ships audio strictly faster
+than real-time, continuously, with no mechanism anywhere to slow back
+down — precisely the "genuine average-rate mismatch, not ordinary
+jitter" signature the audio-quality investigation already found from the
+client side. **Fix**: `scripts/instrumented_server.py`'s new
+`_patch_server_state_step_pacing()` wraps (does not reimplement)
+`ServerState.run_one_step()` — after a step actually runs, if it
+completed faster than `1 / mimi.frame_rate`, sleeps the remainder before
+the next step. Demo-only: `run_one_step` has exactly one caller in all
+of moshi-rag (`ServerState._step_loop()`, confirmed via grep across the
+real source), so this cannot affect `respond()`/evals, which never call
+it and want maximum throughput, not real-time pacing, anyway. Gated by
+`DEMO_STEP_PACING=0` to disable, for A/B against the pre-pacing
+baseline. **Implemented, not yet VM-verified.**
+
+**Independent re-verification (not just re-citing the earlier claim) that
+eval never needed STT-off-thread**: read `inference_job.py`'s
+`_feed_loop()` and `channel.py`'s `_recv_loop()` directly, side by side.
+`_feed_loop()` gates every chunk on `await
+self._wait_step_index_at_least(feed_step - max_stream_delay)` —
+structurally caps how far its self-paced feeding can get ahead of the
+model's own step progress (bounded by the model's small internal codec
+delay), so `LocalSpeechToText.send_audio()`'s synchronous per-frame
+compute cannot form a backlog there, no matter how long it blocks.
+`_recv_loop()` has no equivalent gate anywhere — it's driven by `async
+for message in self.ws`, i.e. the live client's own network-paced audio,
+completely independent of the model's progress; confirmed independently
+in `local_stt.py` that `send_audio()`, despite being `async def`, runs
+`mimi.encode()`/`_run_codes()` synchronously with no internal `await`, so
+a live backlog can and does queue at the transport layer while one call
+blocks. This means the entire 3-crash chain (dynamo race → CUDA-graph
+race → `set_exec_mask` race) and Option E's 2-GPU requirement exist
+solely to serve a mechanism that's real for the demo but was never
+present for eval — eval only inherited the risk because STT-off-thread
+was applied there "for consistency," not because it needed it.
+
+**Fix**: `core/model_interface.py`'s new `_stt_off_thread_enabled()`
+gates the entire Option E chain (`_patch_local_stt_off_thread()`,
+`_patch_compiled_functions_thread_safe()`,
+`_patch_cuda_graph_thread_local()`, `_patch_stt_no_cuda_graph()`,
+`_patch_stt_second_gpu()`) behind `STT_OFF_THREAD=0` to disable (default
+enabled, preserving current behavior) — applied identically in both
+`_load_models()` (eval) and `scripts/instrumented_server.py`'s
+`apply_patches()` (demo), one shared helper so they can't drift. With it
+disabled, STT reverts to fully synchronous, single-thread, no CUDA-graph
+hazard at all — single GPU sufficient for both paths. **Implemented, not
+yet VM-verified.**
+
+**Update (2026-07-28) — the 2×2 test above was overtaken by events; see the
+new section immediately below.** `STT_OFF_THREAD=0` was run for real on
+single-GPU `wb-gpu-a1ultra` (with `DEMO_STEP_PACING=1`) — zero crashes, a
+full multi-turn session, no CUDA-graph surface at all in this mode. That
+answers this section's own open question: **single GPU is safe once
+STT-off-thread is disabled.** But the live-fluency question this test was
+really chasing turned out to have a different, much bigger answer than
+GPU count or STT threading — see "Real root cause of demo response lag"
+below. `wb-gpu-a1ultra2g`/Option E have not been proven necessary by
+anything found this session; they remain implemented and available, but
+the case for keeping them running by default is weak pending the new
+investigation.
+
+### Real root cause of demo response lag: model-generation `<pad>` sampling drift, not retrieval/GPU/pacing (2026-07-28)
+
+**This section supersedes the framing of every section above it in this
+file that attributed demo dead-air to retrieval latency, GPU/CUDA-graph
+work, or client-side jitter buffering.** All of that investigation was
+real and its fixes are real (retrieval genuinely was slow before
+flash-lite; the CUDA-graph crash genuinely needed Option E if STT stays
+off-thread; the jitter-buffer/pacing work genuinely closed a real gap in
+upstream moshi-rag) — but none of it was the dominant contributor to what
+the user actually perceives as demo lag. Found via the two ground-truth
+tools built this session (real acoustic analysis of the saved conversation
+recording — `scripts/analyze_recorded_audio.py` — and direct source
+reading of the generation code), not inferred from proxies.
+
+**The user's own report, checked directly against a real recording and
+confirmed exactly**: at 18s into a saved session recording, the user's
+first question ends; the model doesn't start responding until 23s — a
+genuine ~5s gap. Cross-referencing against `server.log` for that same
+session (`demo/sessions/2026-07-28T07-23-04Z/`, `STT_OFF_THREAD=0`,
+`DEMO_STEP_PACING=1`, flash-lite retrieval already active) found:
+
+- Retrieval and ARC-encoding are both genuinely fast now (0.36-0.66s each,
+  confirmed via `backend_latency=`/`ARC encoding received in` log lines) —
+  ruled out as the cause of a 5s gap.
+- The real mechanism: `moshi/inference_utils/turn_manager.py`'s
+  `TurnManager._update_active_speaker()` only initiates the switch-to-model
+  countdown once `self.model_text_buffer` is non-empty (line ~90); while
+  it's empty, it just logs `"[VAD] User stopped speaking but LM buffer
+  empty, remaining in user turn"` and loops, once per real step (~80ms).
+  Counting consecutive occurrences of that exact line immediately before
+  each of this session's 5 `switch to model` events: **21, 63, 58, 69, 80**
+  — present on turn 1 (no retrieval at all) and growing across the whole
+  session, not specific to `<ret>` turns. Retrieval turns only *look*
+  worse because they tend to occur later in a conversation, where this
+  effect has already compounded — confirmed by checking the exact same
+  stall-count-before-switch-to-model metric on non-retrieval turns too,
+  in the same session, in `git log`-independent real data, not assumed.
+- Ruled out via direct source reading, not guessed: `RingKVCache`
+  (`modules/transformer.py`) is a genuinely fixed-capacity ring buffer
+  (`context: 3000` in the real checkpoint's `config.json` — confirmed by
+  the user directly from the VM — i.e. ~240s at 12.5Hz), so attention
+  cost/memory is constant regardless of session length; our own
+  `_fetch_and_apply_reference_conditioning()` (`core/model_interface.py:220`)
+  replaces `pending_streaming_sums` fresh every turn via direct overwrite,
+  no accumulation. Neither explains a growing stall.
+- What's actually happening: `LMGen._step()`'s text token
+  (`lm.py:834`, `sample_token(text_logits, use_sampling=True, temp=0.7,
+  top_k=25)`) is a **genuine stochastic sample** from the model's own
+  logits every single step — no hardcoded silence threshold anywhere in
+  this path. Confirmed `use_sampling=True`/`temp_text=0.7`/`top_k_text=25`
+  are truly in effect (not a checkpoint override) by having the user `cat`
+  the real checkpoint's `config.json` directly from the VM: **no
+  `lm_gen_config` key at all**, so `LMGen.__init__`'s hardcoded Python
+  defaults apply unmodified. The noisy-but-growing stall-count pattern is
+  exactly what a repeated-Bernoulli-trial process looks like when its
+  underlying "chance of not drawing `<pad>` this step" is slowly
+  decreasing — consistent with, though not yet proven to be caused by,
+  something about accumulating conversation context/conditioning shifting
+  the model's own logits toward `<pad>` the longer a session runs.
+
+**Not yet done, in either direction — the two open levers for next
+session**:
+1. **Try raising `temp_text`/`top_k_text`** on the main model's `LMGen`
+   construction (`inference_utils/utils.py:153-159`, currently unwired to
+   any of our config — would need a narrow patch, analogous in shape to
+   existing patches in this file, not an upstream reimplementation) and
+   test empirically whether the stall shrinks. Cheap, reversible, directly
+   tests whether this is a sampling-conservativeness problem rather than
+   something deeper.
+2. **Controlled experiment**: does the stall track conversation
+   depth/content, or raw step count since session start (`state.offsets`
+   in `lm.py`, never reset except on a true `is_first` slot reset)? Ask a
+   `<ret>`-triggering question as literally the *first* turn of a fresh
+   session and see if the stall is already small — isolates which
+   mechanism is really drifting.
+
+**Tooling built this session to make this investigable at all** (previous
+sessions' server-log-only/client-buffer-only diagnostics couldn't have
+found this):
+- `scripts/analyze_recorded_audio.py` — decodes the client's saved
+  conversation recording (`useRecording.ts`'s "Save audio", confirmed to
+  capture the same post-worklet audio that drives the speakers, mixed with
+  the user's mic) via `ffmpeg`, computes a self-calibrating RMS energy
+  envelope, and merges real acoustic onset/offset/glitch events with
+  `server.log`'s own timestamps into one chronological timeline. Alignment
+  is anchored to `server.log`'s literal `"new WebSocket client connected"`
+  line plus the recording filename's embedded `_startT<X>s` tag (both
+  `useServerAudio.ts` and `useRecording.ts` read the same
+  `performance.now()` clock) — **not** `raw_events.jsonl`'s own `t_rel_s`,
+  which is anchored to `SessionLog.__init__`'s `time.perf_counter()` at
+  server-process startup (before model loading even begins), a materially
+  different zero point than the client's WebSocket-open anchor. An earlier
+  version of this file's own text incorrectly claimed these two `t_rel_s`
+  values lined up — corrected after checking `SessionLog.__init__` directly.
+  End-to-end verified against a real synthesized `.webm` (not just unit
+  tests against synthetic WAV data) before trusting it on real session data.
+- `demo/client/src/audio-processor.ts`/`useServerAudio.ts`'s
+  `getAudioDiagLog()`/`liveBufferS` — the corrected jitter-buffer
+  diagnostic (see "Real-time step pacing" section above for the first,
+  wrong version of this field). On the real `STT_OFF_THREAD=0` +
+  `DEMO_STEP_PACING=1` session, `liveBufferS` sat at 0ms for 99.3% of
+  samples, max 37ms, zero real buffer-drop events — the jitter buffer
+  itself is genuinely healthy now. This is *not* what's causing the
+  perceived lag; the pad-sampling drift above is a separate, downstream-
+  of-VAD, upstream-of-audio issue.
+- `ffmpeg` had to be installed into a user-writable, isolated `apk --root`
+  prefix (`~/.local/ffmpeg-root`, wired via `~/.bashrc`) in the environment
+  this analysis runs in — no system package-manager privileges available
+  there; a static-binary/apk-root workaround, not an `apt`/`apk` install
+  in the usual sense. Not relevant to the VM/demo environment itself, only
+  to wherever `analyze_recorded_audio.py` actually gets run.
 
 ### `respond()`-only: `_doing_retrieval` step-loop stall, mitigated (root cause: self-inflicted, not upstream)
 

@@ -1977,6 +1977,46 @@ diagnosing genuine GPU-sharing scenarios in the future) without treating an
 absence of contention as proof a run's conditioning latency is fine — that
 now depends on whether the step-loop fix has landed, not on GPU topology.
 
+### Update (2026-07-27): a second, unrelated reason dual-GPU matters again
+
+The "GPU count is not the relevant variable" conclusion above is still
+correct — for the conditioning-latency problem it was about. A
+completely separate investigation found a real, independent reason GPU
+count matters again: STT's own in-process model duplicate
+(`core/model_interface.py`'s `LocalSpeechToText`, run off the main event
+loop via `asyncio.to_thread` to fix an unrelated event-loop-starvation
+problem) shares a CUDA context/stream with the front-end's main model by
+default, and moshi-rag's own CUDA-graph-capture machinery
+(`moshi/utils/compile.py`) isn't safe to call from two OS threads
+concurrently — see CLAUDE.md's "STT/front-end CUDA-graph cross-thread
+crash" section for the full investigation (three real VM crashes, three
+rejected locking attempts, and why locking specific call sites can never
+fully close a hazard baked into every `CUDAGraphed` call in the model).
+
+**Current requirement**: `core/gpu.py`'s `resolve_devices()` now exposes
+both physical GPUs to the front-end *process* when two exist
+(`frontend_cuda_visible_devices = "0,1"`, not just `"0"`), so that
+process can pin STT's own model duplicate to `cuda:1` internally
+(`core/model_interface.py`'s `_patch_stt_second_gpu()`) while the main
+model stays on `cuda:0` — unaffected, still always addressed as index 0
+of whatever's visible. This is unrelated to, and does not reopen,
+the conditioner-contention question above: the conditioner is a separate
+process either way and was never exposed to this specific hazard (process
+boundaries isolate both Python interpreter state and default CUDA context
+completely, which is exactly why this hazard is thread-specific, not
+process-specific).
+
+**Practical implication**: `wb-gpu-a1ultra2g` needs to be running again
+for this fix to take effect — the same 2x A100 80GB VM the conditioner
+work above stopped, not deleted. On single-GPU `wb-gpu-a1ultra`, this
+specific fix degrades to a no-op (STT falls back to sharing the
+front-end's own device, the pre-fix behavior) — a separate, narrower
+mitigation (`_patch_cuda_graph_thread_local()`, making a different shared
+Python global thread-local) still applies on either instance. Status as
+of this writing: implemented in code, not yet VM-validated — see
+CLAUDE.md for current validation status before relying on this for a
+scored run.
+
 ---
 
 ## Makefile
