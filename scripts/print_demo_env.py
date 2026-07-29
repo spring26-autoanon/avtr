@@ -24,7 +24,13 @@ Prints:
     field-name transform (underscores -> hyphens), since those field names
     were chosen to match moshi.server's argparse flags exactly (see
     core/model_interface.py's "Generation parameters" table). Excludes
-    tail_silence_steps, which has no demo equivalent (respond()-only).
+    tail_silence_steps (no demo equivalent, respond()-only) and
+    temp_text/top_k_text (moshi.server has no --temp-text/--top-k-text CLI
+    flag to receive them at all — unlike every other field here, these two
+    still apply to the demo, just via core/model_interface.py's
+    _patch_load_models_generation_overrides() reading DEMO_CONFIG directly,
+    not via a CLI flag; scripts/instrumented_server.py's apply_patches()
+    wires that up).
 """
 import argparse
 import os
@@ -37,9 +43,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from core.config import load_config
 from core.model_interface import _DEFAULT_GENERATION, _DEFAULT_LLM_BASE_URL, _DEFAULT_LLM_MODEL_NAME
 
-# No demo (moshi.server) CLI equivalent — respond()-only, see
+# tail_silence_steps: no demo (moshi.server) CLI equivalent — respond()-only.
+# temp_text/top_k_text: moshi.server has no matching CLI flag at all (unlike
+# every other model.generation field) — still demo-relevant, just applied
+# via a monkeypatch reading DEMO_CONFIG directly instead of a CLI flag. See
 # _DEFAULT_GENERATION's own comment in core/model_interface.py.
-_DEMO_EXCLUDED_GENERATION_FIELDS = {"tail_silence_steps"}
+_DEMO_EXCLUDED_GENERATION_FIELDS = {"tail_silence_steps", "temp_text", "top_k_text"}
 
 
 def _retrieval_env(config: dict) -> dict[str, str]:

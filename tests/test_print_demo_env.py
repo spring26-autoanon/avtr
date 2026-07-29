@@ -69,6 +69,18 @@ def test_generation_flags_excludes_tail_silence_steps():
     assert "tail_silence_steps" not in flags
 
 
+def test_generation_flags_excludes_temp_text_and_top_k_text():
+    """moshi.server has no --temp-text/--top-k-text CLI flag at all — these
+    still apply to the demo, just via core/model_interface.py's
+    _patch_load_models_generation_overrides() reading DEMO_CONFIG directly,
+    not via a CLI flag (see _DEMO_EXCLUDED_GENERATION_FIELDS's comment)."""
+    flags = _generation_flags({"model": {}})
+    assert "temp-text" not in flags
+    assert "temp_text" not in flags
+    assert "top-k-text" not in flags
+    assert "top_k_text" not in flags
+
+
 def test_generation_flags_overrides_merge_over_defaults():
     flags = _generation_flags({"model": {"generation": {"rag_timeout": 12.0}}})
     assert "--rag-timeout 12.0" in flags

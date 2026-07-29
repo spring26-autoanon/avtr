@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -43,6 +44,26 @@ _TAIL_SILENCE_STEPS = 25
 # batch_size/init_active_speaker are deliberately NOT here — see specs/
 # moshirag-evals-requirements.md's "Generation parameters" section for why
 # those two stay hardcoded/path-specific rather than shared config.
+#
+# temp_text/top_k_text are the one exception to the "matches a moshi.server
+# CLI flag" rule above: moshi.server has no --temp-text/--top-k-text flag at
+# all (confirmed via its real argparse block), so scripts/print_demo_env.py
+# excludes both from its CLI-flags translation (_DEMO_EXCLUDED_GENERATION_FIELDS,
+# same mechanism tail_silence_steps already uses, for a different reason —
+# see that field's own comment below) and instead reads them directly out of
+# DEMO_CONFIG for _patch_load_models_generation_overrides() to apply via
+# monkeypatch. Defaults below (0.7/25) match LMGen's own hardcoded values
+# exactly, so adding these two fields changes nothing until a config
+# explicitly overrides them — see CLAUDE.md's pad-token-sampling-drift
+# investigation ("Real root cause of demo response lag") for why these two
+# are the ones worth exposing: sample_token() (moshi/utils/sampling.py) is
+# plain temp/top-k/top-p multinomial sampling on text_logits with no
+# repetition penalty or anti-pad bias of any kind, and temp_text/top_k_text
+# are the only knobs that reach it — cfg_coef also reaches text_logits (see
+# that field's own history above) but is structurally incompatible with the
+# per-slot RAG conditioning this project depends on
+# (lm.py: "assert self.cfg_coef == 1.0, Per-slot streaming_sum update
+# requires cfg_coef == 1."), so it isn't a real second lever here.
 _DEFAULT_GENERATION = {
     "cfg_coef": 1.0,
     "stt_wait_time": 0.5,
@@ -57,6 +78,8 @@ _DEFAULT_GENERATION = {
     "vad_threshold": 0.5,
     "power_threshold": -65,
     "tail_silence_steps": _TAIL_SILENCE_STEPS,
+    "temp_text": 0.7,
+    "top_k_text": 25,
 }
 
 # moshi-rag's ServerState unconditionally constructs its own built-in
@@ -537,15 +560,29 @@ def _stt_off_thread_enabled() -> bool:
     send_audio() call can let a real backlog queue up at the transport
     layer while it's busy.
 
-    Set STT_OFF_THREAD=0 to disable the entire chain (reverts to fully
-    synchronous, single-thread STT — single GPU sufficient either way) and
-    compare demo fluency against the current state. If disabling it
-    doesn't make a perceptible difference, the whole crash-chasing
-    investment and the second-A100 requirement are candidates to retire —
-    see CLAUDE.md's "STT/front-end CUDA-graph cross-thread crash" section
-    for the fuller reasoning behind this experiment.
+    Defaults to DISABLED (STT_OFF_THREAD unset -> synchronous, on-event-loop
+    STT, matching demo/sessions/2026-07-28T07-23-04Z's known-good session)
+    as of 2026-07-29 — flipped from the original default (enabled) after a
+    real demo A/B mistake: two later sessions run without explicitly
+    exporting STT_OFF_THREAD=0 silently defaulted to the off-thread chain,
+    and both showed a real dropped-user-utterance bug (confirmed via the
+    recorded client audio containing genuine speech with zero corresponding
+    server-side VAD/STT activity — see project_pad_token_sampling_investigation
+    memory) that the one session with it explicitly disabled never
+    exhibited. Not proven as the definitive root cause yet (the mechanism
+    linking off-thread STT to a dropped utterance specifically, rather than
+    just the already-known CUDA-graph-crash risk, is still a hypothesis),
+    but strong enough correlation — and disabling it is already independently
+    validated as safe on single-GPU hardware (zero crashes across a full
+    multi-turn session) — that defaulting to the safer, proven mode is the
+    right call while that hypothesis gets tested properly. Set
+    STT_OFF_THREAD=1 to explicitly opt back into the off-thread + Option E
+    chain — e.g. to A/B against this default, or to get back the backlog/
+    event-loop-starvation mitigation it was originally built for on 2-GPU
+    hardware, where the physical device separation makes the CUDA-graph
+    cross-thread crash a non-issue.
     """
-    return os.environ.get("STT_OFF_THREAD", "1") != "0"
+    return os.environ.get("STT_OFF_THREAD", "0") == "1"
 
 
 def _patch_local_stt_off_thread() -> None:
@@ -620,6 +657,86 @@ def _patch_compiled_functions_thread_safe() -> None:
     transformer_mod._rms_norm = _lock_wrapped(transformer_mod._rms_norm)
     gating_mod.gating_forward_kernel = _lock_wrapped(gating_mod.gating_forward_kernel)
     rope_mod._compile_lock_patched = True
+
+
+def _patch_load_models_generation_overrides(temp_text: float, top_k_text: int) -> None:
+    """
+    Makes the front-end's own LMGen construction (inside moshi-rag's
+    load_models(), moshi/inference_utils/utils.py) sample text tokens with
+    temp_text/top_k_text from our own config instead of LMGen's hardcoded
+    defaults (0.7/25) — see _DEFAULT_GENERATION's entries for these two
+    fields, and CLAUDE.md's "Real root cause of demo response lag" section
+    for why they're the one real lever onto the pad-token-sampling drift
+    (sample_token() applies temp/top-k directly to text_logits, with no
+    repetition penalty or anti-pad bias anywhere else in the pipeline).
+
+    Patches the module-local name moshi.inference_utils.utils.LMGen — same
+    technique as _patch_stt_no_cuda_graph()'s local_stt_mod.LMGen swap
+    (subclass swapped in at the module-attribute level), not
+    moshi.models.lm.LMGen globally. load_models()'s own `LMGen(...)` call
+    resolves that bare name dynamically out of utils.py's own module
+    globals every time it runs — not once, at definition time — so this
+    reaches the call correctly regardless of which name(s) other modules
+    used to reach the load_models *function* itself (moshi.server.py's own
+    `from .inference_utils import load_models` binds a completely separate
+    name for the function, in moshi.server's own namespace, at moshi.server's
+    own import time; patching a re-exported function name like that would
+    silently miss callers who already resolved it — see
+    feedback_vm_instrumentation_patching's "patch submodule originals not
+    re-exports" note). Patching the LMGen name actually referenced *inside*
+    load_models()'s body sidesteps that class of bug entirely.
+
+    Scoped to the front-end only: moshi.stt.local_stt.py imports its own,
+    separate LMGen name into its own module globals and resolves that one
+    inside LocalSpeechToText.__init__ — a different attribute, untouched by
+    this patch. Confirmed via real source (same read that grounded
+    _patch_stt_no_cuda_graph() above): the front-end and STT builds are two
+    independent code paths that happen to construct the same underlying
+    class, not one call site both funnel through.
+
+    Subclasses and uses kwargs.setdefault(...), not a forced override or a
+    wholesale __init__ replacement — a checkpoint whose own lm_gen_config
+    ever specifies temp_text/top_k_text (spread into this same call as
+    **kwargs ahead of our subclass's defaults) still wins. True for the
+    real checkpoint as of this writing (confirmed empty lm_gen_config).
+
+    Idempotent and process-global (like _patch_stt_no_cuda_graph()): safe to
+    call once per process regardless of which entry point (this module's own
+    _load_models(), or scripts/instrumented_server.py's apply_patches())
+    runs first.
+    """
+    import moshi.inference_utils.utils as moshi_utils_mod
+
+    if getattr(moshi_utils_mod.LMGen, "_generation_overrides_patched", False):
+        return
+
+    # print(), not logger.info() -- this runs from both entry points, and
+    # scripts/instrumented_server.py's apply_patches() calls this before
+    # moshi.server.main()'s own setup_logging(), so a logger.info() call
+    # here would be silently swallowed the same way
+    # _patch_server_state_step_pacing()'s docstring already documents for
+    # that patch. Placed after the idempotency check (not before) so it
+    # only ever states the value that will actually take effect -- this
+    # exact ambiguity bit a real A/B test once already (2026-07-29): no way
+    # to confirm after the fact whether a scratch config's temp_text
+    # override had actually taken effect.
+    print(
+        f"[Generation] temp_text={temp_text} top_k_text={top_k_text} "
+        "(front-end LMGen only -- see _patch_load_models_generation_overrides)",
+        file=sys.stderr,
+    )
+
+    original_lm_gen_cls = moshi_utils_mod.LMGen
+
+    class _GenerationOverrideLMGen(original_lm_gen_cls):
+        _generation_overrides_patched = True
+
+        def __init__(self, *args, **kwargs):
+            kwargs.setdefault("temp_text", temp_text)
+            kwargs.setdefault("top_k_text", top_k_text)
+            super().__init__(*args, **kwargs)
+
+    moshi_utils_mod.LMGen = _GenerationOverrideLMGen
 
 
 def _patch_stt_no_cuda_graph() -> None:
@@ -1717,6 +1834,18 @@ class MoshiRAGAdapter(ModelInterface):
             power_threshold=self._generation["power_threshold"],
         )
 
+        # Must run before load_models() -- see
+        # _patch_load_models_generation_overrides()'s own docstring for why
+        # this can't be threaded through `args` like every other field
+        # above (moshi.server has no --temp-text/--top-k-text CLI flag for
+        # print_demo_env.py's translation to mirror, so the demo path reads
+        # these two directly out of config instead — see
+        # scripts/instrumented_server.py's apply_patches()).
+        _patch_load_models_generation_overrides(
+            temp_text=self._generation["temp_text"],
+            top_k_text=self._generation["top_k_text"],
+        )
+
         logger.info("Loading MoshiRAG models from %s", self.checkpoint_path)
         self._mimi, self._text_tokenizer, self._lm_gen = load_models(args)
         self._device = args.device
@@ -1741,13 +1870,14 @@ class MoshiRAGAdapter(ModelInterface):
         # env var) — see that function's docstring for why this is now an
         # A/B toggle rather than unconditional.
         if _stt_off_thread_enabled():
+            logger.info("[STT] STT_OFF_THREAD=1 -- Option E chain applied (off-thread STT, 2nd-GPU pinning if visible)")
             _patch_local_stt_off_thread()
             _patch_compiled_functions_thread_safe()
             _patch_cuda_graph_thread_local()
             _patch_stt_no_cuda_graph()
             _patch_stt_second_gpu()
         else:
-            logger.info("[STT] STT_OFF_THREAD=0 -- synchronous on-event-loop STT (Option E chain skipped)")
+            logger.info("[STT] STT_OFF_THREAD=0 (default) -- synchronous on-event-loop STT (Option E chain skipped)")
         self._stt_template = LocalSpeechToText(deepcopy(self._mimi))
 
         # See the class docstring's "Conditioning" section — mandatory, not

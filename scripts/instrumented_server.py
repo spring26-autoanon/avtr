@@ -942,16 +942,20 @@ def apply_patches(
     checkpoint: str,
     retrieval_backend,
     retrieval_backend_display: dict,
+    temp_text: float,
+    top_k_text: int,
 ) -> None:
     from core.model_interface import (
         _patch_compiled_functions_thread_safe,
         _patch_cuda_graph_thread_local,
+        _patch_load_models_generation_overrides,
         _patch_local_stt_off_thread,
         _patch_stt_no_cuda_graph,
         _patch_stt_second_gpu,
         _stt_off_thread_enabled,
     )
 
+    _patch_load_models_generation_overrides(temp_text=temp_text, top_k_text=top_k_text)
     _patch_event_loop_diagnostics()
     _patch_server_state(session, checkpoint, retrieval_backend_display)
     _patch_server_state_step_pacing()
@@ -967,7 +971,7 @@ def apply_patches(
     # states print explicitly (not just the disabled one) so an A/B run
     # never has to infer the active mode from silence.
     if _stt_off_thread_enabled():
-        print("[STT] STT_OFF_THREAD=1 (default) -- Option E chain applied (off-thread STT, 2nd-GPU pinning if visible)", file=sys.stderr)
+        print("[STT] STT_OFF_THREAD=1 -- Option E chain applied (off-thread STT, 2nd-GPU pinning if visible)", file=sys.stderr)
         _patch_local_stt_off_thread()
         _patch_compiled_functions_thread_safe()
         _patch_cuda_graph_thread_local()
@@ -977,7 +981,7 @@ def apply_patches(
         _patch_stt_no_cuda_graph()
         _patch_stt_second_gpu()
     else:
-        print("[STT] STT_OFF_THREAD=0 -- synchronous on-event-loop STT (Option E chain skipped)", file=sys.stderr)
+        print("[STT] STT_OFF_THREAD=0 (default) -- synchronous on-event-loop STT (Option E chain skipped)", file=sys.stderr)
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
     _patch_rag_manager_background_task(session)
@@ -1012,6 +1016,30 @@ def _build_retrieval_backend_for_demo() -> tuple[object, dict]:
     return retrieval_backend, retrieval_backend_display
 
 
+def _generation_overrides_for_demo() -> tuple[float, int]:
+    """
+    Reads model.generation.temp_text/top_k_text from DEMO_CONFIG, merged
+    over _DEFAULT_GENERATION the same way every other generation field is —
+    see that dict's own comment in core/model_interface.py for why these
+    two specifically bypass scripts/print_demo_env.py's CLI-flags mechanism
+    (moshi.server has no matching CLI flag) and get read directly here
+    instead. Pure/stateless like _build_retrieval_backend_for_demo() above
+    — a second, independent parse of the same small YAML file is cheap and
+    keeps each function self-contained.
+    """
+    config_path = os.environ.get("DEMO_CONFIG")
+    if not config_path:
+        print("DEMO_CONFIG must be set (run via scripts/run_demo.sh)", file=sys.stderr)
+        sys.exit(1)
+
+    from core.config import load_config
+    from core.model_interface import _DEFAULT_GENERATION
+
+    config = load_config(config_path)
+    generation = {**_DEFAULT_GENERATION, **config.get("model", {}).get("generation", {})}
+    return generation["temp_text"], generation["top_k_text"]
+
+
 def main() -> None:
     session_dir_env = os.environ.get("DEMO_SESSION_DIR")
     if not session_dir_env:
@@ -1023,10 +1051,13 @@ def main() -> None:
         sys.exit(1)
 
     retrieval_backend, retrieval_backend_display = _build_retrieval_backend_for_demo()
+    temp_text, top_k_text = _generation_overrides_for_demo()
 
     checkpoint = os.environ.get("DEMO_CHECKPOINT", "unknown")
     session = SessionLog(session_dir)
-    apply_patches(session, checkpoint, retrieval_backend, retrieval_backend_display)
+    apply_patches(
+        session, checkpoint, retrieval_backend, retrieval_backend_display, temp_text, top_k_text
+    )
 
     import torch
     import moshi.server

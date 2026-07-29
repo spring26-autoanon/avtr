@@ -9,6 +9,21 @@ model:
     vad_threshold: 0.5
     power_threshold: -65
     tail_silence_steps: 25
+    # Both unchanged from LMGen's own hardcoded defaults (real checkpoint's
+    # config.json has no lm_gen_config override, confirmed directly) —
+    # left explicit here now that they're config-adjustable, rather than
+    # only living in core/model_interface.py's _DEFAULT_GENERATION. See
+    # CLAUDE.md's "Real root cause of demo response lag" section: these are
+    # the one confirmed lever onto the pad-token-sampling drift (temp/top-k
+    # applied directly to text_logits, the only place in the whole pipeline
+    # that reaches it — cfg_coef also reaches text_logits but can't be used
+    # here, see that field's own comment above). No moshi.server CLI flag
+    # exists for either — scripts/print_demo_env.py excludes both from its
+    # CLI-flags translation; the demo applies them via
+    # core/model_interface.py's _patch_load_models_generation_overrides()
+    # reading this same config directly instead.
+    temp_text: 0.7
+    top_k_text: 25
   retrieval:
     enabled: true
     backend: gemini_api          # key into configs/retrieval_backends.yaml — now

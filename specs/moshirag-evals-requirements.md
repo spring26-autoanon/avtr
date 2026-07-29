@@ -220,6 +220,8 @@ per-field mapping table:
 | `vad_threshold` | `InferenceJob` args | `--vad-threshold` | `0.5` |
 | `power_threshold` | `InferenceJob` args | `--power-threshold` | `-65` |
 | `tail_silence_steps` | `_TAIL_SILENCE_STEPS` (eval-only) | n/a | `25` |
+| `temp_text` | `LMGen.__init__` (via `_patch_load_models_generation_overrides`) | n/a — see note below | `0.7` |
+| `top_k_text` | `LMGen.__init__` (via `_patch_load_models_generation_overrides`) | n/a — see note below | `25` |
 
 `batch_size` and `init_active_speaker` are deliberately **not** part of
 this shared block — they're structural/path-specific, not
@@ -233,6 +235,21 @@ Both stay hardcoded/CLI-only per path, same as today.
 `tail_silence_steps` has no demo equivalent — it's `respond()`'s own
 silence-based turn-termination mechanism (see CLAUDE.md's `_TAIL_SILENCE_STEPS`
 notes), not something `moshi.server`'s live, continuous session model needs.
+
+`temp_text`/`top_k_text` are a different kind of exception from
+`tail_silence_steps`: they **do** apply to the demo, but `moshi.server` has
+no `--temp-text`/`--top-k-text` CLI flag at all to receive them through
+(confirmed against its real argparse block), so `scripts/print_demo_env.py`
+excludes both from its CLI-flags translation the same way it excludes
+`tail_silence_steps` (`_DEMO_EXCLUDED_GENERATION_FIELDS`), and
+`scripts/instrumented_server.py`'s `apply_patches()` instead reads them
+directly from `DEMO_CONFIG` and passes them to
+`core/model_interface.py`'s `_patch_load_models_generation_overrides()` —
+a class-level monkeypatch of the module-local `moshi.inference_utils.utils.LMGen`
+name (see that function's own docstring for why not `moshi.models.lm.LMGen`
+globally, matching `_patch_stt_no_cuda_graph`'s precedent). Added
+2026-07-28 as the one confirmed lever onto the pad-token-sampling drift —
+see CLAUDE.md's "Real root cause of demo response lag" section.
 
 ### `core/retrieval_backend.py`
 
@@ -1591,6 +1608,8 @@ model:
     vad_threshold: 0.5
     power_threshold: -65
     tail_silence_steps: 25
+    temp_text: 0.7
+    top_k_text: 25
   retrieval:
     enabled: false
 
@@ -1624,6 +1643,8 @@ model:
     vad_threshold: 0.5
     power_threshold: -65
     tail_silence_steps: 25
+    temp_text: 0.7
+    top_k_text: 25
   retrieval:
     enabled: true
     backend: gemini_api          # key into configs/retrieval_backends.yaml

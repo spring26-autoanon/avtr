@@ -708,3 +708,45 @@ def test_build_retrieval_backend_for_demo_disabled_retrieval_returns_null_backen
 
     assert isinstance(backend, NullBackend)
     assert display == {"name": "null", "type": "null_backend"}
+
+
+# ── _generation_overrides_for_demo ──────────────────────────────────────────
+
+
+def test_generation_overrides_for_demo_requires_demo_config(monkeypatch):
+    from scripts.instrumented_server import _generation_overrides_for_demo
+
+    monkeypatch.delenv("DEMO_CONFIG", raising=False)
+    with pytest.raises(SystemExit):
+        _generation_overrides_for_demo()
+
+
+def test_generation_overrides_for_demo_falls_back_to_defaults(tmp_path, monkeypatch):
+    from scripts.instrumented_server import _generation_overrides_for_demo
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "model:\n  checkpoint: local/whatever\n  retrieval:\n    enabled: false\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    monkeypatch.setenv("DEMO_CONFIG", str(cfg))
+
+    temp_text, top_k_text = _generation_overrides_for_demo()
+
+    assert (temp_text, top_k_text) == (0.7, 25)
+
+
+def test_generation_overrides_for_demo_reads_config_overrides(tmp_path, monkeypatch):
+    from scripts.instrumented_server import _generation_overrides_for_demo
+
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(
+        "model:\n  checkpoint: local/whatever\n  retrieval:\n    enabled: false\n"
+        "  generation:\n    temp_text: 0.9\n    top_k_text: 50\n"
+        "evals: []\noutput_dir: ./out/\n"
+    )
+    monkeypatch.setenv("DEMO_CONFIG", str(cfg))
+
+    temp_text, top_k_text = _generation_overrides_for_demo()
+
+    assert (temp_text, top_k_text) == (0.9, 50)

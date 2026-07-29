@@ -14,6 +14,7 @@ from core.model_interface import (
     _maybe_enable_eval_asyncio_debug,
     _patch_compiled_functions_thread_safe,
     _patch_cuda_graph_thread_local,
+    _patch_load_models_generation_overrides,
     _patch_local_stt_off_thread,
     _patch_stt_no_cuda_graph,
     _patch_stt_second_gpu,
@@ -1053,6 +1054,83 @@ def test_patch_stt_no_cuda_graph_is_idempotent(monkeypatch):
     assert local_stt_mod.LocalSpeechToText.__init__ is wrapped_init
 
 
+# ── _patch_load_models_generation_overrides (pad-sampling-drift lever) ───────
+# See that function's own docstring in core/model_interface.py: patches the
+# module-local moshi.inference_utils.utils.LMGen name (not moshi.models.lm.LMGen
+# globally, and not the load_models function itself — same reasoning as
+# _patch_stt_no_cuda_graph's local_stt_mod.LMGen swap above) so the
+# front-end's own LMGen construction inside load_models() picks up
+# temp_text/top_k_text from config. torch isn't installed in this sandbox,
+# so moshi.inference_utils.utils is faked via sys.modules injection.
+
+
+def _install_fake_moshi_inference_utils_with_lm_gen(monkeypatch):
+    import sys
+    import types
+
+    for name in ("moshi", "moshi.inference_utils"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+
+    utils_mod = types.ModuleType("moshi.inference_utils.utils")
+
+    class _FakeLMGen:
+        def __init__(self, *args, **kwargs):
+            self.init_args = args
+            self.init_kwargs = kwargs
+
+    utils_mod.LMGen = _FakeLMGen
+    monkeypatch.setitem(sys.modules, "moshi.inference_utils.utils", utils_mod)
+
+    return utils_mod
+
+
+def test_patch_load_models_generation_overrides_sets_temp_text_and_top_k_text(monkeypatch):
+    utils_mod = _install_fake_moshi_inference_utils_with_lm_gen(monkeypatch)
+
+    _patch_load_models_generation_overrides(temp_text=0.9, top_k_text=50)
+
+    lm_gen = utils_mod.LMGen(object(), cfg_coef=1.0, force_streaming_sum=True)
+    assert lm_gen.init_kwargs["temp_text"] == 0.9
+    assert lm_gen.init_kwargs["top_k_text"] == 50
+
+
+def test_patch_load_models_generation_overrides_prints_applied_values(monkeypatch, capsys):
+    """Real gap this covers: 2026-07-29's A/B test had no way to confirm
+    after the fact whether a scratch config's temp_text override had
+    actually taken effect — this print is what closes that gap."""
+    _install_fake_moshi_inference_utils_with_lm_gen(monkeypatch)
+
+    _patch_load_models_generation_overrides(temp_text=0.9, top_k_text=50)
+
+    err = capsys.readouterr().err
+    assert "temp_text=0.9" in err
+    assert "top_k_text=50" in err
+
+
+def test_patch_load_models_generation_overrides_respects_explicit_kwarg(monkeypatch):
+    """A checkpoint's own lm_gen_config (spread into the same call, ahead of
+    our subclass's defaults) should still win — setdefault, not a forced
+    override."""
+    utils_mod = _install_fake_moshi_inference_utils_with_lm_gen(monkeypatch)
+
+    _patch_load_models_generation_overrides(temp_text=0.9, top_k_text=50)
+
+    lm_gen = utils_mod.LMGen(object(), temp_text=0.3)
+    assert lm_gen.init_kwargs["temp_text"] == 0.3
+    assert lm_gen.init_kwargs["top_k_text"] == 50
+
+
+def test_patch_load_models_generation_overrides_is_idempotent(monkeypatch):
+    utils_mod = _install_fake_moshi_inference_utils_with_lm_gen(monkeypatch)
+
+    _patch_load_models_generation_overrides(temp_text=0.9, top_k_text=50)
+    wrapped_lm_gen = utils_mod.LMGen
+
+    _patch_load_models_generation_overrides(temp_text=0.5, top_k_text=10)
+
+    assert utils_mod.LMGen is wrapped_lm_gen
+
+
 # ── _patch_stt_second_gpu (Option E: physical device separation) ─────────────
 # See that function's own docstring in core/model_interface.py for the full
 # history of why locking around specific call sites (three attempts) never
@@ -1594,10 +1672,20 @@ def test_finalize_ttfat_defaults_to_zero_when_first_audio_never_recorded():
 
 
 # --- _stt_off_thread_enabled (STT_OFF_THREAD A/B toggle) -------------------
+# Default flipped 2026-07-29: a real demo A/B mistake ran two sessions
+# without explicitly exporting STT_OFF_THREAD=0, silently defaulting to the
+# off-thread chain, and both showed a dropped-user-utterance bug the one
+# session with it explicitly disabled never exhibited — see
+# _stt_off_thread_enabled()'s own docstring for the full reasoning.
 
 
-def test_stt_off_thread_enabled_by_default(monkeypatch):
+def test_stt_off_thread_disabled_by_default(monkeypatch):
     monkeypatch.delenv("STT_OFF_THREAD", raising=False)
+    assert _stt_off_thread_enabled() is False
+
+
+def test_stt_off_thread_enabled_via_env_var(monkeypatch):
+    monkeypatch.setenv("STT_OFF_THREAD", "1")
     assert _stt_off_thread_enabled() is True
 
 
@@ -1606,6 +1694,9 @@ def test_stt_off_thread_disabled_via_env_var(monkeypatch):
     assert _stt_off_thread_enabled() is False
 
 
-def test_stt_off_thread_any_other_value_is_enabled(monkeypatch):
+def test_stt_off_thread_any_other_value_is_disabled(monkeypatch):
+    """Fails closed toward the safer, validated mode on a typo'd/unexpected
+    value, rather than the old permissive "!= '0'" parsing that would have
+    silently enabled the off-thread chain on e.g. STT_OFF_THREAD=false."""
     monkeypatch.setenv("STT_OFF_THREAD", "false")
-    assert _stt_off_thread_enabled() is True
+    assert _stt_off_thread_enabled() is False

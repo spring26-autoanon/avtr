@@ -1201,6 +1201,29 @@ anything found this session; they remain implemented and available, but
 the case for keeping them running by default is weak pending the new
 investigation.
 
+**Update (2026-07-29) — default flipped to disabled.** A real demo A/B
+mistake: two sessions (`demo/sessions/2026-07-29T05-50-41Z/`,
+`demo/sessions/2026-07-29T06-18-06Z/`, both testing unrelated `temp_text`
+values) were run without explicitly exporting `STT_OFF_THREAD=0`, silently
+defaulting to the (at-the-time) enabled off-thread chain — costing a real
+round trip before the missing export was noticed. Both showed a genuine
+dropped-user-utterance bug (confirmed via the recorded client audio
+containing real speech with zero corresponding server-side VAD/STT
+activity) that the one session with it explicitly disabled
+(`demo/sessions/2026-07-28T07-23-04Z/`, referenced above) never exhibited.
+**Not proven as the definitive root cause of the dropped utterance** — the
+mechanism linking off-thread STT to a dropped utterance specifically
+(rather than just the already-known CUDA-graph-crash risk this section is
+about) is still a hypothesis, not confirmed — but the correlation is real,
+and disabling it is already independently validated as safe on single-GPU
+hardware per the update immediately above. Given that, defaulting to the
+safer, already-proven mode is the right call while the hypothesis gets
+tested properly, rather than leaving a footgun that depends on everyone
+remembering to export a variable. `core/model_interface.py`'s
+`_stt_off_thread_enabled()` now returns `os.environ.get("STT_OFF_THREAD",
+"0") == "1"` (was `!= "0"`, default `"1"`) — set `STT_OFF_THREAD=1` to
+explicitly opt back into the off-thread + Option E chain.
+
 ### Real root cause of demo response lag: model-generation `<pad>` sampling drift, not retrieval/GPU/pacing (2026-07-28)
 
 **This section supersedes the framing of every section above it in this
