@@ -27,3 +27,8 @@ node_modules/
 .idea/
 .vscode/
 *.swp
+
+# local scratch / Claude Code local settings
+audio/
+temp
+.claude/
