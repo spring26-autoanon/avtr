@@ -601,3 +601,29 @@ def test_main_console_end_to_end_reattributes_a_raced_retrieval(tmp_path, capsys
     assert "3.70s" in turn2_line
     assert "late-arriving context" in out
     assert "late-arriving reference" in out
+
+
+# ── pad_stall_steps column (docs/demo-turn-onset-regression.md) ──────────────
+
+
+def test_console_report_shows_pad_stall_steps(capsys):
+    turn = {**TURN_1, "ttfat_s": 4.24, "pad_stall_steps": 53}
+
+    print_console_report(SESSION_START, [turn], [])
+
+    out = capsys.readouterr().out
+    assert "pad" in out
+    assert "53" in out
+    assert "pad stall (steps)" in out
+    # x80ms conversion is what makes the step count readable as latency.
+    assert "4.2s mean" in out
+
+
+def test_console_report_marks_sessions_predating_pad_stall_steps(capsys):
+    """Pre-2026-07-30 sessions have no pad_stall_steps, which is also the
+    signal that their ttfat_s used the old turn-switch anchor and is not
+    comparable with later sessions."""
+    print_console_report(SESSION_START, [{**TURN_1, "ttfat_s": 0.16}], [])
+
+    out = capsys.readouterr().out
+    assert "predates pad_stall_steps" in out

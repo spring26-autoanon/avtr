@@ -1088,6 +1088,17 @@ demo-fluency gap doesn't touch.
 
 ### Client-side audio jitter-buffer diagnostic (added 2026-07-27, not yet used on a real session)
 
+**Correction (2026-07-30):** this diagnostic works, but the reading taken
+from it was backwards. `liveBufferS ≈ 0 ms for 99.3% of samples, max
+37 ms` was recorded as "the jitter buffer itself is genuinely healthy
+now". A playback buffer pinned at zero means the client is **starved** —
+the server is delivering strictly on demand with no slack — which is the
+expected signature of the step-pacing latch, not of health. Same for the
+within-generation word cadence going 0.243s -> 0.309s (**+27%**), noted
+as "close to baseline": that is stretched playback from the same rate
+mismatch, and it matches the "did not feel fluent" report. See
+`docs/demo-turn-onset-regression.md` §4.5.
+
 To test the jitter-buffer hypothesis above, `demo/client/` now records a
 timestamped log of the browser's own audio-playback queue depth
 (`audio-processor.ts`'s existing `delay` figure — mic-duration minus
@@ -1111,10 +1122,19 @@ playback). Save it as `demo/sessions/<session_id>/client_audio.json`
 the next analysis pass — it isn't part of `make sync`'s rsync since it
 never leaves the client machine's browser.
 
-**Not yet build/lint-verified** — implemented and manually reviewed line
-by line, but no Node.js toolchain was available to run `npm run build`/
-`tsc` this session. Run that first, before spending a live session on
-it, in case of a typo this review missed.
+**RESOLVED (2026-07-30): builds clean.** Was "not yet build/lint-verified"
+— implemented and manually reviewed line by line, but no Node.js toolchain
+was available to run `npm run build`/`tsc` in the session that wrote it.
+Run on `wb-gpu-a1ultra`: `npm install && npm run build` succeeds,
+`tsc` passes, 104 modules transformed, `dist/` written. No typo escaped
+the manual review.
+
+Same run reported 22 npm vulnerabilities (5 moderate, 16 high, 1
+critical) across 431 audited packages — parked as non-blocking, see
+`docs/demo-turn-onset-fix-plan.md`'s D9 for the assessment and the
+`npm audit --omit=dev` triage that would close it out. **Do not run
+`npm audit fix --force`**: it bumps `vite`/`eslint` majors and can break
+exactly the build this note just confirmed working.
 
 **Next session's analysis, once a real session's `client_audio.json`
 exists**: plot/diff its `delay` values against the server's own
@@ -1124,6 +1144,46 @@ above (rather than sitting near the worklet's own ~10-80ms target
 buffer range), that confirms client playback backlog as the real
 mechanism behind the perceived demo unfluency — independent of, and not
 a regression from, Option E.
+
+### CORRECTED: Real-time step pacing (added 2026-07-27) is itself the leading cause of the demo turn-onset regression; STT-off-thread A/B toggle
+
+**Correction (2026-07-30) — see `docs/demo-turn-onset-regression.md` §4.3.**
+The pacing patch's stated premise below — "there is no complementary sleep
+anywhere when a step finishes faster than the real-time budget... the
+server ships audio strictly faster than real-time, continuously, with no
+mechanism anywhere to slow back down" — is **false**, confirmed against
+real upstream source. `ServerState._gather_step_inputs()` pulls with
+`input_queue.get_nowait()` and `run_one_step()` returns `False` when no
+channel has a frame, so the step loop is **input-driven**: the client's
+own real-time audio upload is the throttle and `Channel.input_queue` is
+the buffer. The server cannot outrun the client.
+
+Given that, `_patch_server_state_step_pacing()` acts as a one-way latch:
+it never fires while the queue is empty (harmless), and once a backlog
+exists it caps drain at exactly the production rate, so the backlog can
+never shrink and every >80 ms step ratchets it further up. Real per-step
+work is 60-79 ms against an 80 ms budget; that 1-25% headroom was the
+only thing draining the 3.9-4.9 s backlog every session accumulates
+during warm-up/STT priming, and pacing removes it.
+
+Two supporting corrections:
+- The client-side jitter-buffer overrun that motivated this patch was
+  measured with the **first, later-corrected** version of `liveBufferS`
+  (this file notes that correction itself, in the pad-sampling section).
+  The corrected field reads 0 ms for 99.3% of samples — recorded there as
+  "genuinely healthy", but a permanently-empty playback buffer is a
+  **starved** client, i.e. a server with zero slack. The evidence that
+  justified this patch has since been invalidated.
+- `run_demo.sh` never sets `--batch-size`, so the demo runs at
+  `moshi.server`'s default of 16. `BatchRunner.run_step()` computes the
+  full batch tensor every step (`exec_mask` gates state updates, not
+  compute), so a single-user demo pays ~16x the necessary per-step work
+  against that same 80 ms budget.
+
+Planned change: default `DEMO_STEP_PACING` to disabled and set
+`--batch-size 1`. See `docs/demo-turn-onset-fix-plan.md` (B1, B2) for the
+sequencing and the VM A/B that validates it. Original section verbatim
+below.
 
 ### Real-time step pacing (added 2026-07-27) and the STT-off-thread A/B toggle
 
@@ -1224,7 +1284,48 @@ remembering to export a variable. `core/model_interface.py`'s
 "0") == "1"` (was `!= "0"`, default `"1"`) — set `STT_OFF_THREAD=1` to
 explicitly opt back into the off-thread + Option E chain.
 
-### Real root cause of demo response lag: model-generation `<pad>` sampling drift, not retrieval/GPU/pacing (2026-07-28)
+### SUPERSEDED: "Real root cause of demo response lag: model-generation `<pad>` sampling drift" — the stall is real, but it is a regression this repo introduced, not learned model behaviour (2026-07-28, corrected 2026-07-30)
+
+**Correction (2026-07-30) — read `docs/demo-turn-onset-regression.md` first.**
+Everything this section *measures* holds up: the `<pad>` stall before
+`<ret>` is real, it dominates the user-perceived delay, and retrieval /
+ARC-encoding / GPU work are genuinely off the critical path. What's wrong
+is the attribution. Three findings from an independent re-analysis:
+
+1. It is **not learned behaviour.** The paper's own Table 1 reports
+   TTFAT = 0.0s and Table 2 a Full-Duplex-Bench turn-taking latency of
+   0.18s for this exact model — and this repo's own 2026-07-22/23 demo
+   sessions measure 0.1-1.9s onsets, flat or *decreasing* across a
+   session, on the same stack.
+2. It is a **regression introduced 2026-07-27**, whose leading cause is
+   `scripts/instrumented_server.py`'s `_patch_server_state_step_pacing()`
+   (see that section's own correction note below). Mean step period
+   crossed from 60.0/65.7/78.7 ms (pre-patch, i.e. real headroom under
+   the 80 ms budget) to 79.9-82.0 ms (post-patch, zero drain capacity)
+   exactly when the regression appears.
+3. It is **not RAG-specific.** Non-retrieval turns in the same sessions
+   show stall runs of 17-117 steps. This is front-end Moshi turn-onset
+   behaviour; `<ret>` is just a loud log marker.
+
+Also corrected: the acoustic hypothesis is now closed with real
+measurement, not left open. Decoding the saved client recording for
+`2026-07-29T07-19-59Z` and computing its 80 ms dBFS envelope shows
+**100% of windows below -65 dBFS during every long stall** (median
+-77 dBFS) — with `--power-threshold -65` in effect the front-end is
+being fed exact digital zeros throughout, so noise floor, speaker->mic
+echo and gate chatter are all ruled out.
+
+And the reason this went undiagnosed: the demo's own `ttfat_s` starts
+its clock at `_ChannelState.on_utterance_end()`, which only fires once
+`TurnManager.model_text_buffer` is non-empty — i.e. **after** the stall
+has ended. It reported 0.08-0.32s on the very session where the human
+waited 4.3/18.6/7.4s. The two `ttfat_s` fixes recorded further down this
+file were both on the *eval* path; the demo's zero point was never
+audited.
+
+The original section follows verbatim — it is a real, carefully-reasoned
+conclusion from the evidence available at the time, and the two
+ground-truth tools it built are what made this re-analysis possible.
 
 **This section supersedes the framing of every section above it in this
 file that attributed demo dead-air to retrieval latency, GPU/CUDA-graph

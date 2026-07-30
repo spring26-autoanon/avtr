@@ -240,12 +240,61 @@ class _ChannelState:
         self.turn_index = 0
         self._incoming_user_text: list[str] = []
         self._pending: dict | None = None
+        # ttfat_s anchors, held outside self._pending because both are
+        # established *before* the turn record exists — see
+        # on_user_turn_vad()/on_utterance_end() for why.
+        self._t_user_stopped: float | None = None
+        self._t_first_model_token: float | None = None
+        self._vad_stopped = False
+        self._pad_stall_steps = 0
 
     def on_user_text(self, text: str) -> None:
         self._session.write_raw_event("user_text", turn_index=self.turn_index, text=text)
         self._incoming_user_text.append(text)
 
+    def on_user_turn_vad(self, stopped: bool) -> None:
+        """Called once per TurnManager._update_active_speaker evaluation while
+        the *user* still holds the turn, with upstream's own ``vad_neg``
+        verdict (see _patch_turn_manager's _vad_says_user_stopped).
+
+        Arms ttfat_s's clock on each false->true transition, i.e. on each
+        moment VAD newly concludes the user has stopped. Re-arming (rather
+        than latching the first one) is deliberate and matters: a mid-question
+        pause produces an earlier transition, and anchoring there would
+        attribute the pause itself to response latency. Taking the *last*
+        stop before the model speaks is what matches the paper's definition
+        of TTFAT ("the delay between the end of a user's utterance and the
+        moment the model generates the first audio token", §3.1).
+        """
+        if stopped and not self._vad_stopped:
+            self._t_user_stopped = time.perf_counter()
+            self._t_first_model_token = None
+            self._pad_stall_steps = 0
+        self._vad_stopped = stopped
+
+    def on_awaiting_turn_step(self) -> None:
+        """One model step elapsed while the user still holds the turn.
+
+        Counts the pad stall (``pad_stall_steps``) — the same quantity
+        scripts/count_pad_stalls.py derives from server.log's "LM buffer
+        empty" lines, recorded per turn here so it is queryable from
+        turns.jsonl without log parsing.
+
+        Off by at most one step: the caller runs before
+        _update_active_speaker for the same step, so ``_vad_stopped``
+        reflects the previous step's verdict. Immaterial at 80ms resolution
+        for a diagnostic counter, and not worth reordering the wrapper for.
+        """
+        if self._vad_stopped:
+            self._pad_stall_steps += 1
+
     def on_model_text(self, text: str) -> None:
+        # First genuine (non-pad) model token after VAD concluded the user
+        # stopped — the "first audio token" side of ttfat_s. Recorded here
+        # rather than in on_first_audio() because it happens stt_wait_steps
+        # *before* on_utterance_end() creates the turn record it belongs to.
+        if self._vad_stopped and self._t_first_model_token is None:
+            self._t_first_model_token = time.perf_counter()
         self._session.write_raw_event("model_text", turn_index=self.turn_index, text=text)
         # This is also ttfat_s's first-audio-frame signal: on_model_text is
         # only ever called with a genuine, non-pad decoded token (see
@@ -265,25 +314,81 @@ class _ChannelState:
             self._pending["model_response_text"] += text
 
     def on_utterance_end(self) -> None:
-        """Called right as VAD confirms the user stopped speaking and the
-        pending switch to the model turn is set — this is both the ttfat
-        clock start and the turn boundary: whatever was pending from the
-        previous turn is now complete and gets flushed."""
+        """Called as the turn actually switches to the model — the turn
+        boundary: whatever was pending from the previous turn is now complete
+        and gets flushed.
+
+        **This is no longer the ttfat clock start (changed 2026-07-30).** It
+        used to be, and that was the bug: this fires only once
+        TurnManager.model_text_buffer is non-empty, i.e. *after* the model has
+        already produced its first real token, and then after a further
+        stt_wait_steps hold. The resulting ttfat_s measured one step and read
+        0.08-0.32s on sessions where the human waited 4-19s. See
+        docs/demo-turn-onset-regression.md §6.1.
+
+        ttfat_s is now computed here from the two anchors gathered earlier in
+        the turn (on_user_turn_vad / on_model_text) — both are known by the
+        time control reaches this point, which is why it can be resolved
+        eagerly rather than waiting for another model token.
+
+        The old quantity is preserved as ``turn_switch_to_first_token_s``
+        (filled in by on_first_audio) rather than dropped: it measures
+        something real — the stt_wait_steps + display-gating interval — and
+        every pre-2026-07-30 session log carries it under the ttfat_s name, so
+        keeping it under an honest name is what makes old and new sessions
+        comparable instead of silently incomparable.
+        """
         self._flush_pending()
         self.turn_index += 1
-        self._session.write_raw_event("utterance_end", turn_index=self.turn_index)
+        ttfat_s = self._resolve_ttfat_s()
+        pad_stall_steps = self._pad_stall_steps if self._t_user_stopped is not None else None
+        self._session.write_raw_event(
+            "utterance_end",
+            turn_index=self.turn_index,
+            ttfat_s=ttfat_s,
+            pad_stall_steps=pad_stall_steps,
+        )
         self._pending = {
             "type": "turn",
             "turn_index": self.turn_index,
             "timestamp": self._session.now_iso(),
             "user_question_text": "".join(self._incoming_user_text).strip(),
             "model_response_text": "",
-            "ttfat_s": None,
+            "ttfat_s": ttfat_s,
+            "pad_stall_steps": pad_stall_steps,
+            "turn_switch_to_first_token_s": None,
             "e2ekd_s": None,
             "keyword_delay_s": None,
-            "_ttfat_start": time.perf_counter(),
+            "_switch_at": time.perf_counter(),
         }
         self._incoming_user_text = []
+        # ttfat_s is known now, so push it immediately rather than waiting for
+        # the next model token (which is what the old on_first_audio path did).
+        _push_instrumentation(self.channel, self.turn_index, {"ttfat_s": ttfat_s})
+        self._t_user_stopped = None
+        self._t_first_model_token = None
+        self._vad_stopped = False
+        self._pad_stall_steps = 0
+
+    def _resolve_ttfat_s(self) -> float | None:
+        """End of the user's utterance -> first genuine model token, per the
+        paper's §3.1 TTFAT definition.
+
+        Returns None only when VAD never concluded the user stopped during
+        this turn (no anchor to measure from — e.g. the very first turn of a
+        session that opens with ``--init-active-speaker model``).
+
+        Returns 0.0 when the user *did* stop but the model had already begun
+        speaking before that (a barge-in / backchannel that carried into the
+        turn switch): TTFAT is zero-or-negative there, and the paper reports
+        exactly 0.0 for both MoshiRAG and vanilla Moshi, so clamping matches
+        both the definition and the published baseline.
+        """
+        if self._t_user_stopped is None:
+            return None
+        if self._t_first_model_token is None:
+            return 0.0
+        return round(max(0.0, self._t_first_model_token - self._t_user_stopped), 4)
 
     def on_ret_triggered(self) -> None:
         # Logged unconditionally (even with no pending turn) — an
@@ -329,11 +434,24 @@ class _ChannelState:
         )
 
     def on_first_audio(self) -> None:
-        if self._pending is None or self._pending["ttfat_s"] is not None:
+        """Records ``turn_switch_to_first_token_s`` — the first genuine model
+        token *after* the turn switched to the model.
+
+        This is exactly what ``ttfat_s`` used to mean before 2026-07-30 (see
+        on_utterance_end's docstring); the name now says so. It is the
+        stt_wait_steps + display-gating interval, not response latency.
+        """
+        if self._pending is None or self._pending["turn_switch_to_first_token_s"] is not None:
             return  # already recorded for this turn
-        self._pending["ttfat_s"] = round(time.perf_counter() - self._pending["_ttfat_start"], 4)
-        self._session.write_raw_event("first_audio", turn_index=self.turn_index, ttfat_s=self._pending["ttfat_s"])
-        _push_instrumentation(self.channel, self.turn_index, {"ttfat_s": self._pending["ttfat_s"]})
+        elapsed = round(time.perf_counter() - self._pending["_switch_at"], 4)
+        self._pending["turn_switch_to_first_token_s"] = elapsed
+        self._session.write_raw_event(
+            "first_audio",
+            turn_index=self.turn_index,
+            turn_switch_to_first_token_s=elapsed,
+            ttfat_s=self._pending["ttfat_s"],
+        )
+        _push_instrumentation(self.channel, self.turn_index, {"turn_switch_to_first_token_s": elapsed})
 
     def flush_final(self) -> None:
         """Called on channel close so the last turn isn't lost."""
@@ -386,6 +504,9 @@ class SessionLog:
         self._fh = open(self._path, "a")
         self._raw_path = session_dir / "raw_events.jsonl"
         self._raw_fh = open(self._raw_path, "a")
+        # Opened lazily by write_step_diag() so DEMO_QUEUE_DIAG=0 sessions
+        # never create an empty step_diag.jsonl.
+        self._step_diag_fh = None
         self._channel_states: dict[int, _ChannelState] = {}
         # RAGManager/TurnManager instances are per-channel but don't hold a
         # back-reference to their owning Channel, so Channel.__init__ (below)
@@ -421,6 +542,21 @@ class SessionLog:
 
     def write_turn(self, record: dict) -> None:
         self._write(record)
+
+    def write_step_diag(self, **fields) -> None:
+        """One record per *sampled* model step, to its own file.
+
+        Separate from raw_events.jsonl on purpose: at Mimi's 12.5Hz this is
+        ~1500 steps for a two-minute session, which would drown the existing
+        logs. Only written when DEMO_QUEUE_DIAG=1 (see
+        _patch_step_queue_diagnostics), so the file is absent from ordinary
+        sessions rather than empty.
+        """
+        if self._step_diag_fh is None:
+            self._step_diag_fh = open(self.session_dir / "step_diag.jsonl", "a")
+        record = {"t_rel_s": round(time.perf_counter() - self._t0, 3), **fields}
+        self._step_diag_fh.write(json.dumps(record) + "\n")
+        self._step_diag_fh.flush()
 
     def write_raw_event(self, event: str, *, turn_index: int, **fields) -> None:
         record = {
@@ -493,11 +629,230 @@ def _patch_server_state(session: SessionLog, checkpoint: str, retrieval_backend_
     ServerState.__init__ = patched_init
 
 
+def _step_pacing_enabled() -> bool:
+    """Gate for _patch_server_state_step_pacing().
+
+    Extracted from that function purely so the default is testable: the
+    patch body itself imports moshi.server, which isn't installed in the
+    local test environment (see tests/test_instrumented_server.py's module
+    docstring on why those patches are VM-verified rather than mocked).
+
+    Default **disabled** as of 2026-07-30 — see that function's docstring
+    for why the patch's original premise was wrong, and
+    docs/demo-turn-onset-regression.md for the evidence. Mirrors how
+    core/model_interface.py's _stt_off_thread_enabled() was flipped: the
+    variable stays, opt-in rather than opt-out.
+    """
+    return os.environ.get("DEMO_STEP_PACING", "0") == "1"
+
+
+def _slot_backlog_rows(server, consumed: dict[int, int]) -> list[dict]:
+    """Per-active-slot backlog snapshot. Pure function of the server object
+    plus a caller-owned consumed-frames tally, so it is unit-testable against
+    a duck-typed stand-in without a real moshi-rag install.
+
+    Three independent numbers, deliberately — they localise *where* audio is
+    piling up, which `qsize` alone cannot:
+
+    - ``qsize``: frames sitting in Channel.input_queue right now.
+    - ``frames_received``: frames the *live* path has seen, derived from
+      ``LocalSpeechToText.sent_samples`` (incremented once per
+      ``send_audio()`` call in ``Channel._recv_loop``, before the frame is
+      queued). This is the only live-clock counter that already exists in
+      upstream, and it is what makes the measurement independent of where
+      buffering happens — if audio is backing up in the WebSocket or the
+      Opus reader rather than in input_queue, ``qsize`` stays small while
+      this number still tracks reality. Absent under ``--gradium-stt``
+      (GradiumSpeechToText has no such attribute), hence the getattr.
+    - ``frames_consumed``: frames the step loop has actually stepped for
+      this slot, tallied by the _deliver_step_row wrapper.
+
+    ``lag_frames = frames_received - frames_consumed`` is the headline
+    figure: multiply by 80ms to get how far behind live audio the front-end
+    model's perception is. See docs/demo-turn-onset-regression.md §8.
+    """
+    rows: list[dict] = []
+    frame_size = getattr(server, "frame_size", 0) or 0
+    for idx, occupant in enumerate(getattr(server, "slots", None) or []):
+        if occupant is None:
+            continue
+        sent_samples = getattr(getattr(occupant, "stt", None), "sent_samples", None)
+        received = None if (sent_samples is None or not frame_size) else int(sent_samples // frame_size)
+        used = consumed.get(id(occupant), 0)
+        rows.append(
+            {
+                "slot": idx,
+                "qsize": occupant.input_queue.qsize(),
+                "frames_received": received,
+                "frames_consumed": used,
+                "lag_frames": None if received is None else received - used,
+            }
+        )
+    return rows
+
+
+def _patch_step_queue_diagnostics(session: SessionLog) -> None:
+    """Opt-in (``DEMO_QUEUE_DIAG=1``) per-step trace of input-queue backlog,
+    real step timing, and raw text token ids — the measurement that
+    docs/demo-turn-onset-regression.md §8 identifies as the one thing able to
+    settle *why* the demo's turn onset is slow.
+
+    The two candidate mechanisms make opposite predictions, and this patch
+    distinguishes them in a single session:
+
+    - **Input backlog** (leading hypothesis): ``lag_frames`` climbs to ~50
+      during startup and never returns to ~0, growing through the session.
+      The front-end model is perceiving user audio seconds late, so its
+      turn-taking is correct behaviour applied to stale input.
+    - **Genuine generation behaviour**: ``lag_frames`` sits at 0-2 throughout
+      and the model really is declining to speak on time-aligned input. The
+      ``text_tokens`` trace then becomes the actionable data, which is why it
+      is collected here rather than left to a follow-up session.
+
+    ``text_tokens`` folds in what the fix plan tracked separately as D1
+    (PAD vs EPAD indistinguishable in logs, since
+    ``Channel._decode_text_token`` maps ids 0-3 all to ``None``). It is free
+    here: ``_deliver_step_row`` already receives ``text_token`` as a plain
+    Python int — ``BatchRunner.run_step`` does the ``.item()`` sync itself —
+    so recording it costs no extra GPU synchronisation. That mattered: any
+    per-step device sync added by this patch would inflate the very step
+    timings it exists to measure.
+
+    Sampling: one record every ``DEMO_QUEUE_DIAG_EVERY`` steps (default 12,
+    ≈1/s) to keep the file scannable, but ``text_tokens`` carries *every*
+    token id since the previous record, so the token stream is complete
+    regardless of the sampling rate.
+
+    ``work_ms`` vs ``mean_period_ms``: this patch must be applied *before*
+    _patch_server_state_step_pacing() so that it ends up the inner wrapper.
+    ``work_ms`` is then the real ``run_one_step`` compute with any pacing
+    sleep excluded, while ``mean_period_ms`` (measured between consecutive
+    sampled records) includes it — i.e. the pair directly shows how much of
+    the 80ms budget is work and how much is artificial floor.
+    """
+    if os.environ.get("DEMO_QUEUE_DIAG", "0") != "1":
+        return
+
+    from moshi.server import ServerState
+
+    if getattr(ServerState, "_queue_diag_patched", False):
+        return
+
+    try:
+        sample_every = max(1, int(os.environ.get("DEMO_QUEUE_DIAG_EVERY", "12")))
+    except ValueError:
+        sample_every = 12
+
+    original_deliver = ServerState._deliver_step_row
+    original_run_one_step = ServerState.run_one_step
+
+    # Keyed by id(channel). One int per channel ever opened — unlike
+    # SessionLog._channel_states (see unregister_channel's leak note) these
+    # hold no reference to the channel itself, so a stale entry cannot pin a
+    # deepcopied Mimi model in memory.
+    consumed: dict[int, int] = {}
+    pending_tokens: list[int] = []
+    state = {"step": 0, "prev_t": None}
+
+    def patched_deliver(self, occupant, *, text_token, pcm_out):
+        consumed[id(occupant)] = consumed.get(id(occupant), 0) + 1
+        pending_tokens.append(int(text_token))
+        return original_deliver(self, occupant, text_token=text_token, pcm_out=pcm_out)
+
+    async def patched_run_one_step(self):
+        t0 = time.perf_counter()
+        ran = await original_run_one_step(self)
+        t1 = time.perf_counter()
+        if not ran:
+            return ran
+        state["step"] += 1
+        if state["step"] % sample_every:
+            return ran
+        prev_t = state["prev_t"]
+        state["prev_t"] = t1
+        tokens = list(pending_tokens)
+        pending_tokens.clear()
+        session.write_step_diag(
+            step=state["step"],
+            work_ms=round((t1 - t0) * 1000, 2),
+            mean_period_ms=None if prev_t is None else round((t1 - prev_t) * 1000 / sample_every, 2),
+            slots=_slot_backlog_rows(self, consumed),
+            text_tokens=tokens,
+        )
+        return ran
+
+    ServerState._deliver_step_row = patched_deliver
+    ServerState.run_one_step = patched_run_one_step
+    ServerState._queue_diag_patched = True
+    # print(), not logger.info() — see _patch_server_state_step_pacing()'s
+    # docstring: apply_patches() runs before moshi.server.main() configures
+    # the root logger, so logger.info() here is silently swallowed.
+    print(
+        f"[QueueDiag] DEMO_QUEUE_DIAG=1 -- writing step_diag.jsonl every {sample_every} steps",
+        file=sys.stderr,
+    )
+
+
 def _patch_server_state_step_pacing() -> None:
     """Adds real-time pacing to ServerState.run_one_step() — demo-only,
     does not touch BatchRunner.run_step() itself (shared with
     core/model_interface.py's eval path, which wants maximum batch
     throughput, not real-time pacing).
+
+    **DEFAULT FLIPPED TO DISABLED (2026-07-30). The original rationale
+    below is wrong, and this patch is the leading cause of the demo's
+    turn-onset regression — see docs/demo-turn-onset-regression.md §4.3.**
+
+    What the original rationale got wrong: it claimed nothing throttles
+    output, but ServerState._gather_step_inputs() pulls with
+    input_queue.get_nowait() and run_one_step() returns False when no
+    channel has a frame ready (upstream source, re-read directly). The
+    step loop is therefore *input-driven* — the client's own real-time
+    audio upload is the throttle and Channel.input_queue is the buffer.
+    The server cannot outrun the client, so the premise that it "ships
+    audio strictly faster than real-time, continuously" does not hold.
+
+    What this patch actually does, given that: it acts as a one-way latch.
+    It never fires while the queue is empty (`ran` is False, so no sleep —
+    harmless, and invisible in the healthy case). Once a backlog exists it
+    caps drain at exactly the production rate, so the backlog can never
+    shrink, and every step whose own compute exceeds 80ms ratchets it
+    further up. Real per-step work measured 60-79ms against an 80ms
+    budget; that 1-25% headroom was the only mechanism draining the
+    3.9-4.9s backlog every session accumulates during warm-up/STT priming.
+    Removing it turned a transient startup backlog into a permanent ~4s
+    turn-onset floor that then grew to 8-10s over a session.
+
+    Supporting correction: the client-side jitter-buffer overrun cited
+    below as the motivation was measured with the *first, later-corrected*
+    version of the liveBufferS field (CLAUDE.md records that correction
+    itself). The corrected field reads 0ms for 99.3% of samples — recorded
+    at the time as "genuinely healthy", but a playback buffer pinned at
+    zero is a *starved* client, i.e. the opposite condition. The evidence
+    that justified this patch has since been invalidated.
+
+    **Partial rehabilitation (VM session 2, 2026-07-30):** the author of
+    this patch saw something real. Measured with pacing off,
+    `mean_period_ms` is ~66ms *while a backlog is draining* and snaps to
+    ~80ms the instant the queue empties — so during a drain the server
+    genuinely ships audio ~21% faster than real time, which is audible
+    (independently reported as "slightly fast, metallic artifacts more
+    noticeable", concentrated in the session's first ~25s). The mistake was
+    scope, not observation: a transient confined to backlog drain was read
+    as continuous and inherent, and suppressed by guaranteeing the drain
+    never completes.
+
+    Do not reintroduce pacing on the strength of that artifact, though:
+    session 3's client-side data showed the audible metallic artifact is a
+    *client* per-utterance playback-cap warm-up (drops cluster within
+    ±0.31s of every model turn onset, `newMaxBufferMs` ratcheting 15->35ms),
+    unrelated to pacing or to the drain. The corrected client buffer field
+    `liveBufferS` stays a flat, healthy 70-81ms right through the drain
+    window. So the drain's fast delivery is real server-side but has no
+    demonstrated audible cost. See docs/demo-turn-onset-fix-plan.md's
+    session-3 notes and D10.
+
+    Original rationale, kept verbatim as the reasoning trail:
 
     Root cause this addresses (confirmed against real moshi-rag source,
     not guessed — see batch_runner.py's run_step(): it measures
@@ -523,8 +878,10 @@ def _patch_server_state_step_pacing() -> None:
     change — _step_loop's own existing idle-poll sleep(0.005) still
     applies untouched.
 
-    Gate: DEMO_STEP_PACING=0 disables (default enabled), to A/B against
-    the pre-pacing baseline.
+    Gate: DEMO_STEP_PACING=1 enables (default **disabled** since
+    2026-07-30, was default-enabled) — kept rather than deleted so the
+    regression can be reproduced on demand for the VM A/B described in
+    docs/demo-turn-onset-fix-plan.md.
     """
     from moshi.server import ServerState
 
@@ -538,8 +895,12 @@ def _patch_server_state_step_pacing() -> None:
     # inside per-connection handlers that only run once a real session
     # starts, well after setup_logging() -- this function is the
     # exception, since it must run at startup, before any connection.
-    if os.environ.get("DEMO_STEP_PACING", "1") == "0":
-        print("[Pacing] DEMO_STEP_PACING=0 -- real-time step pacing disabled", file=sys.stderr)
+    if not _step_pacing_enabled():
+        print(
+            "[Pacing] DEMO_STEP_PACING=0 (default) -- real-time step pacing disabled "
+            "(set DEMO_STEP_PACING=1 to reproduce the pre-2026-07-30 behaviour)",
+            file=sys.stderr,
+        )
         return
 
     if getattr(ServerState, "_step_pacing_patched", False):
@@ -559,7 +920,11 @@ def _patch_server_state_step_pacing() -> None:
 
     ServerState.run_one_step = patched_run_one_step
     ServerState._step_pacing_patched = True
-    print("[Pacing] real-time step pacing enabled (set DEMO_STEP_PACING=0 to disable)", file=sys.stderr)
+    print(
+        "[Pacing] DEMO_STEP_PACING=1 -- real-time step pacing ENABLED; this is the "
+        "known-bad turn-onset configuration, see docs/demo-turn-onset-regression.md",
+        file=sys.stderr,
+    )
 
 
 def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retrieval_backend) -> None:
@@ -739,6 +1104,26 @@ def _patch_rag_manager_trigger(session: SessionLog) -> None:
     RAGManager.trigger = patched
 
 
+def _vad_says_user_stopped(turn_manager) -> bool:
+    """Read-only mirror of TurnManager._update_active_speaker's own ``vad_neg``
+    expression, plus its ``len(vad_history) < window_size`` early return.
+
+    Copied rather than derived because upstream computes ``vad_neg`` in a local
+    and never exposes it, and this repo does not reimplement TurnManager. Kept
+    to a single expression so the duplication is auditable at a glance:
+
+        vad_neg = all([value > self.threshold for value in self.vad_history])
+
+    If a future moshi-rag changes that expression, ttfat_s silently anchors on
+    the wrong condition — the signal would be ttfat_s going None or absurd on
+    every turn while server.log still shows normal "LM buffer empty" runs.
+    """
+    history = turn_manager.vad_history
+    if len(history) < turn_manager.window_size:
+        return False
+    return all(value > turn_manager.threshold for value in history)
+
+
 def _patch_turn_manager(session: SessionLog) -> None:
     from moshi.inference_utils.turn_manager import TurnManager
 
@@ -746,6 +1131,13 @@ def _patch_turn_manager(session: SessionLog) -> None:
 
     def patched(self):
         was_user = self.active_speaker == "user"
+        # ttfat_s's clock start. Sampled before calling through, so the verdict
+        # is the one this evaluation is about to act on — see
+        # _ChannelState.on_user_turn_vad for why the *last* stop wins.
+        if was_user:
+            state = session.state_for_turn_manager(self)
+            if state is not None:
+                state.on_user_turn_vad(_vad_says_user_stopped(self))
         new_speaker = original(self)
         # Check the *return value*, not self._pending_speaker after the
         # fact: _handle_pending_speaker_switch() (called inside the
@@ -766,6 +1158,14 @@ def _patch_turn_manager(session: SessionLog) -> None:
     def patched_handle_spoken_text(self, model_text=None, user_text=None):
         state = session.state_for_turn_manager(self)
         if state is not None:
+            # user_text is None <=> this call came from Channel._output_loop,
+            # i.e. exactly one model step (it passes model_text only, possibly
+            # None for a pad token). Channel._stt_recv_loop is the only other
+            # caller and always passes user_text. That distinction is what
+            # makes pad_stall_steps a true step count rather than a mix of
+            # steps and STT words.
+            if user_text is None and self.active_speaker == "user":
+                state.on_awaiting_turn_step()
             if user_text is not None:
                 state.on_user_text(user_text)
             if model_text is not None:
@@ -958,6 +1358,10 @@ def apply_patches(
     _patch_load_models_generation_overrides(temp_text=temp_text, top_k_text=top_k_text)
     _patch_event_loop_diagnostics()
     _patch_server_state(session, checkpoint, retrieval_backend_display)
+    # Order matters: queue diagnostics must be the *inner* run_one_step
+    # wrapper so its work_ms excludes any pacing sleep applied on top. See
+    # _patch_step_queue_diagnostics()'s docstring.
+    _patch_step_queue_diagnostics(session)
     _patch_server_state_step_pacing()
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_channel_conditioning()

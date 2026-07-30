@@ -232,6 +232,23 @@ evals start `init_active_speaker="user"` (immediately feeding a question)
 while the demo starts `init_active_speaker="model"` (model greets first).
 Both stay hardcoded/CLI-only per path, same as today.
 
+**Correction (2026-07-30) to the `batch_size` half of that rationale.** The
+CLI-only/path-specific *decision* stands and is unchanged — `run_demo.sh`
+still sets `--batch-size` itself rather than deriving it from the shared
+config block. What was wrong is the stated reason for leaving the demo at
+moshi's default of `16`: "the demo needs headroom for concurrent live
+sessions" treats unused slots as free. They are not.
+`BatchRunner.run_step()` computes the **full batch tensor every step** —
+`exec_mask` gates state updates, not compute — so a single-user demo at
+`batch_size=16` pays roughly 16× the necessary per-step work against a hard
+80 ms real-time budget (1/12.5 Hz), which is the one budget the live path
+cannot overrun. Measured step times bear this out (`batched step (1/16
+active) took 81.8–89.9ms`). `run_demo.sh` now defaults `--batch-size 1`,
+matching the eval path, with the flag still available for genuine
+concurrent-user testing. Original intent recorded above rather than
+overwritten, per this repo's convention for spec corrections; see
+`docs/demo-turn-onset-regression.md` §4.6 for the measurements.
+
 `tail_silence_steps` has no demo equivalent — it's `respond()`'s own
 silence-based turn-termination mechanism (see CLAUDE.md's `_TAIL_SILENCE_STEPS`
 notes), not something `moshi.server`'s live, continuous session model needs.

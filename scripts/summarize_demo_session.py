@@ -354,16 +354,24 @@ def print_console_report(session_start: dict, turns: list[dict], raw_events: lis
     # space of separation from the ttfat column instead of butting right up
     # against it. Ragged alignment on those rare rows is an accepted
     # tradeoff; a completely missing separator isn't.
-    print(f"  {'#':<4}{'time':<10}{'question':<44}{'<ret>':<7}{'ret.total':<10} {'ttfat':<8}{'e2ekd'}")
+    # "pad" is pad_stall_steps — consecutive model steps spent emitting <pad>
+    # after VAD concluded the user stopped, i.e. the pad stall in steps rather
+    # than seconds (x80ms for wall time). Sits next to ttfat because it is the
+    # same delay in different units, and because a large ttfat with a small pad
+    # count would mean something other than the stall is responsible. Absent
+    # (shown "—") in sessions logged before 2026-07-30.
+    print(f"  {'#':<4}{'time':<10}{'question':<44}{'<ret>':<7}{'ret.total':<10} {'ttfat':<8}{'pad':<6}{'e2ekd'}")
     for turn in turns:
         question = turn.get("user_question_text") or ""
         if len(question) > 42:
             question = question[:39] + "..."
         retrievals = turn.get("retrievals", [])
+        pad = turn.get("pad_stall_steps")
         print(
             f"  {turn['turn_index']:<4}{_fmt_time(turn['timestamp']):<10}{question:<44}"
             f"{_fmt_ret_flag(retrievals):<7}{_fmt_ret_total(retrievals):<10} "
-            f"{_fmt_s(turn.get('ttfat_s')):<8}{_fmt_s(turn.get('e2ekd_s'))}"
+            f"{_fmt_s(turn.get('ttfat_s')):<8}{('—' if pad is None else str(pad)):<6}"
+            f"{_fmt_s(turn.get('e2ekd_s'))}"
         )
     print()
     print(SEP)
@@ -403,6 +411,21 @@ def print_console_report(session_start: dict, turns: list[dict], raw_events: lis
         print(f"  {'ttfat':<30} mean {mean:.2f}s   p95 {p95:.2f}s   (n={len(ttfats)})")
     else:
         print(f"  {'ttfat':<30} n/a — no turns completed")
+
+    # ttfat_s was anchored to the turn switch (i.e. after the pad stall had
+    # already ended) before 2026-07-30, so it read ~0.1-0.3s regardless of the
+    # real wait. Sessions from before then carry no pad_stall_steps at all,
+    # which is the signal that their ttfat numbers are not comparable to
+    # later ones — see docs/demo-turn-onset-regression.md §6.1.
+    pads = [t["pad_stall_steps"] for t in turns if t.get("pad_stall_steps") is not None]
+    if pads:
+        mean, p95 = _mean_p95(pads)
+        print(
+            f"  {'pad stall (steps)':<30} mean {mean:.0f}   p95 {p95:.0f}   "
+            f"(n={len(pads)}, x80ms = {mean * 0.08:.1f}s mean)"
+        )
+    elif turns:
+        print(f"  {'pad stall (steps)':<30} n/a — session predates pad_stall_steps (2026-07-30)")
 
     print('  ⚠ e2ekd not yet implemented — evals/registry/latency/e2ekd.py doesn\'t')
     print('    exist yet; this column stays "—" until that eval lands and the demo')

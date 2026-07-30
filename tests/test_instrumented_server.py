@@ -33,7 +33,30 @@ from scripts.instrumented_server import (
     _build_retrieval_backend_for_demo,
     _patch_rag_manager_get_reference_text,
     _push_instrumentation,
+    _slot_backlog_rows,
+    _step_pacing_enabled,
 )
+
+
+class _Clock:
+    """Deterministic stand-in for time.perf_counter, so latency assertions are
+    exact rather than sleep-based."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    c = _Clock()
+    monkeypatch.setattr("time.perf_counter", c)
+    return c
 
 
 class _FakeSession:
@@ -385,38 +408,36 @@ def test_retrieval_complete_with_no_pending_turn_still_logs():
     asyncio.run(run())
 
 
-def test_first_audio_records_ttfat_once_only():
+def test_first_audio_records_turn_switch_metric_once_only():
     async def run():
         session = _FakeSession()
         state = _ChannelState(session, _fake_channel())
 
         state.on_utterance_end()
         state.on_first_audio()
-        first_value = state._pending["ttfat_s"]
+        first_value = state._pending["turn_switch_to_first_token_s"]
         assert first_value is not None
 
         state.on_first_audio()  # a later frame in the same turn
-        assert state._pending["ttfat_s"] == first_value  # unchanged, not overwritten
+        assert state._pending["turn_switch_to_first_token_s"] == first_value  # not overwritten
 
     asyncio.run(run())
 
 
 def test_model_text_triggers_first_audio_automatically():
-    """The real fix (found validating latency.ttfat on the batch path, then
-    applied here by analogy): ttfat_s's first-audio signal now comes from
-    the first genuine (non-pad) model text token via on_model_text, not a
-    separate pcm-presence check — see the module docstring's
-    TurnManager.handle_spoken_text bullet for why."""
+    """The first-audio signal comes from the first genuine (non-pad) model
+    text token via on_model_text, not a separate pcm-presence check — see the
+    module docstring's TurnManager.handle_spoken_text bullet for why."""
     async def run():
         session = _FakeSession()
         state = _ChannelState(session, _fake_channel())
 
         state.on_utterance_end()
-        assert state._pending["ttfat_s"] is None
+        assert state._pending["turn_switch_to_first_token_s"] is None
 
         state.on_model_text("Paris.")
 
-        assert state._pending["ttfat_s"] is not None
+        assert state._pending["turn_switch_to_first_token_s"] is not None
         assert any(ev["event"] == "first_audio" for ev in session.raw_written)
 
     asyncio.run(run())
@@ -428,6 +449,170 @@ def test_first_audio_before_any_turn_is_a_no_op():
         state = _ChannelState(session, _fake_channel())
 
         state.on_first_audio()  # no pending turn — must not raise
+
+    asyncio.run(run())
+
+
+# ── _ChannelState: ttfat_s anchoring (docs/demo-turn-onset-regression.md §6.1)
+
+
+def test_ttfat_measures_from_vad_stop_to_first_model_token(clock):
+    """The whole point of the 2026-07-30 fix: ttfat_s spans the pad stall."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)          # VAD: user stopped
+        clock.advance(4.0)                    # 50 steps of <pad>
+        state.on_model_text("Sure")           # first genuine token
+        clock.advance(0.5)                    # stt_wait_steps hold
+        state.on_utterance_end()              # turn actually switches
+
+        assert state._pending["ttfat_s"] == 4.0
+
+    asyncio.run(run())
+
+
+def test_ttfat_does_not_use_the_turn_switch_as_its_anchor(clock):
+    """Regression guard for the exact bug this replaced: anchoring on the turn
+    switch reported ~0.16s on turns where the human waited seconds. Both
+    metrics are kept, and they must not be the same number."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)
+        clock.advance(6.0)
+        state.on_model_text("Sure")
+        clock.advance(0.5)
+        state.on_utterance_end()
+        clock.advance(0.16)
+        state.on_model_text("it")             # first token after the switch
+        state.on_first_audio()
+
+        assert state._pending["ttfat_s"] == 6.0
+        assert state._pending["turn_switch_to_first_token_s"] == 0.16
+
+    asyncio.run(run())
+
+
+def test_ttfat_anchors_on_the_last_vad_stop_not_the_first(clock):
+    """A mid-question pause produces an earlier false->true transition.
+    Anchoring there would bill the user's own pause as response latency."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)          # pause mid-question
+        clock.advance(1.5)
+        state.on_user_turn_vad(False)         # user resumes speaking
+        clock.advance(2.0)
+        state.on_user_turn_vad(True)          # real end of utterance
+        clock.advance(3.0)
+        state.on_model_text("Sure")
+        state.on_utterance_end()
+
+        assert state._pending["ttfat_s"] == 3.0
+
+    asyncio.run(run())
+
+
+def test_ttfat_repeated_stopped_verdicts_do_not_re_arm_the_clock(clock):
+    """on_user_turn_vad fires every step, not just on transitions — only the
+    false->true edge may move the anchor, or ttfat_s would always read ~0."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)
+        for _ in range(50):
+            clock.advance(0.08)
+            state.on_user_turn_vad(True)
+        state.on_model_text("Sure")
+        state.on_utterance_end()
+
+        assert state._pending["ttfat_s"] == 4.0
+
+    asyncio.run(run())
+
+
+def test_ttfat_is_none_when_vad_never_reported_a_stop(clock):
+    """First turn of an --init-active-speaker model session: the model greets
+    before any user utterance exists, so there is no anchor to measure from.
+    None, not a fabricated zero."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_utterance_end()
+
+        assert state._pending["ttfat_s"] is None
+        assert state._pending["pad_stall_steps"] is None
+
+    asyncio.run(run())
+
+
+def test_ttfat_is_zero_when_model_spoke_before_the_user_stopped(clock):
+    """Barge-in / backchannel carried into the turn switch: TTFAT is
+    zero-or-negative, and the paper reports exactly 0.0 for this model."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_model_text("Mm-hm")          # model speaks while user active
+        state.on_user_turn_vad(True)
+        clock.advance(0.4)
+        state.on_utterance_end()
+
+        assert state._pending["ttfat_s"] == 0.0
+
+    asyncio.run(run())
+
+
+def test_pad_stall_steps_counts_only_steps_while_awaiting_the_turn(clock):
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_awaiting_turn_step()         # before any stop verdict — ignored
+        state.on_user_turn_vad(True)
+        for _ in range(37):
+            state.on_awaiting_turn_step()
+        state.on_model_text("Sure")
+        state.on_utterance_end()
+
+        assert state._pending["pad_stall_steps"] == 37
+
+    asyncio.run(run())
+
+
+def test_pad_stall_steps_resets_when_the_user_resumes_speaking(clock):
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)
+        for _ in range(10):
+            state.on_awaiting_turn_step()
+        state.on_user_turn_vad(False)         # user resumes
+        state.on_user_turn_vad(True)          # stops again
+        for _ in range(4):
+            state.on_awaiting_turn_step()
+        state.on_model_text("Sure")
+        state.on_utterance_end()
+
+        assert state._pending["pad_stall_steps"] == 4
+
+    asyncio.run(run())
+
+
+def test_ttfat_anchors_are_cleared_between_turns(clock):
+    """Turn N's anchors must not leak into turn N+1 — otherwise the second
+    turn's ttfat_s would be measured from the first turn's stop."""
+    async def run():
+        state = _ChannelState(_FakeSession(), _fake_channel())
+
+        state.on_user_turn_vad(True)
+        clock.advance(3.0)
+        state.on_model_text("Sure")
+        state.on_utterance_end()
+
+        clock.advance(20.0)                   # model speaks, user listens
+        state.on_utterance_end()              # next switch, no VAD stop recorded
+
+        assert state._pending["ttfat_s"] is None
 
     asyncio.run(run())
 
@@ -750,3 +935,145 @@ def test_generation_overrides_for_demo_reads_config_overrides(tmp_path, monkeypa
     temp_text, top_k_text = _generation_overrides_for_demo()
 
     assert (temp_text, top_k_text) == (0.9, 50)
+
+
+# ── _step_pacing_enabled (docs/demo-turn-onset-regression.md §4.3) ───────────
+
+
+def test_step_pacing_is_disabled_by_default(monkeypatch):
+    """Default flipped 2026-07-30. This patch is a one-way latch on
+    Channel.input_queue: harmless while the queue is empty, permanently
+    freezing any backlog once one exists. It must stay opt-in."""
+    monkeypatch.delenv("DEMO_STEP_PACING", raising=False)
+
+    assert _step_pacing_enabled() is False
+
+
+def test_step_pacing_enabled_only_by_explicit_1(monkeypatch):
+    monkeypatch.setenv("DEMO_STEP_PACING", "1")
+    assert _step_pacing_enabled() is True
+
+    for value in ("0", "", "true", "yes", "2"):
+        monkeypatch.setenv("DEMO_STEP_PACING", value)
+        assert _step_pacing_enabled() is False, value
+
+
+# ── _slot_backlog_rows (docs/demo-turn-onset-regression.md §8) ───────────────
+
+
+class _FakeQueue:
+    def __init__(self, size):
+        self._size = size
+
+    def qsize(self):
+        return self._size
+
+
+class _FakeSlotChannel:
+    def __init__(self, qsize, sent_samples=None):
+        self.input_queue = _FakeQueue(qsize)
+        if sent_samples is not None:
+            self.stt = MagicMock()
+            self.stt.sent_samples = sent_samples
+        else:
+            self.stt = object()  # e.g. GradiumSpeechToText: no sent_samples
+
+
+class _FakeServer:
+    def __init__(self, slots, frame_size=1920):
+        self.slots = slots
+        self.frame_size = frame_size
+
+
+def test_slot_backlog_rows_reports_lag_frames():
+    """lag_frames is the headline number: frames the live _recv_loop has seen
+    minus frames the step loop has actually stepped for. x80ms = how far behind
+    live audio the front-end model's perception is."""
+    channel = _FakeSlotChannel(qsize=48, sent_samples=1920 * 100)
+    server = _FakeServer([None, channel])
+
+    rows = _slot_backlog_rows(server, {id(channel): 52})
+
+    assert rows == [
+        {
+            "slot": 1,
+            "qsize": 48,
+            "frames_received": 100,
+            "frames_consumed": 52,
+            "lag_frames": 48,
+        }
+    ]
+
+
+def test_slot_backlog_rows_skips_empty_slots():
+    channel = _FakeSlotChannel(qsize=0, sent_samples=0)
+    server = _FakeServer([None, None, channel, None])
+
+    rows = _slot_backlog_rows(server, {})
+
+    assert [r["slot"] for r in rows] == [2]
+
+
+def test_slot_backlog_rows_tolerates_stt_without_sent_samples():
+    """--gradium-stt has no sent_samples counter. qsize must still be reported
+    rather than the whole record being dropped."""
+    channel = _FakeSlotChannel(qsize=7)
+    server = _FakeServer([channel])
+
+    rows = _slot_backlog_rows(server, {id(channel): 3})
+
+    assert rows[0]["qsize"] == 7
+    assert rows[0]["frames_received"] is None
+    assert rows[0]["lag_frames"] is None
+    assert rows[0]["frames_consumed"] == 3
+
+
+def test_slot_backlog_rows_unseen_channel_counts_as_zero_consumed():
+    channel = _FakeSlotChannel(qsize=2, sent_samples=1920 * 5)
+    server = _FakeServer([channel])
+
+    rows = _slot_backlog_rows(server, {})
+
+    assert rows[0]["frames_consumed"] == 0
+    assert rows[0]["lag_frames"] == 5
+
+
+def test_slot_backlog_rows_on_a_server_with_no_slots_yet():
+    rows = _slot_backlog_rows(_FakeServer([]), {})
+    assert rows == []
+
+
+# ── SessionLog.write_step_diag ───────────────────────────────────────────────
+
+
+def test_write_step_diag_creates_the_file_lazily(tmp_path):
+    session = SessionLog(tmp_path)
+
+    assert not (tmp_path / "step_diag.jsonl").exists()
+
+    session.write_step_diag(step=12, work_ms=61.4, mean_period_ms=80.2, slots=[], text_tokens=[3, 3, 4])
+
+    record = json.loads((tmp_path / "step_diag.jsonl").read_text().strip())
+    assert record["step"] == 12
+    assert record["work_ms"] == 61.4
+    assert record["text_tokens"] == [3, 3, 4]
+    assert "t_rel_s" in record
+
+
+def test_write_step_diag_appends_one_line_per_call(tmp_path):
+    session = SessionLog(tmp_path)
+
+    session.write_step_diag(step=12, slots=[])
+    session.write_step_diag(step=24, slots=[])
+
+    lines = (tmp_path / "step_diag.jsonl").read_text().strip().split("\n")
+    assert [json.loads(line)["step"] for line in lines] == [12, 24]
+
+
+def test_write_step_diag_does_not_pollute_turns_or_raw_events(tmp_path):
+    session = SessionLog(tmp_path)
+
+    session.write_step_diag(step=12, slots=[])
+
+    assert (tmp_path / "turns.jsonl").read_text() == ""
+    assert (tmp_path / "raw_events.jsonl").read_text() == ""

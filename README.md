@@ -15,10 +15,13 @@ Full requirements/spec: [`specs/moshirag-evals-requirements.md`](specs/moshirag-
 | `scripts/` | VM setup, demo launch, diagnostic tooling |
 | `tests/` | Unit tests (no GPU required) |
 | `specs/` | Authoritative requirements doc |
+| `docs/` | Standalone investigation reports and work plans, referenced from `CLAUDE.md` |
 
 ## Status
 
-Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
+Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM.
+
+**Current thread:** the demo's long turn-onset delay ("pad stall") was re-analysed from scratch on 2026-07-30 and traced to a regression this repo introduced, not model behaviour — see [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) for the evidence and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md) for the sequenced fix. One decisive VM measurement is still outstanding before any code changes. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
 
 ## Requirements & setup
 

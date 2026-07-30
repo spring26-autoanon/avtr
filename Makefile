@@ -53,4 +53,17 @@ smoke:
 demo:
 	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && bash scripts/run_demo.sh"
 
-.PHONY: sync install ssh remote smoke demo
+# Pull demo session artifacts back from the VM (server.log, turns.jsonl,
+# raw_events.jsonl, step_diag.jsonl, conditioner.log). `demo/sessions` is
+# excluded from `sync`'s outbound rsync because the VM is its only writer —
+# this is the one-way pull that closes that loop. Client-side captures
+# (the "Save audio" .webm and client_audio.json) never reach the VM at all:
+# copy those in by hand from the browser machine's downloads folder.
+pull-sessions:
+	rsync -avz $(SSH_ALIAS):$(REMOTE_DIR)/demo/sessions/ "$(LOCAL_DIR)/demo/sessions/"
+
+# Pull eval results back (see CLAUDE.md's "Code change workflow").
+pull-results:
+	rsync -avz $(SSH_ALIAS):$(REMOTE_DIR)/evals/results/ "$(LOCAL_DIR)/evals/results/"
+
+.PHONY: sync install ssh remote smoke demo pull-sessions pull-results

@@ -546,6 +546,32 @@ def _stt_off_thread_enabled() -> bool:
     threads, fixed via 2nd-physical-GPU device separation + a thread-local
     flag).
 
+    **DEPRECATED (2026-07-30), pending deletion in a separate commit.** The
+    problem this chain was built to solve — `Channel._recv_loop()`'s
+    synchronous per-frame STT compute letting a real audio backlog queue up
+    at the transport layer — is now believed to have been dominated by, and
+    largely an artifact of, `scripts/instrumented_server.py`'s
+    `_patch_server_state_step_pacing()`, which removed the step loop's only
+    backlog-drain capacity. With pacing default-off and `--batch-size 1`
+    restoring real headroom (see docs/demo-turn-onset-regression.md §4.3 and
+    §4.6), synchronous STT has room to keep up and this chain has no
+    remaining justification: it carries a 5-patch monkeypatch surface, a
+    second-physical-GPU requirement (`core/gpu.py`'s
+    `ensure_cuda_visible_devices("frontend")` returning "0,1" exists only
+    for it), and a suspected dropped-user-utterance bug — all to mitigate a
+    self-inflicted starvation.
+
+    Kept dormant rather than deleted in this pass deliberately: a deletion
+    that large does not belong in the same commit as a latency fix, because
+    if the demo regresses for an unrelated reason a single-purpose commit is
+    what keeps it bisectable. Delete once the VM A/B in
+    docs/demo-turn-onset-fix-plan.md confirms the onset fix, along with
+    `_patch_local_stt_off_thread`, `_patch_compiled_functions_thread_safe`,
+    `_patch_cuda_graph_thread_local`, `_patch_stt_no_cuda_graph`,
+    `_patch_stt_second_gpu`, `_warm_up_stt_exec_mask`,
+    `_COMPILED_FUNCTIONS_LOCK`, and the dual-GPU path in `core/gpu.py`.
+    Do not build anything new on top of this chain in the meantime.
+
     Added for A/B testing after independently confirming (see the
     project_stt_cuda_graph_thread_safety memory / CLAUDE.md's "STT/front-
     end CUDA-graph cross-thread crash" section) that the eval path never
