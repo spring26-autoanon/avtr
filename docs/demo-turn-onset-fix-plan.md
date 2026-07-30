@@ -31,10 +31,13 @@ now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend wit
 
 **Open, in priority order:**
 
-1. **D10 — the metallic artifact at each utterance onset.** Open, one fix attempted and
-   reverted, root cause undiagnosed. Start by adding the `sampleRate` / `frame.length`
-   diagnostic, *then* test a hypothesis. Read the "Read on this" subsection before doing
-   anything. Pre-existing and independent of the latency work.
+1. **D10 — the metallic artifact at each utterance onset.** Open, narrowed to a
+   **server-side** question after cycle 2. The client side is now fully explained and the
+   sample-rate hypothesis is refuted; crucially, buffer tuning is *proven* unable to fix it
+   (frequency × size is invariant — see the table in cycle 2). Next step: instrument frames
+   *sent* in `Channel._output_loop` and compare against `step_diag.jsonl`'s step count. Do
+   **not** touch `audio-processor.ts` again without new evidence; two attempts have been
+   reverted. Pre-existing and independent of the latency work.
 2. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
    that prompted the escalation came from three sessions that unknowingly ran the weaker
    `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
@@ -486,7 +489,7 @@ Downstream of that deletion, when it happens: `core/gpu.py`'s
 | D7 | Report the `--power-threshold` default gap upstream | `moshi.server` defaults `None`; `run_inference.py` and the paper's training both use `-65` |
 | D8 | `power_threshold=-65` zeroes ~14% of 80 ms frames *inside* real user speech | Measure only for now. A higher or hysteretic gate may suit live microphone input better than the value tuned for TTS training audio |
 | D9 | `demo/client` reports 22 npm vulnerabilities (5 moderate, 16 high, 1 critical) | Parked 2026-07-30, assessed non-blocking — see below. **Do not run `npm audit fix --force`** before the VM trip |
-| D10 | **Metallic artifact at every model-utterance onset** — client discards 80–117 ms of audio every ~130 ms after each turn onset | **OPEN.** One fix attempted and reverted (raising the drop threshold: no effect, 56→55 drops). Root cause is a ~2–3× duration-accounting discrepancy between server and client, undiagnosed — see below for the one measurement that would settle it |
+| D10 | **Metallic artifact at every model-utterance onset** — client discards ~600 ms of audio per second of playback | **OPEN, but narrowed to a server-side question.** Client mechanism fully explained (80 ms frames, 48 kHz context, zero-headroom drop threshold); sample-rate hypothesis refuted; **buffer tuning proven unable to fix it** — the loss rate is set by an unexplained ~1.6–1.8× arrival-vs-playback imbalance. Next step is instrumenting frames *sent*, not the client. See cycle 2 below |
 
 ### D10 — metallic artifact at each utterance onset (fix implemented, needs a listen)
 
@@ -554,7 +557,79 @@ on D10: log the AudioContext's actual `sampleRate` and each decoded
 `frame.length` in `audio-processor.ts`'s `onmessage`, once per session. **Not
 yet added** — deliberately parked, see "Read on this" below.
 
-#### Read on this (2026-07-30) — reasoning only, not a finding
+#### Cycle 2 (2026-07-30, later) — hypothesis refuted, mechanism found, and buffer tuning ruled out
+
+No new session needed. Everything below is derived from the committed client code
+plus the existing `2026-07-30T20-31-09Z` artifacts. The "Read on this" section
+that follows is left in place as the reasoning trail; **its leading hypothesis
+is now refuted.**
+
+**1. There is no unit mismatch.** `useServerAudio.ts` initialises the decoder
+with `decoderSampleRate: 24000` and
+`outputBufferSampleRate: audioContext.sampleRate`, and `bufferLength: 960 *
+sampleRate / 24000`. The decoder resamples Mimi's 24 kHz to the AudioContext
+rate before the worklet ever sees a frame, so `asSamples()`/`currentSamples()`
+are in consistent units. The whole sample-rate story below is wrong.
+
+**2. Frames are exactly 80 ms and the AudioContext is 48 kHz** — established
+from the data rather than logged. Of the 15 distinct `droppedMs` values in that
+session, 11 fit `80 ms + k × 2.667 ms` to within float-print rounding (±0.033),
+where 2.667 ms is 128 samples at 48 kHz, the AudioWorklet render quantum. The
+80 ms constant term is one arriving frame; the quantised remainder is playback
+progress between the arrival and the drop check. (The 4 outliers, off by
+0.6–1.3 ms, are presumably occasional non-80 ms arrivals.) **This is the
+measurement the previous cycle said it needed — it was already in the artifacts.**
+
+**3. Why cycle 1's fix did nothing — a boundary condition.** Upstream's
+threshold is `maxBuffer(10) + partial(10) + initial(80)` = 100 ms and its trim
+target is `initial + partial` = 90 ms. Target + one frame = 170 ms, so any frame
+arriving while the buffer sits at target overshoots the threshold and the drop
+discards a **full 80 ms of speech**. Setting `maxBufferSamples` to 80 ms makes
+the threshold 170 ms — *exactly* target + frameSize, still on the boundary,
+still fires. Hence 56 → 55. The ratchet cannot escape it either: its own ceiling
+was that same 170 ms.
+
+**4. And buffer tuning cannot fix this at all.** This is the finding that
+matters, and it stopped a third attempt from shipping. In steady state the
+volume of audio discarded per second is fixed by the arrival-versus-playback
+rate imbalance, not by any buffer parameter — the parameters only trade glitch
+*frequency* against glitch *size*:
+
+| threshold / target | discard per event | events/s | total discarded |
+|---|---|---|---|
+| 100 / 90 (upstream) | 90 ms | 6.7 | 600 ms/s |
+| 170 / 90 (cycle 1) | 80 ms | 7.5 | 600 ms/s |
+| 250 / 170 (cycle 2 draft) | 80 ms | 7.5 | 600 ms/s |
+| 400 / 90 | 310 ms | 1.9 | 600 ms/s |
+
+Frequency × size is invariant. A deeper buffer gives fewer, longer dropouts,
+which may well sound *worse*. A cycle-2 change along these lines was written and
+then reverted unshipped on this arithmetic.
+
+**5. So the real question moved upstream, and is now server-side.** The loss
+rate is set by the imbalance itself: over the greeting the client accounted for
+~1.8× real time of arriving audio while the server's step loop reported 1.0×
+(`lag_frames` = 1, `mean_period_ms` ≈ 80, `work_ms` = 33 ms) and client playback
+measured exactly 1.000×. Those cannot all hold. Something is putting ~1.6–1.8×
+real-time audio onto the socket despite the step loop running at real time.
+
+**Next cycle should start there, not in the client.** The cheap measurement is a
+count of frames *sent* — instrument `Channel._output_loop`'s
+`opus_writer.append_pcm` / `ws.send_bytes` path to record, per session, how many
+frames and how many bytes of audio were emitted, then compare against
+`step_diag.jsonl`'s step count. If sent-frames ≈ steps, the excess is being
+introduced between the server socket and the worklet (`sphn`'s Opus framing, or
+the decoder emitting more than one buffer per packet) and the next place to look
+is `onWorkerMessage`. If sent-frames > steps, the server is genuinely emitting
+more audio than it steps, and that is a `_output_loop` bug.
+
+Two things worth noting for whoever picks this up: the artifact is pre-existing,
+present in every session ever recorded, and completely independent of the
+(closed) latency work; and the loss may still turn out to be inaudible silence
+frames rather than speech, which remains unestablished and would change the
+priority entirely.
+
+#### Read on this (2026-07-30) — reasoning only, not a finding — REFUTED, see cycle 2 above
 
 Recorded so the next session starts from the argument rather than re-deriving
 it. Everything here is inference from the numbers above; none of it is
