@@ -289,7 +289,11 @@ SERVER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$FRONTEND_CUDA_VISIBLE_DEVICES DEMO
 #
 # Only vars actually set in the invoking shell are forwarded, so unset means
 # "use the code's own default" rather than an empty string overriding it.
-for _var in DEMO_QUEUE_DIAG DEMO_QUEUE_DIAG_EVERY DEMO_STEP_PACING STT_OFF_THREAD \
+# STT_OFF_THREAD is deliberately absent: the off-thread STT / Option E chain
+# it gated was deleted 2026-07-30 (see core/model_interface.py's
+# _load_models() comment). Setting it now has no effect, and forwarding a
+# dead variable would imply otherwise.
+for _var in DEMO_QUEUE_DIAG DEMO_QUEUE_DIAG_EVERY DEMO_STEP_PACING \
             DEMO_ASYNCIO_DEBUG DEMO_ASYNCIO_DEBUG_THRESHOLD_S; do
     if [[ -n "${!_var:-}" ]]; then
         SERVER_CMD="$_var=${!_var} $SERVER_CMD"

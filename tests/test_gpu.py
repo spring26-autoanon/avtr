@@ -85,17 +85,19 @@ def test_resolve_devices_zero_gpus_is_contended():
 
 def test_resolve_devices_two_gpus_splits_and_is_not_contended():
     a = resolve_devices(count=2)
-    # "0,1", not just "0" -- lets the front-end process pin its own
-    # in-process STT model duplicate to physical GPU 1 internally. See
-    # resolve_devices()'s own docstring.
-    assert a.frontend_cuda_visible_devices == "0,1"
+    # Front-end stays pinned to physical GPU 0 alone. This asserted "0,1"
+    # until 2026-07-30, when the deleted Option E chain (which pinned the
+    # front-end process's own in-process STT model duplicate to GPU 1) was
+    # the only reason to widen its visibility -- see resolve_devices()'s
+    # own docstring for why that reasoning is recorded rather than dropped.
+    assert a.frontend_cuda_visible_devices == "0"
     assert a.conditioner_cuda_visible_devices == "1"
     assert a.contended is False
 
 
 def test_resolve_devices_more_than_two_gpus_still_uses_first_two():
     a = resolve_devices(count=4)
-    assert a.frontend_cuda_visible_devices == "0,1"
+    assert a.frontend_cuda_visible_devices == "0"
     assert a.conditioner_cuda_visible_devices == "1"
     assert a.contended is False
 
@@ -112,10 +114,10 @@ def test_resolve_devices_defaults_to_real_device_count(monkeypatch):
 def test_ensure_cuda_visible_devices_sets_frontend_when_unset(monkeypatch):
     monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
     assignment = ensure_cuda_visible_devices("frontend", count=2)
-    assert assignment.frontend_cuda_visible_devices == "0,1"
+    assert assignment.frontend_cuda_visible_devices == "0"
     import os
 
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0,1"
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
 
 
 def test_ensure_cuda_visible_devices_sets_conditioner_when_unset(monkeypatch):

@@ -57,6 +57,16 @@ Co-authored-by: Claude <claude@anthropic.com>
 
 ## Remote instances
 
+**Current state (2026-07-30): use single-GPU `wb-gpu-a1ultra` for
+everything, demo and evals alike. `wb-gpu-a1ultra2g` has no remaining
+justification and should stay stopped.** Both reasons it ever existed have
+now been disproved — the second one as of this date, when the Option E
+chain that depended on it was deleted (see the "STT/front-end CUDA-graph
+cross-thread crash" section below, and `docs/demo-turn-onset-regression.md`).
+`core/gpu.py` no longer exposes a second GPU to the front-end process at
+all. Everything below this paragraph is the history of how that
+two-instance setup came about; nothing in it is a live instruction.
+
 Two GCP Vertex AI VMs, same project and zone. See specs/
 moshirag-evals-requirements.md's "GPU Sizing and Multi-GPU Deployment"
 section for the full history of why both exist — it's had two, unrelated
@@ -69,7 +79,8 @@ reasons at two different times, not one continuous story:
   starvation, unrelated to GPU topology. `wb-gpu-a1ultra2g` was stopped
   (not deleted) once this was confirmed, and single-GPU `wb-gpu-a1ultra`
   was declared sufficient for all further work.
-- **Current reason (active as of this writing)**: a completely separate
+- **Current reason (SUPERSEDED 2026-07-30 — the code this depended on is
+  deleted; `wb-gpu-a1ultra2g` is no longer needed for anything)**: a completely separate
   investigation — STT's own in-process model duplicate sharing a CUDA
   context/stream with the front-end's main model via `asyncio.to_thread`
   — found a real, independent reason dual-GPU matters again: moshi-rag's
@@ -917,6 +928,47 @@ actually finishes, which doesn't fit the current single synchronous
 reporting point in `_background_task`. Left alone for now; the eval
 path's own `context_injection_s` (via `latency.retrieval_breakdown`) is
 unaffected by this and already reports the real value correctly.
+
+### DELETED (2026-07-30): STT/front-end CUDA-graph cross-thread crash and the Option E fix
+
+**The code this entire section documents no longer exists.** Removed in a
+single-purpose commit once the demo turn-onset fix was VM-validated — see
+`docs/demo-turn-onset-regression.md` and `docs/demo-turn-onset-fix-plan.md`'s
+C1.
+
+Why: every crash below was real, and Option E genuinely fixed them. But all
+three only ever became reachable *because* STT was moved off the event loop
+via `asyncio.to_thread`, and that move existed to mitigate an audio backlog
+in `Channel._recv_loop` which turned out to be an artifact of this repo's own
+step-pacing patch, not of synchronous STT. With pacing off, measured per-step
+work is 33ms against an 80ms budget, and a real 4-turn session held
+input-queue lag at 1 frame for 58 seconds straight with fully synchronous
+STT. So the hazard, the five patches guarding it, the second-GPU
+requirement, and the suspected dropped-user-utterance bug were all downstream
+of a self-inflicted problem.
+
+Deleted: `_run_stt_frames_sync`, `_patched_stt_send_audio`,
+`_stt_off_thread_enabled`, `_patch_local_stt_off_thread`,
+`_patch_compiled_functions_thread_safe`, `_patch_stt_no_cuda_graph`,
+`_patch_stt_second_gpu`, `_patch_cuda_graph_thread_local`,
+`_COMPILED_FUNCTIONS_LOCK`, `core/gpu.py`'s dual-GPU front-end visibility,
+and ~850 lines of their tests. The `STT_OFF_THREAD` env var is gone; setting
+it now does nothing.
+
+**Kept: `_warm_up_stt_exec_mask()`** — it is called unconditionally, so it
+was the only part of this chain that ever ran on the default path, and
+keeping it is what makes the deletion a true no-op on current behaviour. It
+survives purely as latency hygiene (pre-capturing `set_exec_mask`'s CUDA
+graph so the first timed frame of a turn pays a replay's cost, not a
+capture's), not as a correctness fix. See its own docstring.
+
+The investigation below is retained verbatim: the crashes were real, the
+diagnostic techniques (py-spy on a hung process, reading `CUDAGraphed`'s
+`_in_cuda_graph` global) are reusable, and if anything ever genuinely needs
+STT off-thread again this is the map of what it will hit. Recover the code
+from git history rather than rewriting it.
+
+#### Original section (historical)
 
 ### STT/front-end CUDA-graph cross-thread crash: three real crashes, root-caused to moshi-rag's own CUDA-graphing machinery not being thread-safe, fixed via physical GPU separation (Option E)
 

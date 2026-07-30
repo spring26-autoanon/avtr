@@ -373,6 +373,33 @@ way.
 
 ## Phase C — reduce the surface that never needed to exist (no VM required)
 
+### C1 — DONE (2026-07-30): STT-off-thread + Option E chain deleted
+
+Deleted in its own single-purpose commit, after session 3 validated the onset
+fix. Removed: `_run_stt_frames_sync`, `_patched_stt_send_audio`,
+`_stt_off_thread_enabled`, `_patch_local_stt_off_thread`,
+`_patch_compiled_functions_thread_safe`, `_patch_stt_no_cuda_graph`,
+`_patch_stt_second_gpu`, `_patch_cuda_graph_thread_local`,
+`_COMPILED_FUNCTIONS_LOCK`, `core/gpu.py`'s dual-GPU front-end visibility, the
+`STT_OFF_THREAD` env var and its forwarding, and ~850 lines of tests. Three
+now-unused imports (`functools`, `threading`, `contextlib.contextmanager`) and
+six orphaned test helpers went with them.
+
+**Kept deliberately: `_warm_up_stt_exec_mask()`.** It is called
+unconditionally — never gated by `STT_OFF_THREAD` — so it is the only part of
+the chain that ran on the default path, and keeping it is what makes this
+deletion a genuine no-op on current behaviour rather than a behaviour change
+smuggled into a cleanup. It survives on the latency argument alone
+(pre-capturing `set_exec_mask`'s CUDA graph so a turn's first timed frame pays
+a replay, not a capture); whether that still earns its keep single-threaded is
+a separate, measurable question noted in its docstring.
+
+`wb-gpu-a1ultra2g` now has no remaining justification and should stay stopped;
+CLAUDE.md's "Remote instances" section says so up front instead of instructing
+the reader to start it.
+
+#### Original plan (historical)
+
 ### C1 — Formally deprecate the STT-off-thread + Option E chain
 
 `_stt_off_thread_enabled()` already defaults to off (2026-07-29). By this repo's own

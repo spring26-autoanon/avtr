@@ -640,8 +640,8 @@ def _step_pacing_enabled() -> bool:
     Default **disabled** as of 2026-07-30 — see that function's docstring
     for why the patch's original premise was wrong, and
     docs/demo-turn-onset-regression.md for the evidence. Mirrors how
-    core/model_interface.py's _stt_off_thread_enabled() was flipped: the
-    variable stays, opt-in rather than opt-out.
+    the since-deleted STT_OFF_THREAD toggle was flipped: the variable
+    stays, opt-in rather than opt-out.
     """
     return os.environ.get("DEMO_STEP_PACING", "0") == "1"
 
@@ -1345,15 +1345,7 @@ def apply_patches(
     temp_text: float,
     top_k_text: int,
 ) -> None:
-    from core.model_interface import (
-        _patch_compiled_functions_thread_safe,
-        _patch_cuda_graph_thread_local,
-        _patch_load_models_generation_overrides,
-        _patch_local_stt_off_thread,
-        _patch_stt_no_cuda_graph,
-        _patch_stt_second_gpu,
-        _stt_off_thread_enabled,
-    )
+    from core.model_interface import _patch_load_models_generation_overrides
 
     _patch_load_models_generation_overrides(temp_text=temp_text, top_k_text=top_k_text)
     _patch_event_loop_diagnostics()
@@ -1365,27 +1357,11 @@ def apply_patches(
     _patch_server_state_step_pacing()
     _patch_channel(session, retrieval_backend, retrieval_backend_display)
     _patch_channel_conditioning()
-    # Whole chain gated by _stt_off_thread_enabled() (STT_OFF_THREAD env
-    # var) — see that function's docstring in core/model_interface.py for
-    # why this is now an A/B toggle rather than unconditional.
-    # print(), not logger.info(), for both branches -- see
-    # _patch_server_state_step_pacing()'s docstring: apply_patches() runs
-    # before moshi.server.main()'s own setup_logging() call, so
-    # logger.info() here would be silently swallowed the same way. Both
-    # states print explicitly (not just the disabled one) so an A/B run
-    # never has to infer the active mode from silence.
-    if _stt_off_thread_enabled():
-        print("[STT] STT_OFF_THREAD=1 -- Option E chain applied (off-thread STT, 2nd-GPU pinning if visible)", file=sys.stderr)
-        _patch_local_stt_off_thread()
-        _patch_compiled_functions_thread_safe()
-        _patch_cuda_graph_thread_local()
-        # Order matters: _patch_stt_second_gpu() wraps LocalSpeechToText.__init__
-        # again on top of _patch_stt_no_cuda_graph()'s own wrap, and must run
-        # after it — see both functions' own docstrings in core/model_interface.py.
-        _patch_stt_no_cuda_graph()
-        _patch_stt_second_gpu()
-    else:
-        print("[STT] STT_OFF_THREAD=0 (default) -- synchronous on-event-loop STT (Option E chain skipped)", file=sys.stderr)
+    # STT runs synchronously on the event loop, as upstream moshi-rag wrote
+    # it. The "Option E" chain that used to be applied here behind
+    # STT_OFF_THREAD was deleted 2026-07-30 — see core/model_interface.py's
+    # _load_models() comment and docs/demo-turn-onset-regression.md for why
+    # the backlog it mitigated was self-inflicted.
     _patch_rag_manager_trigger(session)
     _patch_turn_manager(session)
     _patch_rag_manager_background_task(session)

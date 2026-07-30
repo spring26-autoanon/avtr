@@ -12,16 +12,8 @@ from core.model_interface import (
     _TimedInferenceJob,
     _clean_model_text,
     _maybe_enable_eval_asyncio_debug,
-    _patch_compiled_functions_thread_safe,
-    _patch_cuda_graph_thread_local,
     _patch_load_models_generation_overrides,
-    _patch_local_stt_off_thread,
-    _patch_stt_no_cuda_graph,
-    _patch_stt_second_gpu,
-    _patched_stt_send_audio,
-    _run_stt_frames_sync,
     _silent_wav,
-    _stt_off_thread_enabled,
     _warm_up_stt_exec_mask,
 )
 from core.retrieval_backend import NullBackend
@@ -569,262 +561,32 @@ def _install_fake_torch(monkeypatch):
     return fake_torch
 
 
-class _FakeCodesTensor:
-    """Stand-in for the real torch.Tensor codes shape [:, :needed_tokens]
-    ends up as — real MagicMock auto-chaining doesn't satisfy
-    _run_stt_frames_sync's own `codes.shape[-1] == 1` assertion, since
-    comparing an auto-vivified MagicMock to 1 is never truthy."""
 
-    shape = (1, 1, 1)
 
-    def __getitem__(self, item):
-        return self
 
-    def to(self, device):
-        return self
 
 
-def _make_fake_stt(sample_rate=24000, frame_rate=12.5):
-    import numpy as np
 
-    stt = MagicMock()
-    stt._device = "cpu"
-    stt.mimi.sample_rate = sample_rate
-    stt.mimi.frame_rate = frame_rate
-    stt.mimi.encode.return_value = _FakeCodesTensor()
-    stt._lm_gen.needed_tokens = 1
-    stt._playhead_s = 0.0
-    stt._pending = np.zeros(0, dtype=np.float32)
-    stt._lock = asyncio.Lock()
-    stt._out_queue = asyncio.Queue()
-    stt.sent_samples = 0
-    return stt
 
 
-def test_run_stt_frames_sync_calls_run_codes_once_per_frame_and_updates_playhead(monkeypatch):
-    _install_fake_torch(monkeypatch)
-    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
-    stt._run_codes.side_effect = ["word-1", None, "word-3"]
-    frames = [object(), object(), object()]
 
-    words = _run_stt_frames_sync(stt, frames, fs=1920, sr=24000)
 
-    assert words == ["word-1", "word-3"]
-    assert stt._run_codes.call_count == 3
-    assert stt._playhead_s == pytest.approx(3 * 1920 / 24000)
 
 
-def test_run_stt_frames_sync_empty_frames_is_a_noop(monkeypatch):
-    _install_fake_torch(monkeypatch)
-    stt = _make_fake_stt()
 
-    words = _run_stt_frames_sync(stt, [], fs=1920, sr=24000)
 
-    assert words == []
-    stt._run_codes.assert_not_called()
-    assert stt._playhead_s == 0.0
 
 
-def test_patched_stt_send_audio_validates_input():
-    import numpy as np
 
-    stt = _make_fake_stt()
-    with pytest.raises(ValueError):
-        asyncio.run(_patched_stt_send_audio(stt, np.zeros((2, 2), dtype=np.float32)))
-    with pytest.raises(ValueError):
-        asyncio.run(_patched_stt_send_audio(stt, np.zeros(10, dtype=np.float64)))
 
 
-def test_patched_stt_send_audio_buffers_partial_frame_without_computing(monkeypatch):
-    import numpy as np
 
-    compute_calls = []
 
-    async def fake_to_thread(fn, *args):
-        compute_calls.append(args)
-        return fn(*args)
 
-    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
-    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
 
-    asyncio.run(_patched_stt_send_audio(stt, np.zeros(500, dtype=np.float32)))
 
-    assert compute_calls == []
-    assert stt._pending.size == 500
-    assert stt.sent_samples == 500
 
 
-def test_patched_stt_send_audio_extracts_complete_frames_and_calls_compute_once(monkeypatch):
-    import numpy as np
-
-    frame_batches = []
-
-    def fake_run_stt_frames_sync(stt, frames, fs, sr):
-        frame_batches.append((len(frames), fs, sr))
-        return ["decoded-word"]
-
-    monkeypatch.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
-    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
-
-    # 3 full frames (5760 samples) plus a 100-sample remainder.
-    asyncio.run(_patched_stt_send_audio(stt, np.zeros(5860, dtype=np.float32)))
-
-    assert frame_batches == [(3, 1920, 24000)]
-    assert stt._pending.size == 100
-
-
-def test_patched_stt_send_audio_puts_words_on_queue_in_order(monkeypatch):
-    import numpy as np
-
-    monkeypatch.setattr(
-        "core.model_interface._run_stt_frames_sync",
-        lambda stt, frames, fs, sr: ["word-1", "word-2", "word-3"],
-    )
-    stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)  # fs = 1920
-
-    asyncio.run(_patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)))
-
-    got = []
-    while not stt._out_queue.empty():
-        got.append(stt._out_queue.get_nowait())
-    assert got == ["word-1", "word-2", "word-3"]
-
-
-def test_patched_stt_send_audio_runs_compute_off_the_main_thread():
-    """The whole point of this fix: mirrors
-    test_fetch_and_apply_reference_conditioning_runs_fetch_off_the_main_thread
-    — confirms the compute executes on a different thread than the caller,
-    the same property that keeps moshi-rag's shared event loop free."""
-    import threading
-
-    import numpy as np
-
-    caller_thread = threading.current_thread()
-    compute_thread_name = {}
-
-    def fake_run_stt_frames_sync(stt, frames, fs, sr):
-        compute_thread_name["thread"] = threading.current_thread()
-        return []
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
-        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
-        asyncio.run(_patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)))
-
-    assert compute_thread_name["thread"] != caller_thread
-
-
-def test_patched_stt_send_audio_does_not_block_concurrent_coroutine():
-    """The real mechanism check, not just structure: a fake compute that
-    does a genuine blocking time.sleep (standing in for real GPU work,
-    matching the ~0.58-0.80s real bursts observed in CLAUDE.md's root-cause
-    section) must not stall a concurrent lightweight coroutine on the same
-    event loop — that's the actual bug being fixed. Compare against
-    _fetch_and_apply_reference_conditioning's equivalent property, already
-    covered above; this is the same check for the STT path."""
-    import time
-
-    import numpy as np
-
-    SLEEP_S = 0.08
-
-    def fake_run_stt_frames_sync(stt, frames, fs, sr):
-        time.sleep(SLEEP_S)  # genuine blocking call, runs via asyncio.to_thread
-        return []
-
-    async def heartbeat(tick_gap_s: float, stop: asyncio.Event) -> list:
-        ticks = []
-        t0 = time.perf_counter()
-        while not stop.is_set():
-            await asyncio.sleep(tick_gap_s)
-            ticks.append(time.perf_counter() - t0)
-        return ticks
-
-    async def main():
-        stop = asyncio.Event()
-        hb_task = asyncio.ensure_future(heartbeat(0.01, stop))
-        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
-        t0 = time.perf_counter()
-        await _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32))
-        elapsed = time.perf_counter() - t0
-        stop.set()
-        ticks = await hb_task
-        return elapsed, ticks
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
-        elapsed, ticks = asyncio.run(main())
-
-    assert elapsed >= SLEEP_S
-    # If the event loop were blocked for the sleep's duration (the pre-fix
-    # bug), the heartbeat would accumulate ~0 ticks during that window. With
-    # the fix, ticks should keep landing roughly every 0.01s throughout.
-    assert len(ticks) >= int(SLEEP_S / 0.01) - 1
-
-
-def test_patched_stt_send_audio_serializes_overlapping_calls():
-    """self._lock must still prevent two overlapping send_audio calls from
-    interleaving their compute, now that compute runs via asyncio.to_thread
-    — holding an asyncio.Lock across an awaited to_thread call keeps it
-    logically held for the whole duration, so this should hold by
-    construction; asserted directly rather than trusted."""
-    import numpy as np
-
-    concurrent_count = {"current": 0, "max": 0}
-
-    def fake_run_stt_frames_sync(stt, frames, fs, sr):
-        concurrent_count["current"] += 1
-        concurrent_count["max"] = max(concurrent_count["max"], concurrent_count["current"])
-        import time
-
-        time.sleep(0.02)
-        concurrent_count["current"] -= 1
-        return []
-
-    async def main():
-        stt = _make_fake_stt(sample_rate=24000, frame_rate=12.5)
-        await asyncio.gather(
-            _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)),
-            _patched_stt_send_audio(stt, np.zeros(1920, dtype=np.float32)),
-        )
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("core.model_interface._run_stt_frames_sync", fake_run_stt_frames_sync)
-        asyncio.run(main())
-
-    assert concurrent_count["max"] == 1
-
-
-def _install_fake_moshi_stt_local_stt(monkeypatch):
-    import sys
-    import types
-
-    for name in ("moshi", "moshi.stt", "moshi.stt.local_stt"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-
-    class _FakeLocalSpeechToText:
-        async def send_audio(self, audio):
-            raise AssertionError("should have been replaced by the patch")
-
-    sys.modules["moshi.stt.local_stt"].LocalSpeechToText = _FakeLocalSpeechToText
-    return _FakeLocalSpeechToText
-
-
-def test_patch_local_stt_off_thread_replaces_send_audio(monkeypatch):
-    fake_cls = _install_fake_moshi_stt_local_stt(monkeypatch)
-
-    _patch_local_stt_off_thread()
-
-    assert fake_cls.send_audio is _patched_stt_send_audio
-
-
-def test_patch_local_stt_off_thread_is_idempotent(monkeypatch):
-    fake_cls = _install_fake_moshi_stt_local_stt(monkeypatch)
-
-    _patch_local_stt_off_thread()
-    _patch_local_stt_off_thread()
-
-    assert fake_cls.send_audio is _patched_stt_send_audio
 
 
 # ── _patch_compiled_functions_thread_safe (dynamo lazy-compile race fix) ──────
@@ -841,136 +603,14 @@ def test_patch_local_stt_off_thread_is_idempotent(monkeypatch):
 # can only be confirmed on the VM.
 
 
-def _install_fake_moshi_modules_for_compile_patch(monkeypatch):
-    import sys
-    import types
-
-    for name in ("moshi", "moshi.modules"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-
-    rope_mod = types.ModuleType("moshi.modules.rope")
-    rope_mod.apply_rope = lambda *args, **kwargs: ("apply_rope", args, kwargs)
-    monkeypatch.setitem(sys.modules, "moshi.modules.rope", rope_mod)
-
-    transformer_mod = types.ModuleType("moshi.modules.transformer")
-    transformer_mod._rms_norm = lambda *args, **kwargs: ("_rms_norm", args, kwargs)
-    monkeypatch.setitem(sys.modules, "moshi.modules.transformer", transformer_mod)
-
-    gating_mod = types.ModuleType("moshi.modules.gating")
-    gating_mod.gating_forward_kernel = lambda *args, **kwargs: ("gating_forward_kernel", args, kwargs)
-    monkeypatch.setitem(sys.modules, "moshi.modules.gating", gating_mod)
-
-    return rope_mod, transformer_mod, gating_mod
 
 
-def test_patch_compiled_functions_thread_safe_wraps_and_preserves_behavior(monkeypatch):
-    rope_mod, transformer_mod, gating_mod = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
-    original_apply_rope = rope_mod.apply_rope
-    original_rms_norm = transformer_mod._rms_norm
-    original_gating = gating_mod.gating_forward_kernel
-
-    _patch_compiled_functions_thread_safe()
-
-    assert rope_mod.apply_rope is not original_apply_rope
-    assert transformer_mod._rms_norm is not original_rms_norm
-    assert gating_mod.gating_forward_kernel is not original_gating
-
-    assert rope_mod.apply_rope(1, x=2) == ("apply_rope", (1,), {"x": 2})
-    assert transformer_mod._rms_norm(1, x=2) == ("_rms_norm", (1,), {"x": 2})
-    assert gating_mod.gating_forward_kernel(1, x=2) == ("gating_forward_kernel", (1,), {"x": 2})
 
 
-def test_patch_compiled_functions_thread_safe_is_idempotent(monkeypatch):
-    rope_mod, transformer_mod, gating_mod = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
-
-    _patch_compiled_functions_thread_safe()
-    wrapped_apply_rope = rope_mod.apply_rope
-    wrapped_rms_norm = transformer_mod._rms_norm
-    wrapped_gating = gating_mod.gating_forward_kernel
-
-    _patch_compiled_functions_thread_safe()
-
-    assert rope_mod.apply_rope is wrapped_apply_rope
-    assert transformer_mod._rms_norm is wrapped_rms_norm
-    assert gating_mod.gating_forward_kernel is wrapped_gating
 
 
-def test_gpu_exclusivity_lock_serializes_concurrent_calls(monkeypatch):
-    """The real cross-thread mechanism check: two threads both calling a
-    locked function (standing in for real concurrent apply_rope/_rms_norm/
-    gating_forward_kernel calls from the step-loop thread and the STT
-    worker thread) genuinely never run inside the locked section at the
-    same time — real threads, not just each locked in isolation."""
-    import threading
-    import time
-
-    rope_mod, _, _ = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
-
-    concurrent_count = {"current": 0, "max": 0}
-    count_lock = threading.Lock()
-
-    def _slow_apply_rope(*args, **kwargs):
-        with count_lock:
-            concurrent_count["current"] += 1
-            concurrent_count["max"] = max(concurrent_count["max"], concurrent_count["current"])
-        time.sleep(0.05)
-        with count_lock:
-            concurrent_count["current"] -= 1
-
-    rope_mod.apply_rope = _slow_apply_rope
-    _patch_compiled_functions_thread_safe()
-
-    thread_a = threading.Thread(target=rope_mod.apply_rope)
-    thread_b = threading.Thread(target=rope_mod.apply_rope)
-
-    thread_a.start()
-    thread_b.start()
-    thread_a.join()
-    thread_b.join()
-
-    assert concurrent_count["max"] == 1
 
 
-def test_gpu_exclusivity_lock_is_reentrant_on_same_thread(monkeypatch):
-    """Regression test for a real VM deadlock (found via py-spy on a hung
-    warmup() call, back when moshi.modules.streaming.StreamingModule.
-    set_exec_mask was briefly also patched under this same lock —
-    LMGen.set_exec_mask's own set_exec_mask_callback recurses into a
-    *nested* StreamingModule's set_exec_mask on the same thread, and a
-    plain threading.Lock isn't reentrant). set_exec_mask no longer shares
-    this lock (see _COMPILED_FUNCTIONS_LOCK's own docstring — locking
-    turned out not to fix that hazard at all; _warm_up_stt_exec_mask()
-    does instead), but _COMPILED_FUNCTIONS_LOCK stays an RLock as cheap
-    insurance, so this regression test stays too: simulates the same
-    same-thread-recursion shape generically, on a background thread with
-    a bounded join() so a real regression fails the test instead of
-    hanging the suite forever."""
-    import threading
-
-    rope_mod, _, _ = _install_fake_moshi_modules_for_compile_patch(monkeypatch)
-
-    call_count = {"n": 0}
-
-    def _recursive_apply_rope(*args, **kwargs):
-        call_count["n"] += 1
-        if call_count["n"] < 2:
-            rope_mod.apply_rope()  # nested call, same thread, lock already held
-        return call_count["n"]
-
-    rope_mod.apply_rope = _recursive_apply_rope
-    _patch_compiled_functions_thread_safe()
-
-    result = {}
-
-    def _run():
-        result["value"] = rope_mod.apply_rope()
-
-    thread = threading.Thread(target=_run)
-    thread.start()
-    thread.join(timeout=5.0)
-
-    assert not thread.is_alive(), "recursive call deadlocked — lock is not reentrant"
-    assert result["value"] == 2
 
 
 # ── _patch_stt_no_cuda_graph (CUDA graph stream-capture crash fix) ────────────
@@ -983,75 +623,14 @@ def test_gpu_exclusivity_lock_is_reentrant_on_same_thread(monkeypatch):
 # sys.modules injection.
 
 
-def _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch):
-    import sys
-    import types
-
-    for name in ("moshi", "moshi.stt"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-
-    local_stt_mod = types.ModuleType("moshi.stt.local_stt")
-
-    class _FakeLMGen:
-        def __init__(self, *args, **kwargs):
-            self.init_args = args
-            self.init_kwargs = kwargs
-
-    class _FakeLocalSpeechToText:
-        def __init__(self, mimi, *args, **kwargs):
-            self.mimi = mimi
-            self.init_args = args
-            self.init_kwargs = kwargs
-
-    local_stt_mod.LMGen = _FakeLMGen
-    local_stt_mod.LocalSpeechToText = _FakeLocalSpeechToText
-    monkeypatch.setitem(sys.modules, "moshi.stt.local_stt", local_stt_mod)
-
-    return local_stt_mod
 
 
-def test_patch_stt_no_cuda_graph_forces_lm_gen_profile_true(monkeypatch):
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_no_cuda_graph()
-
-    lm_gen = local_stt_mod.LMGen(object(), cfg_coef=1.0)
-    assert lm_gen.init_kwargs["profile"] is True
 
 
-def test_patch_stt_no_cuda_graph_forces_lm_gen_profile_true_even_if_caller_passes_false(monkeypatch):
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_no_cuda_graph()
-
-    lm_gen = local_stt_mod.LMGen(object(), profile=False)
-    assert lm_gen.init_kwargs["profile"] is True
 
 
-def test_patch_stt_no_cuda_graph_sets_mimi_profile_before_delegating(monkeypatch):
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_no_cuda_graph()
-
-    mimi = MagicMock()
-    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
-
-    mimi.set_profile.assert_called_once_with(True)
-    assert stt.mimi is mimi
-    assert stt.init_kwargs == {"vad_callback": None}
 
 
-def test_patch_stt_no_cuda_graph_is_idempotent(monkeypatch):
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_no_cuda_graph()
-    wrapped_lm_gen = local_stt_mod.LMGen
-    wrapped_init = local_stt_mod.LocalSpeechToText.__init__
-
-    _patch_stt_no_cuda_graph()
-
-    assert local_stt_mod.LMGen is wrapped_lm_gen
-    assert local_stt_mod.LocalSpeechToText.__init__ is wrapped_init
 
 
 # ── _patch_load_models_generation_overrides (pad-sampling-drift lever) ───────
@@ -1140,111 +719,18 @@ def test_patch_load_models_generation_overrides_is_idempotent(monkeypatch):
 # torch.cuda with a controllable device_count() are faked.
 
 
-def _install_fake_torch_with_cuda(monkeypatch, device_count: int):
-    import sys
-    import types
-
-    fake_cuda = types.ModuleType("torch.cuda")
-    fake_cuda.is_available = lambda: device_count > 0
-    fake_cuda.device_count = lambda: device_count
-
-    fake_torch = types.ModuleType("torch")
-    fake_torch.cuda = fake_cuda
-    monkeypatch.setitem(sys.modules, "torch", fake_torch)
-    monkeypatch.setitem(sys.modules, "torch.cuda", fake_cuda)
-    return fake_torch
 
 
-def test_patch_stt_second_gpu_moves_mimi_to_cuda_1_when_two_gpus_visible(monkeypatch):
-    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_second_gpu()
-
-    mimi = MagicMock()
-    moved_mimi = MagicMock()
-    mimi.to.return_value = moved_mimi
-
-    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
-
-    mimi.to.assert_called_once_with("cuda:1")
-    assert stt.mimi is moved_mimi
-    assert stt.init_kwargs["device"] == "cuda:1"
 
 
-def test_patch_stt_second_gpu_is_a_noop_with_one_gpu(monkeypatch):
-    _install_fake_torch_with_cuda(monkeypatch, device_count=1)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_second_gpu()
-
-    mimi = MagicMock()
-    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
-
-    mimi.to.assert_not_called()
-    assert stt.mimi is mimi
-    assert "device" not in stt.init_kwargs
 
 
-def test_patch_stt_second_gpu_is_a_noop_with_no_cuda(monkeypatch):
-    _install_fake_torch_with_cuda(monkeypatch, device_count=0)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_second_gpu()
-
-    mimi = MagicMock()
-    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
-
-    mimi.to.assert_not_called()
-    assert stt.mimi is mimi
 
 
-def test_patch_stt_second_gpu_does_not_override_an_explicit_device(monkeypatch):
-    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_second_gpu()
-
-    mimi = MagicMock()
-    stt = local_stt_mod.LocalSpeechToText(mimi, device="cuda:0")
-
-    assert stt.init_kwargs["device"] == "cuda:0"
 
 
-def test_patch_stt_second_gpu_is_idempotent(monkeypatch):
-    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_second_gpu()
-    wrapped_init = local_stt_mod.LocalSpeechToText.__init__
-
-    _patch_stt_second_gpu()
-
-    assert local_stt_mod.LocalSpeechToText.__init__ is wrapped_init
 
 
-def test_patch_stt_second_gpu_chains_after_patch_stt_no_cuda_graph(monkeypatch):
-    """Confirms the documented call-order requirement: applying both
-    patches (in the order core/model_interface.py and
-    scripts/instrumented_server.py both use) still forces profile=True
-    *and* moves mimi to the second GPU — neither patch's effect is lost
-    by the other wrapping on top."""
-    _install_fake_torch_with_cuda(monkeypatch, device_count=2)
-    local_stt_mod = _install_fake_moshi_stt_local_stt_with_lm_gen(monkeypatch)
-
-    _patch_stt_no_cuda_graph()
-    _patch_stt_second_gpu()
-
-    mimi = MagicMock()
-    moved_mimi = MagicMock()
-    mimi.to.return_value = moved_mimi
-
-    stt = local_stt_mod.LocalSpeechToText(mimi, vad_callback=None)
-
-    mimi.to.assert_called_once_with("cuda:1")
-    moved_mimi.set_profile.assert_called_once_with(True)
-    assert stt.mimi is moved_mimi
-    assert stt.init_kwargs["device"] == "cuda:1"
 
 
 # ── _patch_cuda_graph_thread_local (Option E's complement) ────────────────────
@@ -1256,104 +742,14 @@ def test_patch_stt_second_gpu_chains_after_patch_stt_no_cuda_graph(monkeypatch):
 # _set_in_cuda_graph() are pure Python bookkeeping.
 
 
-def _install_fake_moshi_utils_compile(monkeypatch):
-    import sys
-    import types
-    from contextlib import contextmanager
-
-    for name in ("moshi", "moshi.utils"):
-        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
-
-    compile_mod = types.ModuleType("moshi.utils.compile")
-    _flag = {"value": False}
-
-    def in_cuda_graph() -> bool:
-        return _flag["value"]
-
-    @contextmanager
-    def _set_in_cuda_graph():
-        assert not _flag["value"]
-        _flag["value"] = True
-        try:
-            yield
-        finally:
-            _flag["value"] = False
-
-    compile_mod.in_cuda_graph = in_cuda_graph
-    compile_mod._set_in_cuda_graph = _set_in_cuda_graph
-    monkeypatch.setitem(sys.modules, "moshi.utils.compile", compile_mod)
-    return compile_mod
 
 
-def test_patch_cuda_graph_thread_local_replaces_both_functions(monkeypatch):
-    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
-    original_in_cuda_graph = compile_mod.in_cuda_graph
-    original_set = compile_mod._set_in_cuda_graph
-
-    _patch_cuda_graph_thread_local()
-
-    assert compile_mod.in_cuda_graph is not original_in_cuda_graph
-    assert compile_mod._set_in_cuda_graph is not original_set
 
 
-def test_patch_cuda_graph_thread_local_preserves_same_thread_reentrancy_guard(monkeypatch):
-    """Same-thread double-entry must still trip the assert — this is the
-    real, intended protection (preventing a genuinely nested capture on
-    one thread), not something the thread-local swap should remove."""
-    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
-    _patch_cuda_graph_thread_local()
-
-    with compile_mod._set_in_cuda_graph():
-        assert compile_mod.in_cuda_graph() is True
-        with pytest.raises(AssertionError):
-            with compile_mod._set_in_cuda_graph():
-                pass
-    assert compile_mod.in_cuda_graph() is False
 
 
-def test_patch_cuda_graph_thread_local_isolates_different_threads(monkeypatch):
-    """The actual bug being fixed: two threads must NOT observe each
-    other's flag at all. Real threads, not simulated -- one thread holds
-    _set_in_cuda_graph() open for a while; a second thread entering its
-    own _set_in_cuda_graph() concurrently must not see in_cuda_graph()==True
-    and must not trip the reentrancy assert."""
-    import threading
-
-    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
-    _patch_cuda_graph_thread_local()
-
-    other_thread_saw_false = {"value": None}
-    other_thread_raised = {"value": None}
-
-    def _other_thread():
-        try:
-            other_thread_saw_false["value"] = compile_mod.in_cuda_graph() is False
-            with compile_mod._set_in_cuda_graph():
-                pass
-        except Exception as exc:  # noqa: BLE001 - want to see any failure
-            other_thread_raised["value"] = exc
-
-    with compile_mod._set_in_cuda_graph():
-        thread = threading.Thread(target=_other_thread)
-        thread.start()
-        thread.join(timeout=5.0)
-
-    assert not thread.is_alive(), "other thread never finished -- assert likely blocked it"
-    assert other_thread_raised["value"] is None
-    assert other_thread_saw_false["value"] is True
 
 
-def test_patch_cuda_graph_thread_local_is_idempotent(monkeypatch):
-    compile_mod = _install_fake_moshi_utils_compile(monkeypatch)
-
-    _patch_cuda_graph_thread_local()
-    wrapped_in_cuda_graph = compile_mod.in_cuda_graph
-    wrapped_set = compile_mod._set_in_cuda_graph
-
-    _patch_cuda_graph_thread_local()
-
-    assert compile_mod.in_cuda_graph is wrapped_in_cuda_graph
-    assert compile_mod._set_in_cuda_graph is wrapped_set
 
 
 # ── _warm_up_stt_exec_mask (latency-cleanliness fix now that Option E's ──────
@@ -1679,24 +1075,9 @@ def test_finalize_ttfat_defaults_to_zero_when_first_audio_never_recorded():
 # _stt_off_thread_enabled()'s own docstring for the full reasoning.
 
 
-def test_stt_off_thread_disabled_by_default(monkeypatch):
-    monkeypatch.delenv("STT_OFF_THREAD", raising=False)
-    assert _stt_off_thread_enabled() is False
 
 
-def test_stt_off_thread_enabled_via_env_var(monkeypatch):
-    monkeypatch.setenv("STT_OFF_THREAD", "1")
-    assert _stt_off_thread_enabled() is True
 
 
-def test_stt_off_thread_disabled_via_env_var(monkeypatch):
-    monkeypatch.setenv("STT_OFF_THREAD", "0")
-    assert _stt_off_thread_enabled() is False
 
 
-def test_stt_off_thread_any_other_value_is_disabled(monkeypatch):
-    """Fails closed toward the safer, validated mode on a typo'd/unexpected
-    value, rather than the old permissive "!= '0'" parsing that would have
-    silently enabled the off-thread chain on e.g. STT_OFF_THREAD=false."""
-    monkeypatch.setenv("STT_OFF_THREAD", "false")
-    assert _stt_off_thread_enabled() is False

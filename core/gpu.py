@@ -80,28 +80,32 @@ def resolve_devices(count: int | None = None) -> DeviceAssignment:
     a real device_count() call; passing it explicitly (as tests do) keeps
     this fully unit-testable with no GPU, subprocess, or mocking involved.
 
-    frontend_cuda_visible_devices includes physical GPU 1 too (`"0,1"`,
-    not just `"0"`) whenever a second GPU exists — this is deliberate,
-    not scope creep: the front-end process's own in-process STT model
-    duplicate is pinned to a second physical GPU when one is visible
-    (core/model_interface.py's _patch_stt_second_gpu()), to give it a
-    genuinely separate CUDA context/stream from the front-end's own main
-    model, eliminating a real cross-thread CUDA-graph-capture crash that
-    locking around specific call sites couldn't fully close (see that
-    function's own docstring for the full history). That only works if
-    this process can actually see the second physical GPU at all — once
-    CUDA_VISIBLE_DEVICES restricts a process to one device before its CUDA
-    runtime initializes, no other physical GPU is ever reachable from
-    inside it again, regardless of what index code asks for. The main
-    model itself is unaffected: it's still always addressed as "cuda:0"
-    (see MoshiRAGAdapter._load_models()'s own args.device), the first of
-    whatever's now visible.
+    The front-end is always restricted to physical GPU 0 and the
+    conditioner gets GPU 1 when one exists. The main model is always
+    addressed as "cuda:0" (see MoshiRAGAdapter._load_models()'s own
+    args.device), the first of whatever is visible.
+
+    **Changed 2026-07-30:** this used to expose *both* GPUs to the
+    front-end process (`"0,1"`) so that its own in-process STT model
+    duplicate could be pinned to a second physical GPU by
+    core/model_interface.py's `_patch_stt_second_gpu()` — the "Option E"
+    fix for a cross-thread CUDA-graph-capture crash. That whole chain was
+    deleted along with the crash's actual cause: it only ever ran with STT
+    moved off-thread, which existed to mitigate an audio backlog that
+    turned out to be an artifact of this repo's own step-pacing patch (see
+    docs/demo-turn-onset-regression.md). With STT synchronous there is one
+    thread touching CUDA graphs, no capture race, and no reason to widen
+    the front-end's device visibility. Kept here as history because the
+    reasoning is non-obvious: exposing a second GPU is irreversible per
+    process (once CUDA_VISIBLE_DEVICES restricts a process before its CUDA
+    runtime initializes, no other physical GPU is reachable from inside it
+    again), so anyone reviving that approach needs this to happen here, not
+    at the point of use.
     """
     n = device_count() if count is None else count
     conditioner_index = "1" if n >= 2 else _FRONTEND_INDEX
-    frontend_visible = "0,1" if n >= 2 else _FRONTEND_INDEX
     return DeviceAssignment(
-        frontend_cuda_visible_devices=frontend_visible,
+        frontend_cuda_visible_devices=_FRONTEND_INDEX,
         conditioner_cuda_visible_devices=conditioner_index,
         contended=(conditioner_index == _FRONTEND_INDEX),
     )
