@@ -1239,3 +1239,78 @@ def test_slot_backlog_rows_input_dropped_is_none_on_an_unbounded_queue():
     channel = _FakeSlotChannel(qsize=2, sent_samples=1920 * 40)
     rows = _slot_backlog_rows(_FakeServer([channel]), {id(channel): 38})
     assert rows[0]["input_dropped"] is None
+
+
+# ── retrieval must not block the event loop (D10 residual fix) ────────────────
+
+
+def test_patch_rag_manager_get_reference_text_does_not_block_the_event_loop(tmp_path):
+    """RetrievalBackend.retrieve() is synchronous and does a real blocking HTTP
+    call. Called directly from an `async def` it froze the whole event loop --
+    ServerState._step_loop and Channel._recv_loop included -- for 0.45-0.63s per
+    <ret>, which starved the browser's ~90ms playback buffer and produced one
+    audible stall per turn. It must run via asyncio.to_thread.
+
+    Verified by mechanism, not by inspection: the fake backend blocks a real
+    thread with time.sleep, and a concurrent lightweight coroutine must keep
+    ticking on schedule while it does."""
+    import time as _time
+
+    BLOCK_S = 0.30
+    TICK_S = 0.02
+
+    class _BlockingBackend:
+        context_formatting: dict = {}
+
+        def retrieve(self, context, history=None):
+            _time.sleep(BLOCK_S)  # real thread block, not await asyncio.sleep
+            return ("a reference", BLOCK_S)
+
+    async def run():
+        session = _FakeSession()
+        session.last_context_injection_s = None
+        rag_manager = MagicMock()
+        rag_manager._history = []
+        _patch_rag_manager_get_reference_text(session, rag_manager, _BlockingBackend())
+
+        ticks = 0
+
+        async def ticker():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(TICK_S)
+                ticks += 1
+
+        t = asyncio.create_task(ticker())
+        await rag_manager.get_reference_text("user: hello\nmoshi: hi")
+        t.cancel()
+
+        # If retrieve() ran on the loop, ticks would be ~0. Off-thread, the
+        # ticker keeps running for the whole BLOCK_S.
+        assert ticks >= int(BLOCK_S / TICK_S) - 3, f"event loop was blocked (ticks={ticks})"
+
+    asyncio.run(run())
+
+
+def test_patch_rag_manager_get_reference_text_still_returns_the_reference(tmp_path):
+    """The to_thread hop must not change the return contract."""
+    class _Backend:
+        context_formatting: dict = {}
+
+        def retrieve(self, context, history=None):
+            return ("the reference", 0.123)
+
+    async def run():
+        session = _FakeSession()
+        session.last_context_injection_s = None
+        rag_manager = MagicMock()
+        rag_manager._history = []
+        _patch_rag_manager_get_reference_text(session, rag_manager, _Backend())
+
+        ctx, ref, elapsed, label = await rag_manager.get_reference_text("user: q\nmoshi: a")
+
+        assert ref == "the reference"
+        assert label == "RetrievalBackend"
+        assert elapsed >= 0.0
+
+    asyncio.run(run())

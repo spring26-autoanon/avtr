@@ -669,7 +669,19 @@ class _TimedInferenceJob:
                 self.asr_wait_s = max(0.0, t0 - self.retrieval_trigger_ts)
             self.retrieval_context = context
             try:
-                ref_text, latency = backend.retrieve(context)
+                # asyncio.to_thread, NOT a direct call — RetrievalBackend.retrieve()
+                # is synchronous and makes a real blocking HTTP request, so
+                # calling it straight from this `async def` blocks the event
+                # loop (and with it this job's own step loop) for its full
+                # duration. Same bug and same fix as the demo path's copy in
+                # scripts/instrumented_server.py's
+                # _patch_rag_manager_get_reference_text, where it was measured
+                # at 0.45-0.63s per <ret>; see that call site's comment for the
+                # evidence. Fixed here too rather than only where it was
+                # measured: the mechanism is identical, this path drives
+                # latency.ttfat, and leaving one of two copies blocking is how
+                # the eval/demo divergence bugs in this repo's history started.
+                ref_text, latency = await asyncio.to_thread(backend.retrieve, context)
                 self.retrieval_latency_s = latency
             except Exception as exc:
                 logger.warning("RetrievalBackend.retrieve() failed: %s", exc)

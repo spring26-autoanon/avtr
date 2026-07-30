@@ -31,13 +31,13 @@ now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend wit
 
 **Open, in priority order:**
 
-1. **D10 remainder — server step hitches.** B3 is **done and VM-validated**: client audio
-   loss 7.2% → 0.8%, the greeting artifact gone, no latency cost. The residual is 7 underruns
-   (one per turn), caused by occasional 113–133 ms step periods exceeding the client's entire
-   ~90 ms buffer. Preferred next step is attributing those hitches (correlate against
-   `server.log`'s retrieval events / GC) — that costs no latency. Fallback is deepening the
-   client buffer to ~200 ms, which costs ~110 ms of playback latency. See the B3 section.
-   Note the metric caveat there: with B3 on, true backlog is `lag_frames − input_dropped`.
+1. **D10 remainder — FIXED, needs one VM session.** The 113–133 ms step hitches behind the
+   residual underruns were attributed to a blocking `retrieval_backend.retrieve()` call inside
+   an `async def` (4/4 hitches matched a retrieval, extra wall time ≈ `api_call_s` to the
+   millisecond) and fixed with `asyncio.to_thread` on both the demo and eval paths. Expected:
+   hitches gone, underruns 7 → ~0, per-turn artifact gone. B3 itself is done and VM-validated
+   (client audio loss 7.2% → 0.8%, greeting artifact gone, no latency cost). Note the metric
+   caveat in the B3 section: with B3 on, true backlog is `lag_frames − input_dropped`.
 3. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
    that prompted the escalation came from three sessions that unknowingly ran the weaker
    `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
@@ -192,7 +192,58 @@ at turn onsets" better than 0.8% average loss does.
 The same hitches drive the residual *input* drops: `input_dropped`'s step-jumps
 coincide with the 133 ms and 120 ms period samples.
 
-**Two candidate fixes, a genuine trade-off, neither implemented:**
+#### Hitches ATTRIBUTED and FIXED (2026-07-30) — a blocking retrieval call on the event loop
+
+Option 2 below turned out to be tractable, so the latency-costing option 1 was
+not needed. Attributed from the existing session, no new instrumentation:
+`raw_events.jsonl` shares `step_diag.jsonl`'s clock, so hitch windows can be
+matched directly against session events.
+
+**All 4 hitches contain a `retrieval_complete` event — 4 for 4, with exactly 4
+retrievals in the session.** And the extra wall time per hitch
+(`12 × (period − 80 ms)`) matches that retrieval's own `api_call_s` almost
+exactly:
+
+| hitch `t_rel` | `mean_period_ms` | extra wall time | `api_call_s` |
+|---|---|---|---|
+| 140.34 | 133.3 | 0.639 s | 0.630 s |
+| 158.10 | 120.2 | 0.483 s | 0.482 s |
+| 176.67 | 113.1 | 0.398 s | 0.455 s |
+| 192.50 | 120.1 | 0.481 s | 0.549 s |
+
+**Cause:** `_patch_rag_manager_get_reference_text`'s
+`_patched_get_reference_text` called `retrieval_backend.retrieve(...)`
+**synchronously, directly inside an `async def`**. `retrieve()` is a plain `def`
+that makes a real blocking HTTP request to the retrieval LLM, so it froze the
+entire event loop — `ServerState._step_loop` and `Channel._recv_loop` included —
+for its full 0.45–0.63 s, once per `<ret>`. `work_ms` stayed at its normal 33 ms
+throughout, which is the tell: the loop was not busy computing, it was blocked.
+
+**Self-inflicted, not upstream.** moshi-rag's own `RAGManager.get_reference_text`
+properly awaits `self.reference_generator.generate_reference_text(...)`. This
+repo's patch replaced an awaited async call with a blocking one — the same class
+of bug as `_patch_server_state_step_pacing`, and the same fix already applied to
+the conditioning fetch in `_patch_channel_conditioning`.
+
+**Fix:** `await asyncio.to_thread(retrieval_backend.retrieve, ...)`. Applied in
+**both** copies — the demo path in `scripts/instrumented_server.py` and the eval
+path in `core/model_interface.py`, which had the identical bug in its own
+`_patched_get_reference_text`. Fixing only the measured one is how this repo's
+eval/demo divergence bugs have historically started. Safe off-thread: `retrieve()`
+mutates nothing shared, and `RAGManager.trigger()` cancels any pending task
+before starting a new one, so calls are serialised.
+
+Covered by a mechanism test rather than inspection
+(`test_patch_rag_manager_get_reference_text_does_not_block_the_event_loop`): the
+fake backend blocks a real thread with `time.sleep` and a concurrent ticker
+coroutine must keep ticking on schedule. Suite 413 → 415.
+
+**Not yet VM-validated.** Expected: the 113–133 ms step-period hitches disappear,
+`liveBufferS` stops being starved at turn onsets, underruns drop from 7 toward 0,
+and the residual per-turn artifact goes with them. If hitches persist, the
+remaining candidates are the conditioning fetch's known GIL contention and GC.
+
+**Two candidate fixes, a genuine trade-off — option 2 was taken, see above:**
 
 1. **Deepen the client buffer** so it survives a ~133 ms hitch — needs
    `initialBufferSamples + partialBufferSamples` ≳ 200 ms, versus ~90 ms today.

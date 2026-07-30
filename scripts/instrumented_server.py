@@ -1054,7 +1054,39 @@ def _patch_rag_manager_get_reference_text(session: SessionLog, rag_manager, retr
     async def _patched_get_reference_text(context: str) -> tuple[str, str, float, str]:
         t0 = time.perf_counter()
         try:
-            ref_text, latency = retrieval_backend.retrieve(context, history=rag_manager._history)
+            # asyncio.to_thread, NOT a direct call: RetrievalBackend.retrieve()
+            # is synchronous (`def`, not `async def`) and makes a real blocking
+            # HTTP request to the retrieval LLM, so calling it directly from
+            # this `async def` blocked the whole event loop -- including
+            # ServerState._step_loop and Channel._recv_loop -- for its full
+            # 0.45-0.63s duration, once per <ret>.
+            #
+            # Measured on demo/sessions/2026-07-30T22-38-51Z: all 4 step-period
+            # hitches in the session (113-133ms mean over a 12-step window,
+            # against an 80ms budget and a 33ms mean work_ms) contained a
+            # retrieval_complete event, 4 for 4, and the extra wall time per
+            # hitch matched api_call_s almost exactly (0.639 vs 0.630, 0.483 vs
+            # 0.482, 0.398 vs 0.455, 0.481 vs 0.549). Those hitches starved the
+            # browser's ~90ms playback buffer outright, producing one underrun
+            # and one audible stall per turn -- the residual D10 artifact left
+            # after B3.
+            #
+            # Self-inflicted, not upstream: moshi-rag's own
+            # RAGManager.get_reference_text properly awaits
+            # `self.reference_generator.generate_reference_text(...)`. This
+            # patch replaced an awaited async call with a blocking one. Same
+            # class of bug as _patch_server_state_step_pacing's, and the same
+            # fix already used for the conditioning fetch (see
+            # _patch_channel_conditioning).
+            #
+            # Safe off-thread: retrieve() reads self.context_formatting and
+            # `history`, and does the HTTP call. It mutates nothing shared --
+            # rag_manager._history is only appended to below, back on this
+            # thread -- and RAGManager.trigger() cancels any pending task
+            # before starting a new one, so calls are serialised.
+            ref_text, latency = await asyncio.to_thread(
+                retrieval_backend.retrieve, context, history=rag_manager._history
+            )
         except Exception as exc:
             logger.warning("RetrievalBackend.retrieve() failed: %s", exc)
             ref_text, latency = "", 0.0
