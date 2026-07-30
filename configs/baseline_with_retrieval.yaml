@@ -26,9 +26,25 @@ model:
     top_k_text: 25
   retrieval:
     enabled: true
-    backend: gemini_api          # key into configs/retrieval_backends.yaml — now
-                                  # gemini-3.5-flash-lite, see configs/retrieval_backends.yaml's
-                                  # own comment on gemini_api for why (promoted 2026-07-28)
+    backend: gemini_api_moshi_style   # key into configs/retrieval_backends.yaml
+    # Was plain `gemini_api` until 2026-07-30. Changed because the moshi-style
+    # backend is the validated-better one and had been carried only by
+    # configs/baseline_with_retrieval_moshi_style.yaml, which meant anything
+    # using this file as the default — including every scripts/run_demo.sh
+    # launch that didn't pass --config — silently got the weaker prompt. That
+    # bit a real demo A/B on 2026-07-30 (three sessions run on `gemini_api`
+    # without noticing) and produced retrieval output that looked like a model
+    # problem: references restating turn 1's fact regardless of the question.
+    #
+    # The difference is more than the prompt template. `gemini_api` has
+    # thread_reference_history=False (the retrieval LLM sees no record of what
+    # it already returned, so it re-derives from a transcript dominated by the
+    # model's own last answer) and drop_leading/trailing_incomplete_turn=False
+    # (turn-boundary fragments go into the retrieval context as noise).
+    #
+    # Caveat for scored runs: eval results from before this date used the
+    # `gemini_api` prompt and are NOT directly comparable to results after it.
+    # Re-baseline rather than diffing across the change.
     # 1500 was tuned for gemini-2.0-flash (now deprecated/shut down). Its
     # replacement, gemini-3.5-flash, is a "thinking" model that defaults to
     # medium thinking effort and — unlike the 2.5 family's

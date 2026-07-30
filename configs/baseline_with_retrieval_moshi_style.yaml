@@ -1,3 +1,11 @@
+# NOTE (2026-07-30): this config is now redundant with
+# configs/baseline_with_retrieval.yaml, which adopted
+# `backend: gemini_api_moshi_style` as its own default on the same date (see
+# that file's comment for why). Kept rather than deleted so existing
+# `--config configs/baseline_with_retrieval_moshi_style.yaml` invocations —
+# in shell history, notes, and CLAUDE.md examples — keep working and keep
+# meaning what they meant. Prefer the plain baseline config for new work;
+# this one should be retired once nothing references it.
 model:
   checkpoint: base
   generation:

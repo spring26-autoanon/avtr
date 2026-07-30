@@ -23,26 +23,17 @@ class MoshiProcessor extends AudioWorkletProcessor {
     // If the buffer length goes over that many, we will drop the oldest packets until
     // we reach back initialBufferSamples + partialBufferSamples.
     //
-    // Starts at the *ceiling* (maxMaxBufferWithIncrements), not upstream's
-    // asSamples(10). Upstream starts at the floor and only ever raises this
-    // when a drop actually happens, so the buffer policy is learned by
-    // failing: 14 increments of 5ms to reach 80ms, each one paid for with a
-    // real, audible discard of 18-69ms of speech. Measured on a real session
-    // (demo/sessions/2026-07-30T19-49-54Z, client_audio_diag): 56 drops,
-    // every burst landing within +/-0.31s of a model turn onset, which is
-    // exactly the "metallic artifact at the start of each utterance, then it
-    // smooths out" the demo has had for its whole life. See
-    // docs/demo-turn-onset-fix-plan.md's D10.
-    //
-    // This costs no steady-state latency: totalMaxBufferSamples() is the
-    // *drop threshold*, not the buffer's operating depth. Depth is set by the
-    // arrival/drain balance, and measured liveBufferS sat at 70-81ms while
-    // this threshold was 100-170ms. Raising it only stops the trimming, so
-    // burst audio gets played slightly later instead of being thrown away --
-    // strictly better than a glitch. The increment machinery below is kept
-    // rather than removed: it is upstream's, it is now a no-op at the
-    // ceiling, and leaving it means this is a one-value change to revert.
-    this.maxBufferSamples = asSamples(80);
+    // Back to upstream's asSamples(10) after a measured failed experiment.
+    // 2026-07-30: this was set to the ceiling asSamples(80) on the theory that
+    // the drop threshold started too tight and was being "learned by
+    // failing" (it only ever grows inside the drop branch, 5ms at a time).
+    // Confirmed live in a real session -- newMaxBufferMs reported only 80.0
+    // instead of ratcheting 15..70 -- and it changed nothing: drops went
+    // 56 -> 55, and the audible per-utterance artifact was unchanged. So the
+    // threshold is not what triggers the drops. Reverted rather than left in
+    // as inert complexity. See docs/demo-turn-onset-fix-plan.md's D10 for what
+    // the numbers actually say and the one measurement that would resolve it.
+    this.maxBufferSamples = asSamples(10);
     // increments
     this.partialBufferIncrement = asSamples(5);
     this.maxPartialWithIncrements = asSamples(80);
@@ -134,20 +125,10 @@ class MoshiProcessor extends AudioWorkletProcessor {
     // named, so it doesn't happen again.
     this._liveBufferS = 0.;
 
-    // For now let's reset the buffer params. maxBufferSamples resets to the
-    // ceiling, matching the constructor — see its comment there for why.
-    //
-    // partialBufferSamples deliberately still starts low (upstream's 10ms).
-    // Unlike maxBufferSamples this one *does* cost real latency: start()
-    // sets remainingPartialBufferSamples from it and playback waits that
-    // long before resuming, so raising it delays every stream start and
-    // every underrun recovery. It is also a far smaller contributor to the
-    // audible problem -- the same session measured 5 underruns against 56
-    // drops -- so it is left alone rather than traded against
-    // responsiveness. Revisit only if underruns turn out to dominate after
-    // the drop fix lands.
+    // For now let's reset the buffer params. Both back at upstream's values --
+    // see the constructor's note on the reverted ceiling experiment.
     this.partialBufferSamples = asSamples(10);
-    this.maxBufferSamples = asSamples(80);
+    this.maxBufferSamples = asSamples(10);
   }
 
   totalMaxBufferSamples() {

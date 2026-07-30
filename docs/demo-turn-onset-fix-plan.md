@@ -446,7 +446,7 @@ Downstream of that deletion, when it happens: `core/gpu.py`'s
 | D7 | Report the `--power-threshold` default gap upstream | `moshi.server` defaults `None`; `run_inference.py` and the paper's training both use `-65` |
 | D8 | `power_threshold=-65` zeroes ~14% of 80 ms frames *inside* real user speech | Measure only for now. A higher or hysteretic gate may suit live microphone input better than the value tuned for TTS training audio |
 | D9 | `demo/client` reports 22 npm vulnerabilities (5 moderate, 16 high, 1 critical) | Parked 2026-07-30, assessed non-blocking — see below. **Do not run `npm audit fix --force`** before the VM trip |
-| D10 | **Metallic artifact at every model-utterance onset** — client playback drop threshold started at its floor and was learned by failing | **FIX IMPLEMENTED 2026-07-30, needs a listen** — see below |
+| D10 | **Metallic artifact at every model-utterance onset** — client discards 80–117 ms of audio every ~130 ms after each turn onset | **OPEN.** One fix attempted and reverted (raising the drop threshold: no effect, 56→55 drops). Root cause is a ~2–3× duration-accounting discrepancy between server and client, undiagnosed — see below for the one measurement that would settle it |
 
 ### D10 — metallic artifact at each utterance onset (fix implemented, needs a listen)
 
@@ -472,9 +472,53 @@ It is very likely the real cause of the long-running "metallic/buzzy audio"
 thread in `project_demo_audio_quality_investigation`, which was previously
 misattributed to step pacing.
 
-**Fix**: start `maxBufferSamples` at its own ceiling
-(`maxMaxBufferWithIncrements`, 80 ms) in both the constructor and
-`initState()`. One value, in two places.
+**Attempted fix — TRIED AND REVERTED, it does not work.** Starting
+`maxBufferSamples` at its ceiling (80 ms, so a 170 ms threshold instead of
+100 ms) was tried on session `2026-07-30T20-31-09Z`. It was confirmed live —
+`newMaxBufferMs` reported only `80.0` instead of ratcheting 15…70 — and it
+changed nothing measurable: **drops 56 → 55**, underruns 5 → 4, and the
+audible per-utterance artifact was unchanged by ear. Reverted rather than left
+in as inert complexity. The drop *threshold* is therefore not what triggers
+the drops, and the "learned by failing" reading below, while accurate as a
+description of the code, is not the cause.
+
+**What session 4's numbers actually say**, and why this is now an open
+question rather than a diagnosed bug:
+
+- The client is healthy by every internal measure: playback rate is exactly
+  **1.000×** wall time (`actualAudioPlayed` vs `t_rel_s`, measured across the
+  greeting, a quiet stretch, and a drop window alike) and `liveBufferS` stays
+  at 38–93 ms. It never starves and never backs up.
+- The server is healthy too: `lag_frames` = 1 from t = 5.4 s onward and
+  `mean_period_ms` ≈ 80 for the whole session, with `work_ms` = 33 ms. It is
+  delivering one 80 ms frame per 80 ms.
+- Yet drops fire ~every 130 ms for seconds at a stretch, each discarding
+  80–117 ms, and they recur after every model turn onset.
+- Those three cannot all be true. By conservation, over the 3.35 s greeting
+  window the client played 3.35 s **and** discarded ~2.7 s — about 1.8× real
+  time of arriving audio — while the server reports 1.0×. Worse, the server's
+  own `[Display Model]` span for that greeting is only **1.76 s**, so the
+  client accounted for ~6 s of audio against ~1.8 s of generated speech.
+
+There is a duration-accounting discrepancy of roughly 2–3× between what the
+server thinks it sent and what the client's buffer arithmetic thinks it
+received. I am not going to name a fourth mechanism for it here; two previous
+guesses on this path were wrong (the superseded `delay` field, then the
+threshold theory above), and the artifacts on hand cannot distinguish the
+remaining candidates — nor even establish whether the dropped audio is speech
+(audible damage) or the silence frames the server emits between words
+(harmless).
+
+**The measurement that would resolve it**, and the only thing worth doing next
+on D10: log the AudioContext's actual `sampleRate` and each decoded
+`frame.length` in `audio-processor.ts`'s `onmessage`, once per session. Every
+threshold in that file is denominated via `asSamples()`, which scales by
+`sampleRate`; if the decoded frames do not contain `asSamples(80)` samples
+each, then `currentSamples()`, `totalMaxBufferSamples()` and `liveBufferS` are
+all measuring in the wrong unit and a ~2× discrepancy follows directly. Mimi
+runs at 24 kHz and a browser AudioContext is typically 48 kHz, which makes
+that the obvious first suspect — but it is a suspect, not a finding, until
+those two numbers are on record.
 
 Why this costs no steady-state latency: `totalMaxBufferSamples()` is the
 *drop threshold*, not the operating depth. Depth is set by the arrival/drain
