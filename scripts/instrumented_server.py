@@ -646,6 +646,74 @@ def _step_pacing_enabled() -> bool:
     return os.environ.get("DEMO_STEP_PACING", "0") == "1"
 
 
+def _input_queue_max_frames() -> int:
+    """Cap for Channel.input_queue, in frames. 0 disables the bound entirely
+    (upstream behaviour), for A/B.
+
+    Default 2: `_gather_step_inputs()` consumes exactly one frame per step, so
+    a cap of 1 would hold only the newest frame and drop on any scheduling
+    jitter; 2 gives one frame of genuine slack. Measured sessions hold
+    `lag_frames` at 1 in steady state, so at this cap mid-session drops should
+    be ~0 — `input_dropped` in step_diag.jsonl is what confirms that.
+    """
+    try:
+        return max(0, int(os.environ.get("DEMO_INPUT_QUEUE_MAX", "2")))
+    except ValueError:
+        return 2
+
+
+class _DropOldestQueue(asyncio.Queue):
+    """Channel.input_queue with a frame cap and drop-oldest overflow — B3.
+
+    Why (docs/demo-turn-onset-fix-plan.md's B3 and D10 cycle 3): every session
+    accumulates a 3.9-4.9s input backlog during model load and STT priming,
+    while the client is already streaming. Draining it is not free — the step
+    loop consumes at ~1.78x real time until it catches up, the browser's
+    playback buffer cannot hold the surplus, and it discards **2.534s of audio,
+    about 47% of the model's greeting** (measured, session
+    2026-07-30T20-31-09Z). That is the largest single contributor to the D10
+    artifact and the reason the opening phrase sounds rushed.
+
+    Bounding the queue removes the backlog instead of draining it. Dropping
+    those frames here costs nothing — the window precedes any user speech, and
+    `Channel._recv_loop` feeds the STT *before* queueing, so the transcript and
+    VAD still see every frame; only the front-end model's own input is
+    thinned. Dropping them at the output instead destroys half the greeting.
+
+    `put()` stays `async def` to match the single call site
+    (`await self.input_queue.put(step_input)`) but never actually blocks: the
+    parent is left unbounded and the cap is enforced here, so a full queue
+    trims rather than applying backpressure to `_recv_loop`.
+
+    **`is_first` is never lost.** The first frame of a session carries
+    `is_first=True`, which is what makes `BatchRunner.run_step()` call
+    `mimi.reset_streaming`/`lm_gen.reset_streaming`. Silently dropping it would
+    leave the models in whatever state the previous connection left behind, so
+    the flag is transferred onto the surviving frame instead. This is the one
+    genuinely dangerous part of bounding this queue.
+    """
+
+    def __init__(self, max_frames: int) -> None:
+        # Deliberately unbounded upstream; _cap is enforced in put() so that
+        # overflow drops instead of blocking the receive loop.
+        super().__init__()
+        self._cap = max_frames
+        self.dropped = 0
+
+    async def put(self, item) -> None:
+        if self._cap > 0:
+            while self.qsize() >= self._cap:
+                try:
+                    stale = self.get_nowait()
+                except asyncio.QueueEmpty:  # pragma: no cover - racing put/get
+                    break
+                self.dropped += 1
+                if getattr(stale, "is_first", False):
+                    # Carry the session-reset signal forward, see class docstring.
+                    item.is_first = True
+        self.put_nowait(item)
+
+
 def _slot_backlog_rows(server, consumed: dict[int, int]) -> list[dict]:
     """Per-active-slot backlog snapshot. Pure function of the server object
     plus a caller-owned consumed-frames tally, so it is unit-testable against
@@ -686,6 +754,12 @@ def _slot_backlog_rows(server, consumed: dict[int, int]) -> list[dict]:
                 "frames_received": received,
                 "frames_consumed": used,
                 "lag_frames": None if received is None else received - used,
+                # Cumulative frames discarded by _DropOldestQueue (B3). Absent
+                # (None) when the queue is upstream's unbounded asyncio.Queue,
+                # i.e. DEMO_INPUT_QUEUE_MAX=0. Expected shape once B3 is on: a
+                # jump of ~30-50 during startup, then flat -- steady-state
+                # lag_frames is 1, so there should be nothing left to drop.
+                "input_dropped": getattr(occupant.input_queue, "dropped", None),
             }
         )
     return rows
@@ -1031,6 +1105,15 @@ def _patch_channel(session: SessionLog, retrieval_backend, retrieval_backend_dis
         # whenever remote STT is configured.
         if isinstance(self.stt, LocalSpeechToText):
             _warm_up_stt_exec_mask(self.stt)
+        # B3: swap in the bounded, drop-oldest input queue. Safe to replace the
+        # attribute here rather than patching asyncio.Queue: Channel.__init__
+        # has just constructed it and nothing has been queued yet (this runs
+        # before run()'s TaskGroup creates _recv_loop), and the only consumer,
+        # ServerState._gather_step_inputs(), reaches it through this same
+        # attribute. See _DropOldestQueue's docstring for why the bound exists.
+        cap = _input_queue_max_frames()
+        if cap > 0:
+            self.input_queue = _DropOldestQueue(cap)
         session.register_channel(self)
         _patch_rag_manager_get_reference_text(session, self.rag_manager, retrieval_backend)
 

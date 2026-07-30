@@ -294,6 +294,7 @@ SERVER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$FRONTEND_CUDA_VISIBLE_DEVICES DEMO
 # _load_models() comment). Setting it now has no effect, and forwarding a
 # dead variable would imply otherwise.
 for _var in DEMO_QUEUE_DIAG DEMO_QUEUE_DIAG_EVERY DEMO_STEP_PACING \
+            DEMO_INPUT_QUEUE_MAX \
             DEMO_ASYNCIO_DEBUG DEMO_ASYNCIO_DEBUG_THRESHOLD_S; do
     if [[ -n "${!_var:-}" ]]; then
         SERVER_CMD="$_var=${!_var} $SERVER_CMD"

@@ -31,9 +31,11 @@ now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend wit
 
 **Open, in priority order:**
 
-1. **B3 — bounded server-side input queue.** Now the top item: D10 cycle 3 showed the
-   startup backlog drain discards ~47% of the model's greeting (2.53 s of the session's
-   5.33 s total loss). Cap `Channel.input_queue` at ~2 frames, drop-oldest. Then re-measure.
+1. **B3 — IMPLEMENTED, needs one VM session.** Bounded drop-oldest
+   `Channel.input_queue` (cap 2, `DEMO_INPUT_QUEUE_MAX=0` disables). Targets the
+   startup-backlog drain that discards ~47% of the model's greeting (2.53 s of the session's
+   5.33 s total loss). See the B3 section for the expected-signals table; the audible check
+   is whether the greeting still sounds rushed.
 2. **D10 — remainder.** Diagnosed, not fixed. After B3, bursts 2–5 (0.45–1.1 s each, each
    preceded by one underrun) are the residual; a deeper client buffer is the right tool for
    those, but only measure it *after* B3. Confirm the `opus_bytes`-skip mechanism before
@@ -151,7 +153,58 @@ start for a permanent multi-second latency, by guaranteeing the drain never comp
 is a materially fairer characterisation than "the premise was wrong", and it is why B3 is now
 required rather than conditional.
 
-### B3 — reverted to OPTIONAL / low priority (see the correction below)
+### B3 — IMPLEMENTED 2026-07-30, not yet VM-validated
+
+`scripts/instrumented_server.py`'s `_DropOldestQueue`, swapped in for
+`Channel.input_queue` by `_patch_channel`'s `patched_init`. Cap 2 frames,
+drop-oldest, `DEMO_INPUT_QUEUE_MAX=0` to disable for A/B (forwarded through
+`run_demo.sh` like the other diagnostics).
+
+Cap 2 rather than 1 because `_gather_step_inputs()` consumes exactly one frame
+per step, so 1 would drop on any scheduling jitter; 2 gives a frame of genuine
+slack. Steady-state `lag_frames` is 1, so mid-session drops should be ~0.
+
+**The one genuinely dangerous part, handled and tested:** the first frame of a
+session carries `is_first=True`, which is what makes `BatchRunner.run_step()`
+call `mimi.reset_streaming`/`lm_gen.reset_streaming`. Dropping it silently would
+leave the models in the previous connection's state. `put()` transfers the flag
+onto the surviving frame instead
+(`test_drop_oldest_queue_never_loses_is_first`).
+
+`put()` stays `async def` to match its single call site but never blocks — the
+parent queue is left unbounded and the cap is enforced in `put()`, so overflow
+trims instead of applying backpressure to `_recv_loop`. Backpressure there would
+be worse than useless: `_recv_loop` feeds the STT *before* queueing, so
+stalling it would stall the transcript and VAD too. As implemented, STT still
+sees every frame; only the front-end model's own input is thinned.
+
+Demo-only. The eval path's `InferenceJob._feed_loop()` gates on
+`_wait_step_index_at_least()`, so it cannot form a backlog and needs no bound.
+
+**Validation** (14 new unit tests pass; local suite 413). On the VM:
+
+```bash
+# B3 on (new default)
+DEMO_QUEUE_DIAG=1 bash scripts/run_demo.sh
+# B3 off, for comparison
+DEMO_QUEUE_DIAG=1 DEMO_INPUT_QUEUE_MAX=0 bash scripts/run_demo.sh
+```
+
+Expected with B3 on, from `step_diag.jsonl` and the client diag:
+
+| signal | expectation |
+|---|---|
+| `input_dropped` | jumps to ~30–50 during startup, then **flat** — a rising mid-session count means the cap is too tight |
+| `lag_frames` | 0–2 from the very first sample, never the 29–52 startup value |
+| client `buffer_drop` in burst 1 | should largely disappear (was 26 drops / 2.534 s) |
+| bursts 2–5 | expected to **survive** — different mechanism, see D10 cycle 3 |
+| greeting | should no longer sound rushed; this is the audible check |
+| `ttfat_s` | unchanged (0.003–0.21 s); B3 is an audio fix, not a latency one |
+
+If the greeting still sounds rushed *and* `input_dropped` is flat after startup,
+the backlog was not the cause of burst 1 and D10 cycle 3's attribution is wrong.
+
+#### Previous standing (historical): reverted to OPTIONAL / low priority
 
 This section briefly read "DECIDED: bounded queue with drop-oldest", on the theory that the
 drain phase's faster-than-real-time delivery overran the client's playback buffer and caused

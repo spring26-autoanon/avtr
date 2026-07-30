@@ -33,6 +33,8 @@ from scripts.instrumented_server import (
     _build_retrieval_backend_for_demo,
     _patch_rag_manager_get_reference_text,
     _push_instrumentation,
+    _DropOldestQueue,
+    _input_queue_max_frames,
     _slot_backlog_rows,
     _step_pacing_enabled,
 )
@@ -1001,6 +1003,10 @@ def test_slot_backlog_rows_reports_lag_frames():
             "frames_received": 100,
             "frames_consumed": 52,
             "lag_frames": 48,
+            # None here because _FakeSlotChannel uses a plain queue stub; the
+            # bounded B3 queue reports a real count — see
+            # test_slot_backlog_rows_reports_input_dropped.
+            "input_dropped": None,
         }
     ]
 
@@ -1077,3 +1083,159 @@ def test_write_step_diag_does_not_pollute_turns_or_raw_events(tmp_path):
 
     assert (tmp_path / "turns.jsonl").read_text() == ""
     assert (tmp_path / "raw_events.jsonl").read_text() == ""
+
+
+# ── B3: _DropOldestQueue / _input_queue_max_frames ───────────────────────────
+
+
+class _Frame:
+    """Stand-in for moshi-rag's StepInput — a mutable dataclass with is_first."""
+
+    def __init__(self, tag, is_first=False):
+        self.tag = tag
+        self.is_first = is_first
+
+
+def _drain(q):
+    out = []
+    while True:
+        try:
+            out.append(q.get_nowait())
+        except asyncio.QueueEmpty:
+            return out
+
+
+def test_input_queue_max_frames_default_is_two(monkeypatch):
+    monkeypatch.delenv("DEMO_INPUT_QUEUE_MAX", raising=False)
+    assert _input_queue_max_frames() == 2
+
+
+def test_input_queue_max_frames_zero_means_unbounded(monkeypatch):
+    monkeypatch.setenv("DEMO_INPUT_QUEUE_MAX", "0")
+    assert _input_queue_max_frames() == 0
+
+
+def test_input_queue_max_frames_bad_value_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("DEMO_INPUT_QUEUE_MAX", "not-a-number")
+    assert _input_queue_max_frames() == 2
+
+
+def test_drop_oldest_queue_caps_at_max_frames():
+    async def run():
+        q = _DropOldestQueue(2)
+        for i in range(10):
+            await q.put(_Frame(i))
+        assert q.qsize() == 2
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_keeps_the_newest_frames():
+    """Drop-oldest, not drop-newest: the model must resume from live audio, not
+    from whatever was queued first."""
+    async def run():
+        q = _DropOldestQueue(2)
+        for i in range(5):
+            await q.put(_Frame(i))
+        assert [f.tag for f in _drain(q)] == [3, 4]
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_counts_drops():
+    async def run():
+        q = _DropOldestQueue(2)
+        for i in range(5):
+            await q.put(_Frame(i))
+        assert q.dropped == 3  # 5 put, 2 retained
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_never_loses_is_first():
+    """The critical hazard. is_first drives BatchRunner.run_step()'s
+    mimi/lm_gen reset_streaming; silently dropping it would leave the models in
+    the previous connection's state. It must transfer to the survivor."""
+    async def run():
+        q = _DropOldestQueue(2)
+        await q.put(_Frame("first", is_first=True))
+        for i in range(4):
+            await q.put(_Frame(i))
+
+        survivors = _drain(q)
+        assert not any(f.tag == "first" for f in survivors)  # it really was dropped
+        assert any(f.is_first for f in survivors), "is_first was lost"
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_is_first_transfers_only_once_and_not_spuriously():
+    async def run():
+        q = _DropOldestQueue(1)
+        await q.put(_Frame("a"))
+        await q.put(_Frame("b"))
+        # No is_first anywhere in, so none out.
+        assert [f.is_first for f in _drain(q)] == [False]
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_under_cap_drops_nothing():
+    async def run():
+        q = _DropOldestQueue(4)
+        for i in range(3):
+            await q.put(_Frame(i))
+        assert q.dropped == 0
+        assert [f.tag for f in _drain(q)] == [0, 1, 2]
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_get_nowait_still_raises_queue_empty():
+    """ServerState._gather_step_inputs() relies on asyncio.QueueEmpty."""
+    async def run():
+        q = _DropOldestQueue(2)
+        with pytest.raises(asyncio.QueueEmpty):
+            q.get_nowait()
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_put_does_not_block_when_full():
+    """put() must never apply backpressure to Channel._recv_loop — a blocked
+    recv loop would stall the STT feed too, since send_audio precedes the
+    queue put."""
+    async def run():
+        q = _DropOldestQueue(1)
+        for i in range(50):
+            await asyncio.wait_for(q.put(_Frame(i)), timeout=0.5)
+        assert q.qsize() == 1
+
+    asyncio.run(run())
+
+
+def test_drop_oldest_queue_interleaved_put_and_get_behaves_like_a_queue():
+    async def run():
+        q = _DropOldestQueue(2)
+        await q.put(_Frame(0))
+        assert q.get_nowait().tag == 0
+        await q.put(_Frame(1))
+        await q.put(_Frame(2))
+        assert [f.tag for f in _drain(q)] == [1, 2]
+        assert q.dropped == 0
+
+    asyncio.run(run())
+
+
+def test_slot_backlog_rows_reports_input_dropped():
+    channel = _FakeSlotChannel(qsize=2, sent_samples=1920 * 40)
+    channel.input_queue.dropped = 37
+    rows = _slot_backlog_rows(_FakeServer([channel]), {id(channel): 38})
+    assert rows[0]["input_dropped"] == 37
+
+
+def test_slot_backlog_rows_input_dropped_is_none_on_an_unbounded_queue():
+    """DEMO_INPUT_QUEUE_MAX=0 leaves upstream's plain asyncio.Queue in place."""
+    channel = _FakeSlotChannel(qsize=2, sent_samples=1920 * 40)
+    rows = _slot_backlog_rows(_FakeServer([channel]), {id(channel): 38})
+    assert rows[0]["input_dropped"] is None
