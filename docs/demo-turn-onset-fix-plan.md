@@ -446,7 +446,57 @@ Downstream of that deletion, when it happens: `core/gpu.py`'s
 | D7 | Report the `--power-threshold` default gap upstream | `moshi.server` defaults `None`; `run_inference.py` and the paper's training both use `-65` |
 | D8 | `power_threshold=-65` zeroes ~14% of 80 ms frames *inside* real user speech | Measure only for now. A higher or hysteretic gate may suit live microphone input better than the value tuned for TTS training audio |
 | D9 | `demo/client` reports 22 npm vulnerabilities (5 moderate, 16 high, 1 critical) | Parked 2026-07-30, assessed non-blocking — see below. **Do not run `npm audit fix --force`** before the VM trip |
-| D10 | **Metallic artifact at every model-utterance onset** — client-side adaptive playback cap (`newMaxBufferMs` ratcheting 15→35 ms) drops 18–69 ms of audio at each turn start | Root-caused 2026-07-30 from session 3's `client_audio_diag`: 5/5 drop bursts within ±0.31 s of a turn onset. Client-side only; unrelated to pacing/batch size; present in every session ever recorded. Now the top *audio-quality* item, and the likely real cause of the long-running "metallic/buzzy audio" thread in `project_demo_audio_quality_investigation`. Fix is in `audio-processor.ts`'s buffer heuristic — pre-warm the cap or start it at the settled value instead of ratcheting up from 15 ms |
+| D10 | **Metallic artifact at every model-utterance onset** — client playback drop threshold started at its floor and was learned by failing | **FIX IMPLEMENTED 2026-07-30, needs a listen** — see below |
+
+### D10 — metallic artifact at each utterance onset (fix implemented, needs a listen)
+
+**Root cause**, from session 3's `client_audio_diag_*.json` — the first such
+capture taken on a session whose server side is fully understood:
+
+`audio-processor.ts` starts *both* of its adaptive buffer parameters at the
+floor of an 80 ms range and only ever raises them **when a failure occurs**:
+
+- `maxBufferSamples` (10 ms, → drop threshold `totalMaxBufferSamples()` = 100 ms)
+  grows by 5 ms only inside the drop branch — each increment paid for with a
+  real discard of 18–69 ms of speech.
+- `partialBufferSamples` (10 ms) grows by 5 ms only inside the underrun branch.
+
+So reaching a workable threshold takes 14 audible glitches, and every session
+re-learns from scratch. Measured: **56 drops, 5 underruns, 6 resumes**, with
+all five drop bursts landing within ±0.31 s of a model turn onset (onsets at
+client-clock 4.5 / 12.2 / 28.3 / 42.7 / 57.8 s; bursts at 4.79 / 12.34 /
+28.02 / 42.48 / 57.81 s). That is precisely "metallic at the start of each
+utterance, then it smooths out", and it is present in every session ever
+recorded — unrelated to pacing, batch size, or anything in the latency fix.
+It is very likely the real cause of the long-running "metallic/buzzy audio"
+thread in `project_demo_audio_quality_investigation`, which was previously
+misattributed to step pacing.
+
+**Fix**: start `maxBufferSamples` at its own ceiling
+(`maxMaxBufferWithIncrements`, 80 ms) in both the constructor and
+`initState()`. One value, in two places.
+
+Why this costs no steady-state latency: `totalMaxBufferSamples()` is the
+*drop threshold*, not the operating depth. Depth is set by the arrival/drain
+balance — measured `liveBufferS` sat at 70–81 ms while the threshold was
+100–170 ms. Raising the threshold only stops the trimming, so burst audio
+gets played slightly later rather than discarded, which is strictly better
+than a glitch. The increment machinery is left in place (it is upstream's,
+and is simply a no-op at the ceiling), so this stays a one-value revert.
+
+`partialBufferSamples` is deliberately **not** raised: unlike the other one it
+does cost real latency (`start()` makes playback wait that long before
+resuming, on every stream start and underrun recovery), and at 5 underruns vs
+56 drops it is a minor contributor. Revisit only if underruns dominate once
+the drop fix lands.
+
+**Validation**: cannot be verified locally — there is no Node toolchain here
+and no client test suite (`vitest` is configured but `demo/client/src` has no
+`*.test.ts`). Needs `npm run build` on the VM plus a listen. Expected: drop
+events fall from ~56 to near zero, `liveBufferS` stays in the same 70–81 ms
+band, and the per-utterance onset artifact goes away. If artifacts persist
+with drops at zero, the remaining source is the underrun path and
+`partialBufferSamples` becomes the next lever.
 
 ### D9 — npm vulnerabilities in `demo/client` (parked, non-blocking)
 
