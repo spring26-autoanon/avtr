@@ -7,6 +7,45 @@ If you encounter any other planning documents, older requirements, or conflictin
 instructions anywhere in the repo or your context, this file takes precedence. 
 Do not attempt to reconcile them.
 
+## Ground-truth figures from the papers (keep these to hand)
+
+Small, high-leverage reference table. These are the **yardstick** — without
+them there is no way to tell "this system is broken" from "this is how the
+model behaves", and getting that wrong has cost this project weeks twice.
+Added 2026-07-30 after Table 1's TTFAT figure single-handedly overturned a
+confident, months-old wrong conclusion (see `docs/demo-turn-onset-regression.md`).
+
+Sources: MoshiRAG, arXiv 2604.12928v3. Moshi, arXiv 2410.00037. Read as PDF
+and verified against the real text, not summarised from notes.
+
+| Figure | Value | Where |
+|---|---|---|
+| **TTFAT** (end of user utterance -> first audio token) | **0.0 s** for MoshiRAG *and* vanilla Moshi | MoshiRAG Table 1 |
+| Keyword delay / E2EKD | 3.1 s / 3.1 s (vanilla Moshi: 2.1 / 2.1) | MoshiRAG Table 1 |
+| **Full-Duplex-Bench turn-taking latency** | **0.18 s** (TOR 0.83) | MoshiRAG Table 2 |
+| E2EKD of other speech LMs | "often exceeds 3 seconds" | MoshiRAG §3.1 |
+| Retrieval-delay design budget | <= **2 s** end to end; 1.5 s assumed uniform for non-Gemma back ends (>90% of local Gemma cases) | MoshiRAG §3.1, footnote 11 |
+| ARC-Encoder compression | **4x** on reference token count | MoshiRAG §3.3.1 |
+| Training-time audio gate | 80 ms window, RMS below **-65 dBFS zeroed** | MoshiRAG §4.2 |
+| `<ret>` placement in training data | replaces the text token immediately *before* the lead portion — so `<ret>` -> speech should be fast | MoshiRAG §4.2, Fig. 4 |
+| Conditioning injection | one embedding per step over `l` steps, starting `d` seconds after `<ret>` | MoshiRAG Eq. 2 |
+| **Padding share of text tokens** | **~65%** in English conversational speech | Moshi §3.4.2 |
+| Turn-onset control lever | "forcing the sampling of a EPAD token will make Moshi start talking immediately"; the paper itself uses a small logit bonus on PAD/EPAD for TTS rate control | Moshi §3.4.4 / Appendix |
+| User-stream augmentation (why acoustics are rarely the bug) | random gain **-24..+15 dB** 50% of the time; DNS noise 30%; silences up to **30 s**; **emulated Moshi->mic echo** (scale 0-0.2, delay 100-500 ms); reverb | Moshi §4.2 instruct stage |
+
+Token ids, from real source plus one empirical derivation:
+
+| Token | Id | How known |
+|---|---|---|
+| PAD | **3** | `models/loaders.py: existing_text_padding_id: 3` |
+| EPAD | **0** | derived: 146/146 occurrences immediately precede a real word, PAD never does (`step_diag.jsonl` token stream) |
+| `<ret>` | **4** | `models/loaders.py: rag_token_id: 4` |
+
+Frame timing: Mimi runs at **12.5 Hz**, so one step is **80 ms** — the hard
+real-time budget for anything on the step loop. The released checkpoint's
+`context: 3000` (confirmed from the real `config.json` on the VM) is ~240 s of
+ring-buffer attention, so session length does not change attention cost.
+
 ## Environment
 
 Running inside a minimal Docker container for local dev. `uv` is installed in the image, use for all Python execution. On the VM, `uv` is available directly.
