@@ -4,40 +4,59 @@ Companion to [`demo-turn-onset-regression.md`](demo-turn-onset-regression.md), w
 evidence. This file is the sequenced work, the VM validation points, and the decisions that
 need a human call before implementation.
 
-**Recommended shape: one code drop, staged validation.** Every behaviour change below is
-already (or becomes) env-gated, so all of Phase A and Phase B can land in a single
-implementation pass and then be A/B'd on **one** VM trip by toggling environment variables
-between sessions. That is more efficient than strict phase-by-phase implementation and loses
-no attributability, because each session isolates exactly one variable. Phase B3 is the one
-item that must wait for real data.
+**Status: complete and merged.** Kept in full as the working record — the plan, every A/B,
+and the three reversed conclusions along the way (each of which cost real time and is worth
+not repeating). Read "Where this stands" next for the summary; the phase sections below are
+the detail.
 
-## Where this stands / next session (as of 2026-07-30, end of session)
+**Original framing, which held up:** one code drop, staged validation. Every behaviour change
+was env-gated, so a phase could land in a single implementation pass and then be A/B'd on one
+VM trip by toggling environment variables between sessions — more efficient than strict
+phase-by-phase implementation, and no loss of attributability because each session isolated
+exactly one variable.
 
-**The turn-onset regression is fixed, VM-validated, and closed.** `ttfat_s` went
-4.45 / 0.07 / 3.37 / 7.10 s → 0.035 / 0.210 / 0.036 / 0.003 s across three A/B sessions,
-which matches the paper's own figures. Nothing about it is outstanding.
+## Where this stands (2026-07-30 — COMPLETE, merged to `main`)
 
-Committed on branch `fix/demo-turn-onset-regression`, **not pushed**:
+**Both the turn-onset regression and the D10 audio artifact are fixed and VM-validated.**
+Six live sessions across the arc; every behaviour change was A/B'd with one variable moved.
 
-| commit | what |
-|---|---|
-| `6cf268a` | the fix + step-backlog diagnostics + `ttfat_s` re-anchoring |
-| `f7df38f` | Option E / STT-off-thread chain deleted (−1317 lines) |
-| `7fb979d` | D10 buffer attempt (superseded by the next commit) |
-| `fb4239c` | moshi-style retrieval default on both paths; D10 attempt reverted |
+| metric | before | after |
+|---|---|---|
+| `ttfat_s` per turn | 4.45 / 0.07 / 3.37 / 7.10 s | **0.036 / 0.200 / 0.000 / 0.036 s** |
+| client audio discarded | 5.334 s (7.2% of received) | **0.158 s (0.2%)** |
+| client drops / underruns | 55 / 4 | **5 / 3** |
+| step periods > 100 ms | 4 per session | **0** |
+| `mean_period_ms` | 82.9 (floored by pacing) | **80.00 mean, 79.99 median** |
 
-Local suite green (399 tests). Everything is at its default: `bash scripts/run_demo.sh`
-now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend with no flags.
+`ttfat_s` now matches the paper's own figures (TTFAT 0.0 s, Full-Duplex-Bench turn-taking
+0.18 s). Retrieval answers on the final session were all factually correct, including a
+textbook pre-RAG filler ("let me check that for you") — the paper's designed behaviour.
 
-**Open, in priority order:**
+**Four root causes, all self-inflicted by this repo's own patches, none upstream:**
 
-1. **D10 remainder — FIXED, needs one VM session.** The 113–133 ms step hitches behind the
-   residual underruns were attributed to a blocking `retrieval_backend.retrieve()` call inside
-   an `async def` (4/4 hitches matched a retrieval, extra wall time ≈ `api_call_s` to the
-   millisecond) and fixed with `asyncio.to_thread` on both the demo and eval paths. Expected:
-   hitches gone, underruns 7 → ~0, per-turn artifact gone. B3 itself is done and VM-validated
-   (client audio loss 7.2% → 0.8%, greeting artifact gone, no latency cost). Note the metric
-   caveat in the B3 section: with B3 on, true backlog is `lag_frames − input_dropped`.
+1. `_patch_server_state_step_pacing()` froze an input-queue backlog → 4–19 s turn onsets.
+2. `Channel.input_queue` unbounded → draining the startup backlog at 1.78× real time made
+   the client discard ~47% of the greeting.
+3. `retrieval_backend.retrieve()` called synchronously inside an `async def` → the event
+   loop blocked for 0.45–0.63 s per `<ret>`, starving the client's buffer once per turn.
+4. The demo's `ttfat_s` anchored after the stall it was meant to measure → the whole thing
+   read as 0.08–0.40 s for weeks.
+
+**Remaining open items** (none blocking, none related to the above):
+
+1. **Retrieval quality** — much improved on the moshi-style default (final session's answers
+   all correct), but not formally re-assessed. The one hard datum still outstanding: an
+   earlier session's reference explicitly flagged the model's own error and the model
+   repeated it anyway.
+2. **Re-baseline evals.** The retrieval-backend default changed, so pre-2026-07-30 scored
+   runs are not comparable to new ones.
+3. **D9** — `npm audit --omit=dev` to close out the vulnerability question.
+4. **Residual D10**, if ever worth it: 3 underruns / 0.158 s (0.2%) remain. Diminishing
+   returns; the lever would be a deeper client buffer at a ~110 ms latency cost.
+
+**Metric caveat that will bite the next reader:** with B3 on, `lag_frames` is **not** a
+backlog measure — dropped frames are received but never consumed, so they inflate it
+permanently. True backlog is `lag_frames − input_dropped`.
 3. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
    that prompted the escalation came from three sessions that unknowingly ran the weaker
    `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
@@ -238,10 +257,20 @@ Covered by a mechanism test rather than inspection
 fake backend blocks a real thread with `time.sleep` and a concurrent ticker
 coroutine must keep ticking on schedule. Suite 413 → 415.
 
-**Not yet VM-validated.** Expected: the 113–133 ms step-period hitches disappear,
-`liveBufferS` stops being starved at turn onsets, underruns drop from 7 toward 0,
-and the residual per-turn artifact goes with them. If hitches persist, the
-remaining candidates are the conditioning fetch's known GIL contention and GC.
+**VM-VALIDATED (`2026-07-30T22-56-41Z`).** Every predicted signal landed:
+
+| signal | S5 (blocking) | S6 (off-loop) |
+|---|---|---|
+| step periods > 100 ms | 4 (113–133 ms) | **0** (max 81.57 ms, median 79.99) |
+| `input_dropped` | 32 → 56 | **32 → 32, flat** |
+| client drops | 12 | **5** |
+| underruns | 6 | **3** |
+| audio discarded | 0.636 s | **0.158 s** |
+
+`mean_period_ms` is now locked to 80.00 mean / 79.99 median across 87 samples —
+the step loop tracks real time exactly, with no excursions. `input_dropped`
+going flat confirms the same hitches were driving the residual *input*-side
+drops, as predicted. Operator confirms the per-turn artifact is gone.
 
 **Two candidate fixes, a genuine trade-off — option 2 was taken, see above:**
 
@@ -661,7 +690,7 @@ Downstream of that deletion, when it happens: `core/gpu.py`'s
 | D7 | Report the `--power-threshold` default gap upstream | `moshi.server` defaults `None`; `run_inference.py` and the paper's training both use `-65` |
 | D8 | `power_threshold=-65` zeroes ~14% of 80 ms frames *inside* real user speech | Measure only for now. A higher or hysteretic gate may suit live microphone input better than the value tuned for TTS training audio |
 | D9 | `demo/client` reports 22 npm vulnerabilities (5 moderate, 16 high, 1 critical) | Parked 2026-07-30, assessed non-blocking — see below. **Do not run `npm audit fix --force`** before the VM trip |
-| D10 | **Metallic artifact at every model-utterance onset** — 7.2% of received audio discarded, in five bursts, one per model turn | **DIAGNOSED (cycle 3), fix not yet implemented.** Two causes: burst 1 (2.53 s, ~47% of the greeting) is the startup backlog drain — fixed by **B3**, a bounded server-side input queue; bursts 2–5 (0.45–1.1 s each, each preceded by an underrun) are per-turn sender transients that a deeper client buffer would absorb. Do B3 first, then re-measure. See cycle 3 below |
+| ~~D10~~ | ~~Metallic artifact at every model-utterance onset~~ | **RESOLVED 2026-07-30 & VM-validated.** Two causes, both fixed: the startup backlog drain (→ **B3**, bounded input queue) and a blocking `retrieval_backend.retrieve()` on the event loop (→ `asyncio.to_thread`). Audio discarded 5.334 s → **0.158 s** (7.2% → 0.2%); step-period hitches 4 → **0**. Residual 3 underruns / 0.2% left as diminishing returns. Full arc in cycles 1–3 below |
 
 ### D10 — metallic artifact at each utterance onset (fix implemented, needs a listen)
 

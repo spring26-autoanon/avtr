@@ -1,9 +1,24 @@
 # Demo turn-onset regression — independent re-analysis (2026-07-30)
 
-**Status:** root cause identified with strong evidence; **one decisive measurement still
-outstanding** (see [§8](#8-the-one-decisive-experiment-still-missing)). Written from a
+**Status: RESOLVED and VM-validated (2026-07-30), merged to `main`.** Written from a
 deliberately fresh review of the whole demo path — upstream source, both papers, and every
 saved demo session in `demo/sessions/` — without assuming any prior conclusion in this repo.
+
+§8 below asks for one decisive measurement before acting. It was taken, the diagnosis held,
+and the fix was validated across three A/B sessions:
+
+| | before | after |
+|---|---|---|
+| `ttfat_s` per turn | 4.45 / 0.07 / 3.37 / 7.10 s | **0.036 / 0.200 / 0.000 / 0.036 s** |
+| client audio discarded | 5.334 s (7.2% of received) | **0.158 s (0.2%)** |
+| step periods > 100 ms | 4 per session | **0** |
+
+Two further self-inflicted defects surfaced during validation and were fixed alongside: an
+unbounded `Channel.input_queue`, whose startup backlog cost ~47% of the model's greeting when
+drained, and `retrieval_backend.retrieve()` called synchronously inside an `async def`,
+blocking the event loop for 0.45–0.63 s per `<ret>`. See
+[`demo-turn-onset-fix-plan.md`](demo-turn-onset-fix-plan.md) for the full arc, including three
+conclusions of mine that were reversed by measurement along the way.
 
 **This document supersedes the framing of three CLAUDE.md sections.** Those sections are
 kept in place, not rewritten, with correction pointers back here:

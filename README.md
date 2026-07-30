@@ -21,7 +21,7 @@ Full requirements/spec: [`specs/moshirag-evals-requirements.md`](specs/moshirag-
 
 Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM.
 
-**Current thread:** the demo's long turn-onset delay ("pad stall") was re-analysed from scratch on 2026-07-30 and traced to a regression this repo introduced, not model behaviour — see [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) for the evidence and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md) for the sequenced fix. One decisive VM measurement is still outstanding before any code changes. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
+**Most recent work (2026-07-30, complete):** the demo's long turn-onset delay ("pad stall") and its metallic per-turn audio artifact were both traced to regressions this repo introduced — not model behaviour — and fixed. `ttfat_s` went 4.45–7.10 s to 0.00–0.20 s (matching the paper's own figures) and client-side audio loss went 7.2% to 0.2%, VM-validated across six live sessions. See [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) for the evidence and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md) for the fix arc and remaining open items. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
 
 ## Requirements & setup
 

@@ -1338,6 +1338,19 @@ explicitly opt back into the off-thread + Option E chain.
 
 ### SUPERSEDED: "Real root cause of demo response lag: model-generation `<pad>` sampling drift" — the stall is real, but it is a regression this repo introduced, not learned model behaviour (2026-07-28, corrected 2026-07-30)
 
+**RESOLVED 2026-07-30 — read `docs/demo-turn-onset-regression.md` and
+`docs/demo-turn-onset-fix-plan.md` first; this section is superseded
+history.** Final validated state: `ttfat_s` 4.45–7.10s -> 0.00–0.20s
+(matching the paper's TTFAT 0.0s / turn-taking 0.18s), and client-side
+audio loss 7.2% -> 0.2%. Four root causes, all self-inflicted by this
+repo's own patches and none upstream: (1) `_patch_server_state_step_pacing()`
+froze an input-queue backlog; (2) `Channel.input_queue` was unbounded, so
+draining that backlog at 1.78x real time made the client discard ~47% of
+the model's greeting; (3) `retrieval_backend.retrieve()` ran synchronously
+inside an `async def`, blocking the event loop 0.45–0.63s per `<ret>`;
+(4) the demo's own `ttfat_s` was anchored *after* the stall it existed to
+measure, which is why this went undiagnosed for weeks.
+
 **Correction (2026-07-30) — read `docs/demo-turn-onset-regression.md` first.**
 Everything this section *measures* holds up: the `<pad>` stall before
 `<ret>` is real, it dominates the user-perceived delay, and retrieval /
