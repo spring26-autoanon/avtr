@@ -31,22 +31,22 @@ now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend wit
 
 **Open, in priority order:**
 
-1. **D10 — the metallic artifact at each utterance onset.** Open, narrowed to a
-   **server-side** question after cycle 2. The client side is now fully explained and the
-   sample-rate hypothesis is refuted; crucially, buffer tuning is *proven* unable to fix it
-   (frequency × size is invariant — see the table in cycle 2). Next step: instrument frames
-   *sent* in `Channel._output_loop` and compare against `step_diag.jsonl`'s step count. Do
-   **not** touch `audio-processor.ts` again without new evidence; two attempts have been
-   reverted. Pre-existing and independent of the latency work.
-2. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
+1. **B3 — bounded server-side input queue.** Now the top item: D10 cycle 3 showed the
+   startup backlog drain discards ~47% of the model's greeting (2.53 s of the session's
+   5.33 s total loss). Cap `Channel.input_queue` at ~2 frames, drop-oldest. Then re-measure.
+2. **D10 — remainder.** Diagnosed, not fixed. After B3, bursts 2–5 (0.45–1.1 s each, each
+   preceded by one underrun) are the residual; a deeper client buffer is the right tool for
+   those, but only measure it *after* B3. Confirm the `opus_bytes`-skip mechanism before
+   touching `_output_loop`. Do not change `audio-processor.ts` without re-measuring first —
+   two attempts have already been reverted.
+3. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
    that prompted the escalation came from three sessions that unknowingly ran the weaker
    `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
    one hard datum that survives: turn 4's reference explicitly flagged the model's own error
    and the model repeated it anyway.
-3. **Re-baseline evals.** The retrieval-backend default changed, so pre-2026-07-30 scored
+4. **Re-baseline evals.** The retrieval-backend default changed, so pre-2026-07-30 scored
    runs are not comparable to new ones.
-4. **D9** — `npm audit --omit=dev` to close out the vulnerability question.
-5. **B3** — optional robustness only; fixes no observed problem at `--batch-size 1`.
+5. **D9** — `npm audit --omit=dev` to close out the vulnerability question.
 
 **Things not to redo** (each cost real time this session): don't restore step pacing; don't
 raise the client's buffer threshold; don't read `delay` instead of `liveBufferS`; don't run a
@@ -171,6 +171,16 @@ post-hitch mini-backlogs — but it fixes **no observed problem** at `--batch-si
 the backlog drains in ~5 s, before the first user turn even completes (session 3: `lag_frames`
 reached 1 at t=5.4 s; the first model turn began at t=4.5 s). It is insurance against slower
 hardware or genuinely concurrent slots, not a fix. Do not implement it on latency grounds.
+
+**RE-ELEVATED (2026-07-30, D10 cycle 3) — it fixes a real, measured problem after all, just
+not a latency one.** The paragraph above is right that the backlog costs no *latency* at
+`--batch-size 1`. What it missed is that *draining* it costs **audio**: the drain runs at
+~1.78× real time, the client cannot buffer the surplus, and it discards **2.534 s — about 47%
+of the model's greeting** — which is the largest single contributor to the D10 artifact and
+exactly what the operator described as the opening phrase sounding "rushed through". Dropping
+those frames at the *input* costs nothing (that window precedes any user speech); dropping
+them at the *output* destroys half the greeting. **B3 is now the recommended next code
+change**, ahead of anything client-side. See D10 cycle 3.
 
 **A1, A2, B1, B2, C1 and the C2 documentation half are implemented.** Full local suite green
 (411 → 432 tests).
@@ -489,7 +499,7 @@ Downstream of that deletion, when it happens: `core/gpu.py`'s
 | D7 | Report the `--power-threshold` default gap upstream | `moshi.server` defaults `None`; `run_inference.py` and the paper's training both use `-65` |
 | D8 | `power_threshold=-65` zeroes ~14% of 80 ms frames *inside* real user speech | Measure only for now. A higher or hysteretic gate may suit live microphone input better than the value tuned for TTS training audio |
 | D9 | `demo/client` reports 22 npm vulnerabilities (5 moderate, 16 high, 1 critical) | Parked 2026-07-30, assessed non-blocking — see below. **Do not run `npm audit fix --force`** before the VM trip |
-| D10 | **Metallic artifact at every model-utterance onset** — client discards ~600 ms of audio per second of playback | **OPEN, but narrowed to a server-side question.** Client mechanism fully explained (80 ms frames, 48 kHz context, zero-headroom drop threshold); sample-rate hypothesis refuted; **buffer tuning proven unable to fix it** — the loss rate is set by an unexplained ~1.6–1.8× arrival-vs-playback imbalance. Next step is instrumenting frames *sent*, not the client. See cycle 2 below |
+| D10 | **Metallic artifact at every model-utterance onset** — 7.2% of received audio discarded, in five bursts, one per model turn | **DIAGNOSED (cycle 3), fix not yet implemented.** Two causes: burst 1 (2.53 s, ~47% of the greeting) is the startup backlog drain — fixed by **B3**, a bounded server-side input queue; bursts 2–5 (0.45–1.1 s each, each preceded by an underrun) are per-turn sender transients that a deeper client buffer would absorb. Do B3 first, then re-measure. See cycle 3 below |
 
 ### D10 — metallic artifact at each utterance onset (fix implemented, needs a listen)
 
@@ -556,6 +566,79 @@ remaining candidates — nor even establish whether the dropped audio is speech
 on D10: log the AudioContext's actual `sampleRate` and each decoded
 `frame.length` in `audio-processor.ts`'s `onmessage`, once per session. **Not
 yet added** — deliberately parked, see "Read on this" below.
+
+#### Cycle 3 (2026-07-30, later still) — resolved, and it re-justifies B3
+
+Again no new session. The arrival rate is recoverable from the diag via an
+identity in the worklet: `timeInStream` is incremented by **both** playback and
+drops, and the payload's `delay` field is `micDuration − timeInStream`. So
+`played + dropped` is derivable and cross-checks against the summed
+`droppedMs`.
+
+**Correction to cycle 1/2's headline number.** Over the whole session:
+`actualAudioPlayed` = 68.52 s, summed drops = **5.33 s**, wall = 76.31 s. So
+total discarded is **7.2% of received audio**, and arrival/wall = **0.968** —
+essentially real time. My earlier "~1.8× arrival, ~45% of the greeting
+discarded" was a *local* measurement over one 3.3 s window that I wrongly
+generalised to the session. The two `timeInStream` estimates agree to within
+2.1 s over 76 s, which is the `micDuration`-vs-socket-open offset.
+
+**Where the loss actually is** — clustered into exactly five bursts, one per
+model turn:
+
+| burst | window | dropped | drops | underruns | turn onset |
+|---|---|---|---|---|---|
+| 1 | 5.0–8.3 s | **2.534 s** | 26 | 0 | 4.8 (greeting) |
+| 2 | 12.3–14.0 s | 1.110 s | 11 | 1 | 12.5 |
+| 3 | 32.3–32.9 s | 0.449 s | 5 | 1 | 32.6 |
+| 4 | 43.3–44.1 s | 0.562 s | 6 | 1 | 43.5 |
+| 5 | 57.7–58.6 s | 0.679 s | 7 | 1 | 57.9 |
+
+Two distinct phenomena, not one:
+
+- **Burst 1 is the startup backlog drain.** 2.534 s discarded over 3.3 s — ~47%
+  of the greeting, which is why it sounds rushed. It is ~5× any other burst, has
+  **no** underrun, and coincides (within the couple of seconds of clock-anchor
+  uncertainty between `step_diag`'s process-start anchor and the client's
+  socket-open anchor) with `lag_frames` falling 29 → 1. This is genuine surplus
+  audio: the server really does emit ~1.78× real time while draining, and the
+  client has nowhere to put it.
+- **Bursts 2–5 are per-turn transients.** Each is preceded by exactly **one
+  underrun and one resume**: the buffer empties during the between-turns gap,
+  playback stops, refills to `initialBufferSamples` (80 ms), resumes — and is
+  then flooded. Underrun-then-oversupply is the signature of the *sender*
+  pausing and then catching up. The likely mechanism is `_output_loop`'s
+  `if len(opus_bytes) > 0` skip: `sphn.OpusStreamWriter` buffers until it has a
+  complete frame, and near-silence compresses to almost nothing, so during a
+  model pause several steps emit zero bytes and are skipped, then the backlog
+  flushes when speech resumes. Not yet confirmed against `sphn`'s behaviour.
+
+**Correction to cycle 2's invariance argument.** "Frequency × size is invariant,
+so buffer tuning cannot help" holds only for a **persistent** rate imbalance —
+which is burst 1. For the **transient** bursts 2–5, around a balanced 0.968×
+average, a deeper buffer absorbs them with *zero* loss. Cycle 2 over-generalised
+from the greeting to the whole session, exactly as cycle 1 did with the 45%
+figure. So client-side buffering is not useless after all; it is simply the
+wrong tool for burst 1 and the right one for bursts 2–5.
+
+**This re-justifies B3, which was downgraded to "fixes no observed problem".**
+A bounded `Channel.input_queue` with drop-oldest eliminates the startup backlog
+outright, and with it burst 1 — **2.534 s of the 5.33 s total, the single
+largest contributor, and the one the operator described most clearly ("the
+opening phrase feels even more rushed through").** Dropping that audio at the
+*input* costs nothing (it is the pre-greeting window, before the user has
+spoken) whereas dropping it at the *output* destroys half the greeting.
+
+**Recommended next code change, in order:**
+
+1. **B3 server-side** — bounded input queue, cap ~2 frames, drop-oldest. Removes
+   burst 1. Independently justified, and cheap.
+2. *Then* re-measure. If bursts 2–5 survive, a deeper client buffer is the
+   correct fix for them — but only measure it after B3, because B3 changes the
+   startup condition that cycle 1's attempt was implicitly fighting.
+3. Confirm or refute the `opus_bytes`-skip mechanism for bursts 2–5 before
+   touching `_output_loop`: count steps where `len(opus_bytes) == 0` and check
+   they cluster in the between-turn gaps.
 
 #### Cycle 2 (2026-07-30, later) — hypothesis refuted, mechanism found, and buffer tuning ruled out
 
