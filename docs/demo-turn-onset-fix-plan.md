@@ -31,16 +31,13 @@ now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend wit
 
 **Open, in priority order:**
 
-1. **B3 — IMPLEMENTED, needs one VM session.** Bounded drop-oldest
-   `Channel.input_queue` (cap 2, `DEMO_INPUT_QUEUE_MAX=0` disables). Targets the
-   startup-backlog drain that discards ~47% of the model's greeting (2.53 s of the session's
-   5.33 s total loss). See the B3 section for the expected-signals table; the audible check
-   is whether the greeting still sounds rushed.
-2. **D10 — remainder.** Diagnosed, not fixed. After B3, bursts 2–5 (0.45–1.1 s each, each
-   preceded by one underrun) are the residual; a deeper client buffer is the right tool for
-   those, but only measure it *after* B3. Confirm the `opus_bytes`-skip mechanism before
-   touching `_output_loop`. Do not change `audio-processor.ts` without re-measuring first —
-   two attempts have already been reverted.
+1. **D10 remainder — server step hitches.** B3 is **done and VM-validated**: client audio
+   loss 7.2% → 0.8%, the greeting artifact gone, no latency cost. The residual is 7 underruns
+   (one per turn), caused by occasional 113–133 ms step periods exceeding the client's entire
+   ~90 ms buffer. Preferred next step is attributing those hitches (correlate against
+   `server.log`'s retrieval events / GC) — that costs no latency. Fallback is deepening the
+   client buffer to ~200 ms, which costs ~110 ms of playback latency. See the B3 section.
+   Note the metric caveat there: with B3 on, true backlog is `lag_frames − input_dropped`.
 3. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
    that prompted the escalation came from three sessions that unknowingly ran the weaker
    `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
@@ -153,7 +150,68 @@ start for a permanent multi-second latency, by guaranteeing the drain never comp
 is a materially fairer characterisation than "the premise was wrong", and it is why B3 is now
 required rather than conditional.
 
-### B3 — IMPLEMENTED 2026-07-30, not yet VM-validated
+### B3 — VM-VALIDATED 2026-07-30 (`2026-07-30T22-38-51Z/`). Works; residual re-diagnosed.
+
+| | S4 baseline (B3 off) | S5 (B3 on) |
+|---|---|---|
+| total audio discarded by client | 5.334 s | **0.636 s** |
+| loss as % of received audio | 7.2% | **0.8%** |
+| burst 1 (the greeting) | 2.534 s, 26 drops | **gone** |
+| other bursts | 0.449–1.110 s each | 0.033–0.162 s each |
+| `qsize` / true backlog | 29 → 1 over 5 s | **0 / 1 for the whole session** |
+| `ttfat_s` | 0.115 / 0.108 / 0.038 / 0.108 / 0.118 | 0.107 / 0.0 / 0.162 / 0.003 |
+
+**8.4× less audio discarded, burst 1 eliminated, no latency cost.** Operator
+confirmed the rushed greeting is gone. `input_dropped` reached 56 (≈4.5 s of
+user audio withheld from the front-end model, STT unaffected) with no visible
+harm to answers — all four turns on-topic and mostly correct.
+
+**Metric caveat, worth knowing before reading `step_diag.jsonl`:** with B3 on,
+`lag_frames` (= `frames_received − frames_consumed`) is **no longer a backlog
+measure**. Dropped frames are received but never consumed, so they inflate it
+permanently — S5 shows `lag_frames` rising 33 → 57 while `input_dropped` rises
+32 → 56. **True backlog is `lag_frames − input_dropped`**, which was 1 for the
+entire session. Compute it that way or the fix looks like a regression.
+
+**The cycle-3 guess about the residual is refuted.** Bursts 2–5 were attributed
+to `_output_loop`'s `if len(opus_bytes) > 0` skip suppressing near-silence and
+then flushing. That is wrong: over S5 the client accounted for 76.55 s of audio
+against 960 stepped frames = 76.80 s, i.e. **99.7% of stepped frames arrive.**
+Nothing is being suppressed.
+
+**Actual residual cause: server step hitches larger than the client's whole
+buffer.** S5 has 4 step-period samples over 100 ms (133, 120, 120, 113 ms)
+against an 80 ms budget, while client `liveBufferS` peaks at 136 ms and averages
+60 ms. A 133 ms gap in output starves a ~90 ms buffer outright → underrun →
+playback stops and refills `initialBufferSamples` (80 ms) + `partialBufferSamples`
+(10 ms) before resuming. S5 has **7 underruns, one per burst**, and the residual
+drops (33–162 ms) are the post-refill overshoot, not the primary event. So the
+audible residual is an **underrun stall**, not audio loss — which fits "artifact
+at turn onsets" better than 0.8% average loss does.
+
+The same hitches drive the residual *input* drops: `input_dropped`'s step-jumps
+coincide with the 133 ms and 120 ms period samples.
+
+**Two candidate fixes, a genuine trade-off, neither implemented:**
+
+1. **Deepen the client buffer** so it survives a ~133 ms hitch — needs
+   `initialBufferSamples + partialBufferSamples` ≳ 200 ms, versus ~90 ms today.
+   Cycle 2's invariance objection does **not** apply here: arrival is
+   0.98–0.997× of playback, i.e. balanced, so a deeper buffer absorbs transient
+   hitches at *zero* loss. Cost is ~110 ms of added playback latency against a
+   `ttfat_s` of 0.003–0.16 s. This is the "deeper client buffer for bursts 2–5"
+   predicted in cycle 3, now with the transient nature confirmed.
+2. **Remove the hitches** — the root cause. 4 samples of 113–133 ms against a
+   33 ms mean `work_ms` means something occasionally blocks the loop for ~100 ms
+   extra. Unattributed; candidates are GC, a CUDA sync, or retrieval-adjacent
+   work landing on the loop. Strictly better than (1) if it is tractable, since
+   it costs no latency.
+
+Recommend measuring (2) before spending latency on (1): correlate the hitch
+timestamps against `server.log`'s retrieval/`<ret>` events and GC. If hitches
+turn out to be unavoidable, (1) is the fallback.
+
+#### Implementation (2026-07-30)
 
 `scripts/instrumented_server.py`'s `_DropOldestQueue`, swapped in for
 `Channel.input_queue` by `_patch_channel`'s `patched_init`. Cap 2 frames,
