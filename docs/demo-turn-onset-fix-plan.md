@@ -11,7 +11,47 @@ between sessions. That is more efficient than strict phase-by-phase implementati
 no attributability, because each session isolates exactly one variable. Phase B3 is the one
 item that must wait for real data.
 
-## Status (2026-07-30)
+## Where this stands / next session (as of 2026-07-30, end of session)
+
+**The turn-onset regression is fixed, VM-validated, and closed.** `ttfat_s` went
+4.45 / 0.07 / 3.37 / 7.10 s → 0.035 / 0.210 / 0.036 / 0.003 s across three A/B sessions,
+which matches the paper's own figures. Nothing about it is outstanding.
+
+Committed on branch `fix/demo-turn-onset-regression`, **not pushed**:
+
+| commit | what |
+|---|---|
+| `6cf268a` | the fix + step-backlog diagnostics + `ttfat_s` re-anchoring |
+| `f7df38f` | Option E / STT-off-thread chain deleted (−1317 lines) |
+| `7fb979d` | D10 buffer attempt (superseded by the next commit) |
+| `fb4239c` | moshi-style retrieval default on both paths; D10 attempt reverted |
+
+Local suite green (399 tests). Everything is at its default: `bash scripts/run_demo.sh`
+now gets pacing off, `--batch-size 1`, and the moshi-style retrieval backend with no flags.
+
+**Open, in priority order:**
+
+1. **D10 — the metallic artifact at each utterance onset.** Open, one fix attempted and
+   reverted, root cause undiagnosed. Start by adding the `sampleRate` / `frame.length`
+   diagnostic, *then* test a hypothesis. Read the "Read on this" subsection before doing
+   anything. Pre-existing and independent of the latency work.
+2. **Retrieval quality.** Downgraded from "dominant problem" to **unmeasured**: the evidence
+   that prompted the escalation came from three sessions that unknowingly ran the weaker
+   `gemini_api` prompt. Re-assess on a moshi-style session before concluding anything. The
+   one hard datum that survives: turn 4's reference explicitly flagged the model's own error
+   and the model repeated it anyway.
+3. **Re-baseline evals.** The retrieval-backend default changed, so pre-2026-07-30 scored
+   runs are not comparable to new ones.
+4. **D9** — `npm audit --omit=dev` to close out the vulnerability question.
+5. **B3** — optional robustness only; fixes no observed problem at `--batch-size 1`.
+
+**Things not to redo** (each cost real time this session): don't restore step pacing; don't
+raise the client's buffer threshold; don't read `delay` instead of `liveBufferS`; don't run a
+demo A/B without checking the launch banner's forwarded-env line; don't assume `run_demo.sh`'s
+default config carries the moshi-style prompt without checking `turns.jsonl`'s
+`retrieval_backend`.
+
+### Decisions taken during the session
 
 Decisions taken: `ttfat_s` redefined in place; one code drop; Option E deprecated now and
 deleted later; Phase D kept separate.
@@ -511,14 +551,54 @@ remaining candidates — nor even establish whether the dropped audio is speech
 
 **The measurement that would resolve it**, and the only thing worth doing next
 on D10: log the AudioContext's actual `sampleRate` and each decoded
-`frame.length` in `audio-processor.ts`'s `onmessage`, once per session. Every
-threshold in that file is denominated via `asSamples()`, which scales by
-`sampleRate`; if the decoded frames do not contain `asSamples(80)` samples
-each, then `currentSamples()`, `totalMaxBufferSamples()` and `liveBufferS` are
-all measuring in the wrong unit and a ~2× discrepancy follows directly. Mimi
-runs at 24 kHz and a browser AudioContext is typically 48 kHz, which makes
-that the obvious first suspect — but it is a suspect, not a finding, until
-those two numbers are on record.
+`frame.length` in `audio-processor.ts`'s `onmessage`, once per session. **Not
+yet added** — deliberately parked, see "Read on this" below.
+
+#### Read on this (2026-07-30) — reasoning only, not a finding
+
+Recorded so the next session starts from the argument rather than re-deriving
+it. Everything here is inference from the numbers above; none of it is
+measured, and the two previous confident reads on this same path were both
+wrong.
+
+**Leading hypothesis: a unit mismatch in `audio-processor.ts`'s buffer
+arithmetic.** Every threshold in that file is denominated through
+`asSamples(ms) = ms * sampleRate / 1000`, where `sampleRate` is the
+AudioWorklet global — the *AudioContext's* rate, typically 48 kHz in a
+browser. Mimi produces 24 kHz audio. If the decoded frames arriving at
+`onmessage` carry 24 kHz samples (1920 per 80 ms frame) while `asSamples(80)`
+evaluates to 3840, then:
+
+- `currentSamples()` under-reports buffered *duration* by 2×, so
+  `liveBufferS` reads ~half of true occupancy — consistent with it sitting at
+  a suspiciously tidy 38–93 ms while drops fire;
+- `totalMaxBufferSamples()` is a threshold in the wrong unit, which is why
+  moving it (the reverted experiment) changed nothing — both sides of the
+  comparison scale together;
+- `droppedMs` and `newMaxBufferMs`, both computed via `asMs()`, are wrong by
+  the same factor, so the "80–117 ms" figures may not be 80–117 ms of speech;
+- and the ~2–3× server/client duration discrepancy falls out directly.
+
+**What argues against it:** playback measured at exactly 1.000× wall time and
+speech that is intelligible. A raw 2× rate error would make the model sound
+obviously wrong (chipmunked or slowed), and it does not. So if this is the
+mechanism, the decoder must be resampling correctly for *playback* while the
+frames' `length` still misleads the buffer bookkeeping — plausible (the
+`opus-recorder` decoder worker resamples to the context rate) but exactly the
+kind of half-true story that has burned this investigation twice already.
+
+**Second candidate, not yet examined:** the drops may be discarding the
+*silence* frames the server emits continuously between words, in which case
+they are largely inaudible and the metallic artifact has a different cause
+entirely — which would also explain why removing 45% of "audio" during the
+greeting did not make it unintelligible. Distinguishing this needs the dropped
+frames' actual content, not just their count.
+
+**Why parked rather than pursued:** the artifact is pre-existing, present in
+every session ever recorded, and completely independent of the latency work
+that this document's main body is about — which is done and validated. D10
+deserves its own session with the diagnostic added first and a hypothesis
+tested second, not another guess appended to a long thread.
 
 Why this costs no steady-state latency: `totalMaxBufferSamples()` is the
 *drop threshold*, not the operating depth. Depth is set by the arrival/drain
