@@ -32,15 +32,72 @@ Six live sessions across the arc; every behaviour change was A/B'd with one vari
 0.18 s). Retrieval answers on the final session were all factually correct, including a
 textbook pre-RAG filler ("let me check that for you") — the paper's designed behaviour.
 
-**Four root causes, all self-inflicted by this repo's own patches, none upstream:**
+**Four root causes — three ours, one upstream's.** An earlier version of this summary said
+"all self-inflicted, none upstream", which was wrong and contradicted §7.2 of the evidence
+doc; corrected here rather than quietly reworded, since mis-attributing a defect in either
+direction is a credibility problem.
 
-1. `_patch_server_state_step_pacing()` froze an input-queue backlog → 4–19 s turn onsets.
-2. `Channel.input_queue` unbounded → draining the startup backlog at 1.78× real time made
-   the client discard ~47% of the greeting.
-3. `retrieval_backend.retrieve()` called synchronously inside an `async def` → the event
-   loop blocked for 0.45–0.63 s per `<ret>`, starving the client's buffer once per turn.
-4. The demo's `ttfat_s` anchored after the stall it was meant to measure → the whole thing
-   read as 0.08–0.40 s for weeks.
+| # | cause | whose | kind |
+|---|---|---|---|
+| 1 | `_patch_server_state_step_pacing()` froze an input-queue backlog → 4–19 s turn onsets | **ours** (added 2026-07-27) | behaviour defect |
+| 2 | `Channel.input_queue` unbounded → **any** backlog gets drained at ~1.78× real time, flooding the browser, which discards the surplus. Not just the greeting: this is the amplifier behind the artifact on **every** turn (see the decomposition below) | **upstream's**, latent — no queue cap, stale-frame drop or resync anywhere in `_recv_loop`/`input_queue`, and its client buffer's drop threshold (100 ms) sits barely above one 80 ms frame | behaviour defect |
+| 3 | `retrieval_backend.retrieve()` called synchronously inside an `async def` → event loop blocked 0.45–0.63 s per `<ret>`, starving the client's buffer once per turn | **ours** (`_patch_rag_manager_get_reference_text`; upstream's own equivalent properly `await`s) | behaviour defect |
+| 4 | the demo's `ttfat_s` anchored *after* the stall it was meant to measure → the delay read as 0.08–0.40 s for weeks | **ours** | measurement defect — it hid 1–3 rather than causing anything |
+
+So: two of the three behaviour defects were ours, one was upstream's, and our own
+instrumentation is what concealed all of them.
+
+**Decomposing the metallic artifact properly — it is mostly #2, on every turn.** An earlier
+version of this summary split it as "greeting = upstream's #2, later turns = our #3". That is
+too clean, and the A/B disproves it. #2 is an **amplifier**: it converts *any* stall into a
+faster-than-real-time flood that the browser must discard. #3 and the startup model load are
+two of its **triggers**. Measured, holding everything else constant:
+
+| later-turn loss (turns 2+) | greeting loss | config |
+|---|---|---|
+| **2.800 s** | 2.534 s | queue unbounded + blocking retrieval |
+| **0.544 s** | 0.091 s | queue **bounded** + blocking retrieval |
+| 0.066 s | 0.091 s | queue bounded + retrieval off-loop |
+
+Bounding the queue alone removed **81% of later-turn loss** (2.800 → 0.544 s) and 96% of the
+greeting's — before the blocking retrieval call was touched at all. So the upstream defect is
+the dominant contributor on *every* turn, not just the first; our blocking call supplied the
+trigger on retrieval turns (and the underrun/playback stall that goes with it), and fixing it
+cleaned up the remainder.
+
+That is also why the artifact predates this repo's patches: the amplifier was always there,
+and the startup model load is a trigger no deployment avoids.
+
+Caveat on #2's attribution: unmodified upstream was never run here. That it shares the defect
+is inferred from reading its source (the absence of any bound) plus our own pre-patch sessions
+showing the artifact.
+
+**#4 was actually two separate measurement traps, and only one of them was a bug.** Worth
+separating, because they get conflated:
+
+- **A real bug (ours):** `ttfat_s`'s clock started at the turn switch, which by construction
+  fires *after* the stall ended. Fixed by re-anchoring to VAD end-of-utterance.
+- **Not a bug — an architectural property of the demo, and the reason reading `server.log`
+  was actively misleading:** the transcript and VAD lines in that log come from a *different
+  model* than the one that was broken. `Channel._recv_loop` feeds two consumers from every
+  audio frame — `self.stt.send_audio(chunk)` with the **raw** chunk, going to a separate 1B
+  streaming-ASR model (`kyutai/stt-1b-en_fr-candle`), and `input_queue.put(filtered_pcm)`
+  going to the front-end Moshi model. The STT path is never queued, so it always ran live.
+  Result: `[Display User]` transcription was perfect and `[VAD]` read
+  `['1.000','1.000','1.000','1.000']` while the front-end model was perceiving that same
+  speech 4–19 seconds late. Nothing in the log looked wrong, because the healthy path is the
+  one that logs.
+
+  (To be precise about a common slip: this is **STT** — speech-to-text. Text-to-speech does
+  not appear in the demo path at all; `configs/tts_backends.yaml`'s `gemini_tts` is eval-only,
+  used to synthesise spoken questions for `knowledge.gsm8k`.)
+
+Deriving the wrong conclusion from `server.log` was therefore a reasonable read of the
+evidence available, not carelessness — the log showed a healthy transcript, a confident VAD,
+and no warnings. The lesson is narrower and more useful than "don't trust logs": in this
+architecture, **no log line sourced from the STT model can tell you anything about the
+front-end model's own input.** Only `input_queue` depth and frames-received-vs-consumed can,
+which is why `step_diag.jsonl` exists.
 
 **Remaining open items** (none blocking, none related to the above):
 

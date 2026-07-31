@@ -1381,14 +1381,19 @@ explicitly opt back into the off-thread + Option E chain.
 `docs/demo-turn-onset-fix-plan.md` first; this section is superseded
 history.** Final validated state: `ttfat_s` 4.45–7.10s -> 0.00–0.20s
 (matching the paper's TTFAT 0.0s / turn-taking 0.18s), and client-side
-audio loss 7.2% -> 0.2%. Four root causes, all self-inflicted by this
-repo's own patches and none upstream: (1) `_patch_server_state_step_pacing()`
-froze an input-queue backlog; (2) `Channel.input_queue` was unbounded, so
-draining that backlog at 1.78x real time made the client discard ~47% of
-the model's greeting; (3) `retrieval_backend.retrieve()` ran synchronously
-inside an `async def`, blocking the event loop 0.45–0.63s per `<ret>`;
-(4) the demo's own `ttfat_s` was anchored *after* the stall it existed to
-measure, which is why this went undiagnosed for weeks.
+audio loss 7.2% -> 0.2%. Four root causes — **three ours, one upstream's**
+(an earlier version of this note said "all self-inflicted", which was
+wrong): (1) `_patch_server_state_step_pacing()` froze an input-queue
+backlog — **ours**, added 2026-07-27; (2) `Channel.input_queue` unbounded,
+so draining that backlog at 1.78x real time made the client discard ~47% of
+the model's greeting — **upstream's**, latent, and the reason the metallic
+audio artifact long predates this repo's patches; (3)
+`retrieval_backend.retrieve()` ran synchronously inside an `async def`,
+blocking the event loop 0.45–0.63s per `<ret>` — **ours** (upstream's own
+equivalent properly awaits); (4) the demo's own `ttfat_s` was anchored
+*after* the stall it existed to measure — **ours**, a measurement defect
+that hid 1-3 rather than causing anything, and why this went undiagnosed
+for weeks.
 
 **Correction (2026-07-30) — read `docs/demo-turn-onset-regression.md` first.**
 Everything this section *measures* holds up: the `<pad>` stall before

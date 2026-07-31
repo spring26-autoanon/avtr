@@ -21,7 +21,12 @@ Full requirements/spec: [`specs/moshirag-evals-requirements.md`](specs/moshirag-
 
 Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM.
 
-**Most recent work (2026-07-30, complete):** the demo's long turn-onset delay ("pad stall") and its metallic per-turn audio artifact were both traced to regressions this repo introduced — not model behaviour — and fixed. `ttfat_s` went 4.45–7.10 s to 0.00–0.20 s (matching the paper's own figures) and client-side audio loss went 7.2% to 0.2%, VM-validated across six live sessions. See [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) for the evidence and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md) for the fix arc and remaining open items. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
+**Most recent work (2026-07-30, complete):** two long-standing demo problems were root-caused and fixed — neither was model behaviour, which is what both had previously been attributed to.
+
+- The **turn-onset delay** ("pad stall", 4–19 s between the user finishing and the model speaking) was a regression *this repo* introduced, in its own step-pacing patch. `ttfat_s` went 4.45–7.10 s to 0.00–0.20 s, matching the paper's own published figures.
+- The **metallic per-turn audio artifact** was mostly a **latent defect in upstream moshi-rag** — an unbounded input queue that turns any processing stall into a faster-than-real-time flood the browser has to discard, on every turn. Bounding it alone removed 81% of the loss. The remainder was a blocking retrieval call that *was* ours. Client-side audio loss went 7.2% to 0.2%, and this is why the artifact predates this repo's patches.
+
+VM-validated across six live sessions. See [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) for the evidence and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md) for the fix arc, the per-cause attribution table, and remaining open items. `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
 
 ## Requirements & setup
 

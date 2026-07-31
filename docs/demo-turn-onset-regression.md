@@ -13,12 +13,24 @@ and the fix was validated across three A/B sessions:
 | client audio discarded | 5.334 s (7.2% of received) | **0.158 s (0.2%)** |
 | step periods > 100 ms | 4 per session | **0** |
 
-Two further self-inflicted defects surfaced during validation and were fixed alongside: an
-unbounded `Channel.input_queue`, whose startup backlog cost ~47% of the model's greeting when
-drained, and `retrieval_backend.retrieve()` called synchronously inside an `async def`,
-blocking the event loop for 0.45–0.63 s per `<ret>`. See
-[`demo-turn-onset-fix-plan.md`](demo-turn-onset-fix-plan.md) for the full arc, including three
-conclusions of mine that were reversed by measurement along the way.
+Two further defects surfaced during validation and were fixed alongside — **one upstream's,
+one ours**:
+
+- **Upstream's, latent — and the dominant cause of the artifact on *every* turn, not just the
+  first:** `Channel.input_queue` is unbounded, so *any* backlog gets drained at ~1.78× real
+  time, flooding the browser, which discards the surplus. Bounding it alone (B3) removed 81%
+  of later-turn audio loss and 96% of the greeting's, before the blocking call below was
+  touched. This is the long-standing "metallic audio" artifact, and it **predates this repo's
+  patches** — the amplifier was always there, and the startup model load is a trigger no
+  deployment avoids. See §7.2.
+- **Ours:** `retrieval_backend.retrieve()` called synchronously inside an `async def`, blocking
+  the event loop 0.45–0.63 s per `<ret>`. This is one of the *triggers* the unbounded queue
+  amplified, plus a playback stall (underrun) of its own on every retrieval turn. Upstream's
+  own equivalent properly `await`s; this repo's patch replaced it with a blocking call.
+
+See [`demo-turn-onset-fix-plan.md`](demo-turn-onset-fix-plan.md) for the full arc, the
+per-cause attribution table, and three conclusions of mine that measurement reversed along the
+way.
 
 **This document supersedes the framing of three CLAUDE.md sections.** Those sections are
 kept in place, not rewritten, with correction pointers back here:
