@@ -14,23 +14,46 @@ Alignment = tuple[str, tuple[float, float], str]
 TokenizedAlignment = tuple[list[int], tuple[float, float], str]
 
 
+def _load_reference_tensor(path):
+    """Load a sibling precomputed reference_with_time tensor for replay examples.
+    Returns [T_ref, D] or None. File: <wav-stem>.ref.safetensors, key 'reference'."""
+    import os
+    ref_path = os.path.splitext(str(path))[0] + ".ref.safetensors"
+    if not os.path.exists(ref_path):
+        return None
+    from safetensors.torch import load_file
+    return load_file(ref_path)["reference"]
+
+
 @dataclass
 class Sample:
     codes: torch.Tensor
     condition_attributes: ConditionAttributes | None = None
+    # [T_ref, D] precomputed reference_with_time (replay data); None for plain dialogue
+    reference_tensor: torch.Tensor | None = None
 
 
 @dataclass
 class Batch:
     codes: torch.Tensor
     condition_attributes: list[ConditionAttributes] | None = None
+    # per-example [T_ref, D] or None; carries replay reference_with_time
+    reference_tensors: list | None = None
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
         codes = torch.cat([b.codes for b in batch])
-        if batch[0].condition_attributes is None:
-            return Batch(codes)
-        return Batch(codes, [b.condition_attributes for b in batch])
+        condition_attributes = (
+            None
+            if batch[0].condition_attributes is None
+            else [b.condition_attributes for b in batch]
+        )
+        reference_tensors = (
+            [b.reference_tensor for b in batch]
+            if any(b.reference_tensor is not None for b in batch)
+            else None
+        )
+        return Batch(codes, condition_attributes, reference_tensors)
 
 
 def tokenize(
@@ -286,4 +309,5 @@ class InterleavedTokenizer:
             )
 
             codes = torch.cat([text_tokens, audio_tokens], dim=1)
-            return Sample(codes, data.get("text_conditions", None))
+            reference_tensor = _load_reference_tensor(path)
+            return Sample(codes, data.get("text_conditions", None), reference_tensor)

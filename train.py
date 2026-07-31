@@ -251,6 +251,29 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     batch.condition_attributes
                 )
 
+            # Inject precomputed reference_with_time (replay data). condition_provider
+            # cannot build it (ARC module stripped), so pad per-example tensors to the
+            # batch-max T_ref and add as a raw ConditionType (matches serve + the
+            # verified forward+backward spike).
+            if getattr(batch, "reference_tensors", None) is not None:
+                from moshi.conditioners.base import ConditionType
+
+                refs = batch.reference_tensors
+                present = [r for r in refs if r is not None]
+                dim = present[0].shape[-1]
+                T = max(r.shape[0] for r in present)
+                dt = next(model.parameters()).dtype
+                ref_cond = torch.zeros(len(refs), T, dim, device=codes.device, dtype=dt)
+                ref_mask = torch.zeros(len(refs), T, device=codes.device)
+                for bi, r in enumerate(refs):
+                    if r is not None:
+                        L = r.shape[0]
+                        ref_cond[bi, :L] = r.to(device=codes.device, dtype=dt)
+                        ref_mask[bi, :L] = 1
+                if condition_tensors is None:
+                    condition_tensors = {}
+                condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)
+
             # forward / backward
             output = model(codes=codes, condition_tensors=condition_tensors)
             text_loss = compute_loss_with_mask(
