@@ -1,0 +1,27 @@
+data:
+  train_data: "replay/stage2b_train.jsonl"          # dialogue + replay mix (mix_manifests.py)
+  eval_data: "finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-rag-pytorch-bf16"
+  # reference_with_time in fuser.streaming_sum (for the injected reference), not a module;
+  # first_speaker prepend off (deferred). Same config the plumbing smoke test used.
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.spike.json"
+full_finetuning: false
+lora: { enable: true, rank: 64, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+duration_sec: 100
+batch_size: 8
+max_steps: 600
+gradient_checkpointing: true
+optim: { lr: 4e-6, weight_decay: 0.1, pct_start: 0.05 }
+do_eval: false
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 8
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "runs/moshika_rag_stage2b"
+overwrite_run_dir: false
