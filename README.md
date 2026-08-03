@@ -32,6 +32,10 @@ It's three separate processes, not one model call:
 
 **Retrieval backend: `gemini-3.5-flash-lite`**, the shipped default (`configs/retrieval_backends.yaml`). It was promoted from `gemini-3.5-flash` after a live VM run showed it cuts retrieval latency meaningfully with no quality/grounding regression — comfortably inside the paper's own ≤2 s end-to-end retrieval-delay budget, where the plain `flash` model (a "thinking" model with a slower default reasoning mode) was not.
 
+## Why not just use a hosted voice API?
+
+GPT-Realtime and Gemini Live are stronger general reasoners and someone else keeps them running, but neither is full-duplex in the architectural sense, neither will clone a specific person's voice on open terms, and both retrieve synchronously — the turn waits on the tool call. This project's bet is that an open full-duplex model, a speaker fine-tune, and asynchronous domain retrieval can hold together at once. See [`docs/landscape.md`](docs/landscape.md) for the full comparison — cascade vs. full-duplex, zero-shot vs. SFT voice cloning, and where the alternatives land.
+
 ## Status
 
 Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM. Most recent completed arc: a turn-onset delay and a metallic audio artifact were both root-caused to self-inflicted regressions and an upstream defect (see above), fixed and VM-validated across six live sessions — see [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md).
