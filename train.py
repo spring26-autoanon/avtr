@@ -251,25 +251,29 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     batch.condition_attributes
                 )
 
-            # Inject precomputed reference_with_time (replay data). condition_provider
-            # cannot build it (ARC module stripped), so pad per-example tensors to the
-            # batch-max T_ref and add as a raw ConditionType (matches serve + the
-            # verified forward+backward spike).
             if getattr(batch, "reference_tensors", None) is not None:
+                # Inject precomputed reference_with_time (replay), positioned at the
+                # rag_token (⟨ret⟩) frame so it conditions her answer (matches serve),
+                # not the prefix. Full-length ref_cond, zero except at [rag:rag+T_ref].
                 from moshi.conditioners.base import ConditionType
 
+                RAG_TOKEN_ID = 4
                 refs = batch.reference_tensors
                 present = [r for r in refs if r is not None]
                 dim = present[0].shape[-1]
-                T = max(r.shape[0] for r in present)
                 dt = next(model.parameters()).dtype
-                ref_cond = torch.zeros(len(refs), T, dim, device=codes.device, dtype=dt)
-                ref_mask = torch.zeros(len(refs), T, device=codes.device)
+                Bsz, _, S = codes.shape
+                text_row = codes[:, 0, :]
+                ref_cond = torch.zeros(Bsz, S, dim, device=codes.device, dtype=dt)
+                ref_mask = torch.zeros(Bsz, S, device=codes.device)
                 for bi, r in enumerate(refs):
-                    if r is not None:
-                        L = r.shape[0]
-                        ref_cond[bi, :L] = r.to(device=codes.device, dtype=dt)
-                        ref_mask[bi, :L] = 1
+                    if r is None:
+                        continue
+                    hit = (text_row[bi] == RAG_TOKEN_ID).nonzero(as_tuple=False)
+                    start = int(hit[0]) if len(hit) else 0
+                    L = min(r.shape[0], S - start)
+                    ref_cond[bi, start:start + L] = r[:L].to(device=codes.device, dtype=dt)
+                    ref_mask[bi, start:start + L] = 1
                 if condition_tensors is None:
                     condition_tensors = {}
                 condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)

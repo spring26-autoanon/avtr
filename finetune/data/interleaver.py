@@ -143,7 +143,10 @@ class Interleaver:
         # Tokenizes each word individually into a list of ints.
         out = []
         for word, ts, speaker in alignments:
-            toks = tokenize(self.tokenizer, word.strip(), bos=False)
+            if word.strip() == "<RAG>":
+                toks = [4]  # rag_token_id -> emit the ⟨ret⟩ retrieval trigger
+            else:
+                toks = tokenize(self.tokenizer, word.strip(), bos=False)
             out.append((toks, ts, speaker))
         return out
 
