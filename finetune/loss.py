@@ -10,6 +10,8 @@ def compute_loss_with_mask(
     first_codebook_weight_multiplier: float = 1.0,
     text_padding_weight: float = 1.0,
     text_padding_ids: set[int] | None = None,
+    rag_token_id: int | None = None,
+    rag_token_weight: float = 1.0,
 ):
     target = torch.where(target_mask, target, torch.zeros_like(target))
 
@@ -20,6 +22,10 @@ def compute_loss_with_mask(
         assert text_padding_ids is not None
         for id in text_padding_ids:
             weights[target == id] *= text_padding_weight
+        # Upweight the rag_token (⟨ret⟩) so the model learns to EMIT it reliably instead of
+        # confabulating; it's ~1 token/example so it needs a strong multiplier to matter.
+        if rag_token_id is not None and rag_token_weight != 1.0:
+            weights[target == rag_token_id] *= rag_token_weight
 
     logits = logits.view(-1, logits.size(-1)).float()
     target = target.view(-1)

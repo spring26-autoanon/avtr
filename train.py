@@ -290,6 +290,8 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     model.text_padding_token_id,
                     model.end_of_text_padding_id,
                 },
+                rag_token_id=4,
+                rag_token_weight=float(os.environ.get("RAG_TOKEN_WEIGHT", "1.0")),
             )
             audio_loss = compute_loss_with_mask(
                 output.logits,
