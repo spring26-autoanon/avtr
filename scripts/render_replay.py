@@ -18,42 +18,31 @@ Runs on the Mac. `source .env` first (needs ELEVENLABS_API_KEY + DANIELLE_VOICE_
 import argparse
 import json
 import os
-import subprocess
-import tempfile
 
 import numpy as np
 import requests
 import soundfile as sf
 
 SR = 24000
-USER_VOICES = ["Samantha", "Daniel", "Karen"]  # installed macOS `say` voices, rotated for variety
 MODEL_ID = "eleven_multilingual_v2"
+# ElevenLabs premade voice_ids for the user/partner channel, rotated for variety (all
+# distinct from the Danielle clone). These consume the ElevenLabs char budget too.
+USER_VOICES = [
+    "CwhRBWXzGAHq8TQ4Fs17",  # Roger (m)
+    "EXAVITQu4vr4xnSDxMaL",  # Sarah (f)
+    "JBFqnCBsd6RMkjVDRZzb",  # George (m)
+    "Xb7hH8MSUJpSbSDYk0k2",  # Alice (f)
+    "nPczCjzI2devNBz1zQrb",  # Brian (m)
+]
 
 
-def tts_her(text: str, key: str, vid: str) -> np.ndarray:
+def tts(text: str, key: str, voice_id: str) -> np.ndarray:
     r = requests.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{vid}?output_format=pcm_24000",
+        f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}?output_format=pcm_24000",
         headers={"xi-api-key": key, "content-type": "application/json"},
         json={"text": text, "model_id": MODEL_ID}, timeout=120)
     r.raise_for_status()
     return np.frombuffer(r.content, dtype=np.int16).astype(np.float32) / 32768.0
-
-
-def tts_user(text: str, voice: str) -> np.ndarray:
-    path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-    try:
-        r = subprocess.run(["say", "-v", voice, "-o", path, "--data-format=LEI16@24000", text],
-                           capture_output=True)
-        if r.returncode != 0:  # voice missing -> fall back to the default voice
-            subprocess.run(["say", "-o", path, "--data-format=LEI16@24000", text], check=True,
-                           capture_output=True)
-        pcm, sr = sf.read(path, dtype="float32")
-        if pcm.ndim > 1:
-            pcm = pcm[:, 0]
-        assert sr == SR, f"say produced sr={sr}"
-        return pcm
-    finally:
-        os.unlink(path)
 
 
 def assemble(user_pcm: np.ndarray, her_pcm: np.ndarray, gap: float = 0.4):
@@ -98,19 +87,19 @@ def main() -> None:
     with open(args.manifest, "w") as mf:
         for i, rec in enumerate(rows):
             ans, q = ans_of(rec), q_of(rec)
-            her = tts_her(ans, key, vid)
-            usr = tts_user(q, USER_VOICES[i % len(USER_VOICES)])
+            her = tts(ans, key, vid)
+            usr = tts(q, key, USER_VOICES[i % len(USER_VOICES)])
             st, answer_start = assemble(usr, her, args.gap)
             path = os.path.join(args.outdir, f"{rec['id']}.wav")
             sf.write(path, st, SR)
-            chars += len(ans)
+            chars += len(ans) + len(q)
             mf.write(json.dumps({
                 "id": rec["id"], "kind": rec["kind"], "retrieval": rec["retrieval"],
                 "reference": rec["reference"], "path": os.path.abspath(path),
                 "answer_start_sec": round(answer_start, 3),
                 "duration_sec": round(len(st) / SR, 3),
             }, ensure_ascii=False) + "\n")
-            print(f"  [{i+1}/{len(rows)}] {rec['id']}  {len(st)/SR:.1f}s  (her chars so far: {chars})")
+            print(f"  [{i+1}/{len(rows)}] {rec['id']}  {len(st)/SR:.1f}s  (chars so far: {chars})")
 
     print(f"done: {len(rows)} examples -> {args.outdir}  | ElevenLabs chars used this run: {chars}")
 
