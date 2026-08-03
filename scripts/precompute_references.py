@@ -29,7 +29,10 @@ def embed(url: str, text: str):
         content = r.read()
     tensors = st_load(content)                     # :8001 returns safetensors, key "tensor"
     key = "tensor" if "tensor" in tensors else next(iter(tensors))
-    return tensors[key]
+    t = tensors[key]
+    if t.dim() == 3 and t.shape[0] == 1:           # drop batch dim -> [T, D] (what the trainer wants)
+        t = t[0]
+    return t
 
 
 def main() -> None:
