@@ -1,11 +1,5 @@
 # Landscape: full-duplex speech, voice cloning, and where this project sits
 
-**Draft for review (2026-08-03).** Background reading, not spec — context on the
-state of conversational speech technology and what's distinctive about what this
-repo measures. Product and model claims were verified against the sources listed
-at the end on the date above; they will rot, and the hosted products in
-particular change under stable brand names.
-
 This repo is one half of a two-repo effort. The end state of the demo is a
 MoshiRAG checkpoint **fine-tuned on a target speaker's voice and persona while
 keeping the retrieval behavior intact** — training lives in the sibling
