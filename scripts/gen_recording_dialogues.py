@@ -22,10 +22,24 @@ Gemini REST (stdlib). Set GEMINI_API_KEY. Resumable/de-duped by id.
 import argparse
 import json
 import os
+import random
 import sys
 import time
 import urllib.error
 import urllib.request
+
+# Randomized conversation shapes so the dataset isn't templated on one follow-up pattern.
+SHAPES = [
+    "Very brief: Danielle's answer plus a single short follow-up line, then it ends naturally. 3-4 turns.",
+    "Short: the answer, then one quick follow-up exchange, then wrap. About 4-5 turns.",
+    "Medium: Danielle answers, then a couple of natural follow-up exchanges; mix who asks. 5-6 turns.",
+    "The USER is curious and asks TWO or THREE related follow-up questions after the first answer; "
+    "Danielle answers each naturally. 6-8 turns.",
+    "Danielle drives: after answering she asks the USER a follow-up question and they chat about it "
+    "for a couple of turns. 5-7 turns.",
+    "A longer, wandering chat: the answer leads into a related tangent with several back-and-forth "
+    "turns. 7-9 turns.",
+]
 
 SCHEMA = {
     "type": "OBJECT",
@@ -49,14 +63,14 @@ SCHEMA = {
 _COMMON = (
     "Script a NATURAL, SPOKEN conversation for a voice-assistant recording. Two speakers: USER "
     "(a friendly person) and DANIELLE (a warm, knowledgeable assistant). Sound like real people "
-    "talking out loud — contractions, easy phrasing, no markdown, no lists. 4-6 short turns, "
-    "alternating USER/DANIELLE, starting with USER. IMPORTANT: the conversation must NOT dead-end "
-    "on Danielle's answer — after she answers she asks a natural follow-up question or adds a "
-    "continuation, and the chat keeps going for another turn or two. "
+    "talking out loud — contractions, easy phrasing, no markdown, no lists. Alternate USER/DANIELLE, "
+    "starting with USER. IMPORTANT: the conversation must NOT dead-end on Danielle's answer — she "
+    "keeps it going with follow-ups. VARY the rhythm so no two dialogues feel templated. "
+    "SHAPE FOR THIS ONE: {shape} "
 )
 
 
-def build_prompt(kind: str, question: str, reference: str, answer: str) -> str:
+def build_prompt(kind: str, question: str, reference: str, answer: str, shape: str) -> str:
     if kind == "grounded":
         body = (
             f"USER asks (in their own natural words): \"{question}\". DANIELLE answers using ONLY "
@@ -77,7 +91,7 @@ def build_prompt(kind: str, question: str, reference: str, answer: str) -> str:
             f"A casual exchange starting from: \"{question}\". No facts needed, just warm natural "
             "small talk that flows for a few turns. Set grounded_turn to -1."
         )
-    return _COMMON + body
+    return _COMMON.format(shape=shape) + body
 
 
 def call_gemini(prompt: str, model: str, key: str, retries: int = 4):
@@ -139,7 +153,7 @@ def main():
             continue
         try:
             d = call_gemini(build_prompt(rec["kind"], rec["question"], rec.get("reference", ""),
-                                         rec.get("answer", "")), args.model, key)
+                                         rec.get("answer", ""), random.choice(SHAPES)), args.model, key)
         except RuntimeError as e:
             print(f"  skip {rec['id']} ({e})", file=sys.stderr)
             continue
