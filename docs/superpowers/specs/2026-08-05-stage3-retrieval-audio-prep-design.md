@@ -94,22 +94,27 @@ replay/QuestionAudio/audio{Danielle…,Joshua…}_24khz.wav   (2 × 84.65 min mo
   ├─[local] segment_retrieval_audio.py            (Gemini)
   │     └─► replay/retrieval_segments.jsonl
   │         [{id, start, end, turns:[{speaker,start,end,kind,reference}]}]
-  │           ⇢ push segments.jsonl (small)
   │
-  ├─[A100] cut_retrieval_clips.py
+  ├─[local] cut_retrieval_clips.py
   │     └─► replay/retrieval/<id>.wav        (stereo clip, ≤100 s)
   │         replay/retrieval/<id>.json       (ch0 alignments, offset-sliced, N × <RAG>)
   │         replay/retrieval_manifest.jsonl  (one row per clip, references as a list)
+  │           ⇢ rsync clips to A100
   │
   ├─[A100] precompute_references.py  (:8001 ARC encoder) → <id>.ref.safetensors (N tensors)
+  ├─[A100] build_manifest.py         (absolute paths must be written on the box)
+  ├─[A100] verify_retrieval_clips.py (the gate)
   │
   └─[A100] train, train_data = "retrieval:0.5,dialogue:0.5"
 ```
 
-Pairing and segmentation are CPU/API work and stay on the Mac. Annotation and
-reference-encoding need CUDA and the `:8001` service, so they run on the A100.
-Clip cutting happens on the box, so after the first upload only small JSON files
-cross the wire.
+**All GPU-box work is run by the user, not by the assistant.** Everything that
+does not require CUDA or the `:8001` service therefore stays on the Mac —
+pairing, segmentation, and clip cutting — so the remote sequence is as short as
+possible: two Whisper passes, reference encoding, manifest building, the gate,
+and training. The cost is re-uploading the cut clips (~730 MB) instead of
+cutting them in place, which is the right trade against adding steps to a
+hand-run queue.
 
 ## Components
 

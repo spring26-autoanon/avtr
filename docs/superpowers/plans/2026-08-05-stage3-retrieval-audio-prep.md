@@ -12,6 +12,11 @@ Spec: `docs/superpowers/specs/2026-08-05-stage3-retrieval-audio-prep-design.md`
 
 ## Global Constraints
 
+- **The user runs every A100 / GPU command themselves.** Never ssh to
+  `wb-gpu-training`, never run `uv run torchrun`, `annotate.py`, or anything touching the
+  `:8001` service. Remote steps are handed to the user as copy-pasteable blocks, and work
+  stops until they report the output back. Everything that does not need CUDA — pairing,
+  segmentation, clip cutting — runs locally to keep that hand-run queue short.
 - **Local tests run under system `python3 -m pytest`**, not `.venv/bin/python` and not `uv run`. The system interpreter has numpy, soundfile, torch 2.6, safetensors and pytest; `.venv` does not.
 - **`moshi` is not installed on the Mac.** No test may import it, directly or transitively. `finetune/data/interleaver.py` does `from moshi.conditioners import ConditionAttributes` at line 11, so **no test may import `interleaver`**. Logic that needs a local test goes in a new moshi-free module that `interleaver.py` imports.
 - **Audio format is 24 kHz, PCM_24, stereo, channel 0 = Danielle (`SPEAKER_MAIN`), channel 1 = Joshua.** Never resample, never reorder channels.
@@ -2331,7 +2336,7 @@ rsync -avP 'wb-gpu-training:~/moshi-finetune/finetune/data/prepared_retrieval/*.
   finetune/data/prepared_retrieval/
 ```
 
-## 4. Segment and filter (Mac)
+## 4. Segment, filter and cut (Mac)
 ```bash
 source .env                     # GEMINI_API_KEY, rotated
 python3 scripts/segment_retrieval_audio.py \
@@ -2343,47 +2348,60 @@ python3 scripts/filter_retrieval_segments.py \
   --in replay/retrieval_segments.jsonl \
   --out replay/retrieval_segments.filtered.jsonl \
   --dropped replay/retrieval_dropped.jsonl
-```
-**Write down the `her turns:` line.** Its `retrieval_share` sets `RAG_TOKEN_WEIGHT` in step 8.
 
-## 5. Push the segments (Mac)
-```bash
-rsync -avP replay/retrieval_segments.filtered.jsonl \
-  wb-gpu-training:~/moshi-finetune/replay/
-```
-
-## 6. Cut clips and encode references (A100)
-The `:8001` reference-encoder service must be up (see the Stage 2 notes in
-`NEXT_STEPS.md` Part 3).
-```bash
-cd ~/moshi-finetune
-uv run python scripts/cut_retrieval_clips.py \
+python3 scripts/cut_retrieval_clips.py \
   --master finetune/data/prepared_retrieval/danielle_joshuarhodes.wav \
   --alignments finetune/data/prepared_retrieval/danielle_joshuarhodes.json \
   --segments replay/retrieval_segments.filtered.jsonl \
   --outdir replay/retrieval --manifest replay/retrieval_manifest.jsonl
+```
+**Write down the `her turns:` line** from the segmenter. Its `retrieval_share` sets
+`RAG_TOKEN_WEIGHT` in step 7.
 
+Audition two or three clips here, before uploading, and confirm each starts at a question
+rather than mid-sentence:
+```bash
+open replay/retrieval/ret-00-000.wav replay/retrieval/ret-00-001.wav
+```
+
+## 5. Upload the clips (Mac)
+```bash
+rsync -avP replay/retrieval/ wb-gpu-training:~/moshi-finetune/replay/retrieval/
+```
+
+## 6. Encode references, build the manifest, run the gate (A100)
+The `:8001` reference-encoder service must be up (see the Stage 2 notes in
+`NEXT_STEPS.md` Part 3). `build_manifest.py` must run here because manifest paths are
+absolute and machine-specific.
+```bash
+cd ~/moshi-finetune
 uv run python scripts/precompute_references.py \
   --manifest replay/retrieval_manifest.jsonl --audiodir replay/retrieval
 
 uv run python scripts/build_manifest.py \
   --wav-dir replay/retrieval --out-dir replay/retrieval --eval-file ""
-```
 
-## 7. The gate (A100)
-```bash
 uv run python scripts/verify_retrieval_clips.py --clips replay/retrieval
 ```
-Must print `gate passed.` Then listen to two or three clips and confirm each starts at a
-question rather than mid-sentence:
-```bash
-# from the Mac
-rsync -avP 'wb-gpu-training:~/moshi-finetune/replay/retrieval/ret-00-00*.wav' /tmp/audition/
-```
+The gate must print `gate passed.` before step 7. If it reports marker/tensor mismatches,
+send the output back rather than training around them — a mismatch means a retrieval turn
+would be trained with no conditioning.
 
-## 8. Train (A100)
+## 7. Train (A100)
 Set `RAG_TOKEN_WEIGHT` from step 4: 15 if smalltalk+decline are at least 30% of her turns,
 otherwise 8-10.
+
+Before the full run, prove the multi-`⟨ret⟩` injection actually works on the real stack —
+its unit tests cover the tensor maths but nothing on the Mac can load moshi:
+```bash
+cp example/moshika_rag_stage3.yaml /tmp/stage3_smoke.yaml
+sed -i 's/^max_steps: .*/max_steps: 2/; s/^do_ckpt: .*/do_ckpt: false/' /tmp/stage3_smoke.yaml
+RAG_TOKEN_WEIGHT=15 CUDA_VISIBLE_DEVICES=0 \
+  uv run torchrun --nproc-per-node 1 -m train /tmp/stage3_smoke.yaml
+```
+Expected: two steps complete with a finite loss. A crash inside
+`build_reference_condition` or a `reference_with_time` shape error means Task 9 needs
+fixing before the real run.
 ```bash
 cd ~/moshi-finetune
 RAG_TOKEN_WEIGHT=15 CUDA_VISIBLE_DEVICES=0 \
@@ -2393,7 +2411,7 @@ tmux does not survive an SSH drop on this VM — use `setsid`/`nohup`.
 
 Checkpoints land in `runs/moshika_rag_stage3/checkpoints/checkpoint_*/consolidated/lora.safetensors`.
 
-## 9. Audition against the success criterion
+## 8. Audition against the success criterion
 Not "does retrieval work" but "can it switch", per the spec:
 1. Several turns of chit-chat, *then* a factual question — the case trial 4 failed.
 2. After a successful retrieval, return to casual talk; she must not stay formal.
