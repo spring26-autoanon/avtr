@@ -252,31 +252,23 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 )
 
             if getattr(batch, "reference_tensors", None) is not None:
-                # Inject precomputed reference_with_time (replay), positioned at the
-                # rag_token (⟨ret⟩) frame so it conditions her answer (matches serve),
-                # not the prefix. Full-length ref_cond, zero except at [rag:rag+T_ref].
+                # Inject precomputed reference_with_time (replay) at EVERY rag_token (⟨ret⟩)
+                # frame, so multi-retrieval clips condition each answer (matches serve).
                 from moshi.conditioners.base import ConditionType
 
-                RAG_TOKEN_ID = 4
+                from finetune.data.reference_injection import build_reference_condition
+
                 refs = batch.reference_tensors
-                present = [r for r in refs if r is not None]
-                dim = present[0].shape[-1]
-                dt = next(model.parameters()).dtype
-                Bsz, _, S = codes.shape
-                text_row = codes[:, 0, :]
-                ref_cond = torch.zeros(Bsz, S, dim, device=codes.device, dtype=dt)
-                ref_mask = torch.zeros(Bsz, S, device=codes.device)
-                for bi, r in enumerate(refs):
-                    if r is None:
-                        continue
-                    hit = (text_row[bi] == RAG_TOKEN_ID).nonzero(as_tuple=False)
-                    start = int(hit[0]) if len(hit) else 0
-                    L = min(r.shape[0], S - start)
-                    ref_cond[bi, start:start + L] = r[:L].to(device=codes.device, dtype=dt)
-                    ref_mask[bi, start:start + L] = 1
-                if condition_tensors is None:
-                    condition_tensors = {}
-                condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)
+                present = [r for r in refs if r is not None and len(r)]
+                if present:
+                    first = present[0]
+                    dim = (first[0] if isinstance(first, list) else first).shape[-1]
+                    ref_cond, ref_mask = build_reference_condition(
+                        codes[:, 0, :], refs, dim, next(model.parameters()).dtype
+                    )
+                    if condition_tensors is None:
+                        condition_tensors = {}
+                    condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)
 
             # forward / backward
             output = model(codes=codes, condition_tensors=condition_tensors)

@@ -8,11 +8,16 @@ Two code changes so replay training teaches BOTH halves of retrieval:
    `"<RAG>"` alignment at each retrieval example's answer start, so token 4 lands in the text
    stream and the model learns to EMIT ⟨ret⟩.
 
-2. train.py reference injection: position the precomputed reference at the rag_token frame in
-   the text row (codes[:,0,:] == 4) and apply it over the following T_ref frames — matching
-   serve (reference conditions the answer, from the trigger), instead of the earlier
-   prefix-only placement. Full-length ref_cond, zero except at [rag:rag+T_ref]; the lm.py
+2. train.py reference injection: position the precomputed references at EVERY rag_token frame
+   in the text row (codes[:,0,:] == 4), pairing the i-th marker with the i-th reference and
+   clamping each span at the next marker — matching serve (a reference conditions the answer
+   following its own trigger). The tensor maths lives in
+   finetune/data/reference_injection.py so it is unit-testable without moshi/CUDA; the lm.py
    streaming_sum surgery then adds it at the right frames.
+
+   Stage 3 note: an earlier version used only the FIRST marker (`hit[0]`). Every retrieval
+   turn after the first in a clip was then trained with no conditioning while the loss still
+   demanded a grounded answer — i.e. it taught confabulation. Do not revert that.
 
 Idempotent; keeps .orig backups. Run wherever the repo lives (Mac to commit, box to apply).
 
@@ -58,8 +63,8 @@ def patch_interleaver():
 
 def patch_train():
     t = open(TRAIN).read()
-    if "RAG_TOKEN_ID" in t:
-        print("train.py already positions reference at rag frame.")
+    if "build_reference_condition" in t:
+        print("train.py already positions references at every rag frame.")
         return
 
     comment_start = "            # Inject precomputed reference_with_time"
@@ -76,31 +81,23 @@ def patch_train():
 
     new_block = (
         '            if getattr(batch, "reference_tensors", None) is not None:\n'
-        "                # Inject precomputed reference_with_time (replay), positioned at the\n"
-        "                # rag_token (⟨ret⟩) frame so it conditions her answer (matches serve),\n"
-        "                # not the prefix. Full-length ref_cond, zero except at [rag:rag+T_ref].\n"
+        "                # Inject precomputed reference_with_time (replay) at EVERY rag_token (⟨ret⟩)\n"
+        "                # frame, so multi-retrieval clips condition each answer (matches serve).\n"
         "                from moshi.conditioners.base import ConditionType\n"
         "\n"
-        f"                RAG_TOKEN_ID = {RAG_TOKEN_ID}\n"
+        "                from finetune.data.reference_injection import build_reference_condition\n"
+        "\n"
         "                refs = batch.reference_tensors\n"
-        "                present = [r for r in refs if r is not None]\n"
-        "                dim = present[0].shape[-1]\n"
-        "                dt = next(model.parameters()).dtype\n"
-        "                Bsz, _, S = codes.shape\n"
-        "                text_row = codes[:, 0, :]\n"
-        "                ref_cond = torch.zeros(Bsz, S, dim, device=codes.device, dtype=dt)\n"
-        "                ref_mask = torch.zeros(Bsz, S, device=codes.device)\n"
-        "                for bi, r in enumerate(refs):\n"
-        "                    if r is None:\n"
-        "                        continue\n"
-        "                    hit = (text_row[bi] == RAG_TOKEN_ID).nonzero(as_tuple=False)\n"
-        "                    start = int(hit[0]) if len(hit) else 0\n"
-        "                    L = min(r.shape[0], S - start)\n"
-        "                    ref_cond[bi, start:start + L] = r[:L].to(device=codes.device, dtype=dt)\n"
-        "                    ref_mask[bi, start:start + L] = 1\n"
-        "                if condition_tensors is None:\n"
-        "                    condition_tensors = {}\n"
-        '                condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)'
+        "                present = [r for r in refs if r is not None and len(r)]\n"
+        "                if present:\n"
+        "                    first = present[0]\n"
+        "                    dim = (first[0] if isinstance(first, list) else first).shape[-1]\n"
+        "                    ref_cond, ref_mask = build_reference_condition(\n"
+        "                        codes[:, 0, :], refs, dim, next(model.parameters()).dtype\n"
+        "                    )\n"
+        "                    if condition_tensors is None:\n"
+        "                        condition_tensors = {}\n"
+        '                    condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)'
     )
     _backup(TRAIN, t)
     open(TRAIN, "w").write(t[:i] + new_block + t[j_end:])
