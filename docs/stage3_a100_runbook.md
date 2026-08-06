@@ -85,8 +85,9 @@ python3 scripts/cut_retrieval_clips.py \
   --outdir replay/retrieval --manifest replay/retrieval_manifest.jsonl
 ```
 
-**Record the `her turns:` line** from the segmenter. Its `retrieval_share` sets
-`RAG_TOKEN_WEIGHT` in step 7.
+**Record the `her turns:` line** from the segmenter — it is the dataset's retrieval balance.
+Note it does NOT reliably set `RAG_TOKEN_WEIGHT`: run 1 followed that rule (share 0.41 -> 15)
+and retrieval never fired. Use 25 until a run demonstrates otherwise.
 
 Audition two or three clips before uploading; each should open on a question, not mid-sentence:
 ```bash
@@ -138,16 +139,21 @@ sed -e 's/^max_steps: .*/max_steps: 2/' \
     example/moshika_rag_stage3.yaml > /tmp/stage3_smoke.yaml
 printf 'overwrite_run_dir: true\n' >> /tmp/stage3_smoke.yaml
 
-RAG_TOKEN_WEIGHT=15 CUDA_VISIBLE_DEVICES=0 \
+RAG_TOKEN_WEIGHT=25 CUDA_VISIBLE_DEVICES=0 \
   ~/fork-venv/bin/torchrun --nproc-per-node 1 -m train /tmp/stage3_smoke.yaml
 ```
 Expect two steps with a finite loss. A crash inside `build_reference_condition`, or a
 `reference_with_time` shape error, means the Task 9 change needs fixing before the real run.
 
-Then the real run. Set `RAG_TOKEN_WEIGHT` from step 4: **15** if smalltalk+decline are at
-least 30% of her turns, otherwise **8-10**.
+Then the real run at **`RAG_TOKEN_WEIGHT=25`**. Run 1 used 15, derived from the turn mix, and
+retrieval never fired at any checkpoint; trial 4 needed 25. See the config header.
+
+The config deliberately omits `overwrite_run_dir`, so a leftover `run_dir` from a previous
+run makes the trainer refuse to start rather than clobber it. Rename it first:
 ```bash
-RAG_TOKEN_WEIGHT=15 CUDA_VISIBLE_DEVICES=0 setsid nohup \
+[ -d runs/moshika_rag_stage3 ] && mv runs/moshika_rag_stage3 runs/moshika_rag_stage3.run1
+
+RAG_TOKEN_WEIGHT=25 CUDA_VISIBLE_DEVICES=0 setsid nohup \
   ~/fork-venv/bin/torchrun --nproc-per-node 1 -m train example/moshika_rag_stage3.yaml \
   > ~/train_stage3.log 2>&1 &
 ```
