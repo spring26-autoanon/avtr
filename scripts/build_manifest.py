@@ -46,6 +46,10 @@ def main() -> None:
     ap.add_argument("--out-dir", default="finetune/data/prepared")
     ap.add_argument("--eval-file", default="movies.wav",
                     help="basename of the file to hold out for eval")
+    ap.add_argument("--no-eval", action="store_true",
+                    help="hold nothing out: train.jsonl == all.jsonl, no eval.jsonl. Use when "
+                         "the eval set lives in a different directory (e.g. the Stage 3 "
+                         "retrieval clips, whose eval comes from prepared_dialogue).")
     ap.add_argument("--relative-to", default=None,
                     help="if set, write paths relative to this dir instead of "
                          "absolute (default: absolute, which is what the sphn "
@@ -68,23 +72,29 @@ def main() -> None:
         entries.append((p, duration_sec(w)))
 
     all_e = entries
-    eval_e = [(r, d) for r, d in entries if Path(r).name == args.eval_file]
-    train_e = [(r, d) for r, d in entries if Path(r).name != args.eval_file]
-
-    if not eval_e:
-        raise SystemExit(
-            f"--eval-file {args.eval_file} not found among: "
-            + ", ".join(Path(r).name for r, _ in entries)
-        )
+    if args.no_eval:
+        eval_e, train_e = [], entries
+    else:
+        eval_e = [(r, d) for r, d in entries if Path(r).name == args.eval_file]
+        train_e = [(r, d) for r, d in entries if Path(r).name != args.eval_file]
+        if not eval_e:
+            raise SystemExit(
+                f"--eval-file {args.eval_file} not found among: "
+                + ", ".join(Path(r).name for r, _ in entries)
+            )
 
     write_jsonl(out_dir / "all.jsonl", all_e)
     write_jsonl(out_dir / "train.jsonl", train_e)
-    write_jsonl(out_dir / "eval.jsonl", eval_e)
+    if not args.no_eval:
+        write_jsonl(out_dir / "eval.jsonl", eval_e)
 
     tot = sum(d for _, d in all_e)
     print(f"all.jsonl   : {len(all_e)} files, {tot/60:.2f} min")
     print(f"train.jsonl : {len(train_e)} files, {sum(d for _,d in train_e)/60:.2f} min")
-    print(f"eval.jsonl  : {len(eval_e)} file  ({args.eval_file})")
+    if args.no_eval:
+        print("eval.jsonl  : not written (--no-eval)")
+    else:
+        print(f"eval.jsonl  : {len(eval_e)} file  ({args.eval_file})")
 
 
 if __name__ == "__main__":
