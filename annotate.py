@@ -147,6 +147,11 @@ def process_one(
     logger.debug("Wrote file %s", out_file)
 
 
+def out_path_for(path: Path, suffix: str) -> Path:
+    """'/d/a.wav' + '.ch1.json' -> '/d/a.ch1.json'. Replaces only the final extension."""
+    return path.with_suffix("").with_name(path.stem + suffix)
+
+
 def run(params: "Params", shard: int = 0):
     init_logging(params.verbose)
     # local_rank = dora.distrib.get_distrib_spec().local_rank
@@ -171,8 +176,8 @@ def run(params: "Params", shard: int = 0):
     for idx, path in enumerate(kept_paths):
         if (idx + 1) % 100 == 0:
             logger.info("Processing % 8d / % 8d files.", idx + 1, len(kept_paths))
-        out_file = path.with_suffix(".json")
-        err_file = path.with_suffix(".json.err")
+        out_file = out_path_for(path, params.out_suffix)
+        err_file = out_file.with_suffix(out_file.suffix + ".err")
         if out_file.exists():
             continue
         if err_file.exists() and not params.rerun_errors:
@@ -185,7 +190,7 @@ def run(params: "Params", shard: int = 0):
             process_one(
                 path,
                 out_file,
-                channel=0,
+                channel=params.channel,
                 language=params.lang,
                 w_model=w_model,
                 params=params,
@@ -208,6 +213,10 @@ class Params:
     rerun_errors: bool
     shards: int
     shard: int = 0
+    # 0 = Danielle / SPEAKER_MAIN (what training consumes); 1 = her partner
+    channel: int = 0
+    # a second pass must not clobber the first: use .ch1.json for channel 1
+    out_suffix: str = ".json"
 
 
 def main():
@@ -239,6 +248,17 @@ def main():
         default=True,
         help="Keep some of the silence at the beginnning / end of segments"
         " in whisper timestamped. This can mitigate words being misplaced.",
+    )
+    parser.add_argument(
+        "--channel",
+        type=int,
+        default=0,
+        help="Audio channel to transcribe (0 = Danielle/main, 1 = partner).",
+    )
+    parser.add_argument(
+        "--out-suffix",
+        default=".json",
+        help="Output suffix, e.g. .ch1.json so a second pass does not clobber .json",
     )
     parser.add_argument(
         "-l", "--local", action="store_true", help="Run locally to debug."
