@@ -10,34 +10,26 @@ import sentencepiece
 import torch
 from moshi.conditioners import ConditionAttributes
 
+from .reference_io import load_references as _load_reference_tensors
+
 Alignment = tuple[str, tuple[float, float], str]
 TokenizedAlignment = tuple[list[int], tuple[float, float], str]
-
-
-def _load_reference_tensor(path):
-    """Load a sibling precomputed reference_with_time tensor for replay examples.
-    Returns [T_ref, D] or None. File: <wav-stem>.ref.safetensors, key 'reference'."""
-    import os
-    ref_path = os.path.splitext(str(path))[0] + ".ref.safetensors"
-    if not os.path.exists(ref_path):
-        return None
-    from safetensors.torch import load_file
-    return load_file(ref_path)["reference"]
 
 
 @dataclass
 class Sample:
     codes: torch.Tensor
     condition_attributes: ConditionAttributes | None = None
-    # [T_ref, D] precomputed reference_with_time (replay data); None for plain dialogue
-    reference_tensor: torch.Tensor | None = None
+    # list of [T_ref, D] precomputed reference_with_time, one per <RAG> marker in this
+    # clip, in marker order; None for plain dialogue with no retrieval
+    reference_tensor: list | None = None
 
 
 @dataclass
 class Batch:
     codes: torch.Tensor
     condition_attributes: list[ConditionAttributes] | None = None
-    # per-example [T_ref, D] or None; carries replay reference_with_time
+    # per-example list of [T_ref, D] (or None); carries replay reference_with_time
     reference_tensors: list | None = None
 
     @classmethod
@@ -312,5 +304,5 @@ class InterleavedTokenizer:
             )
 
             codes = torch.cat([text_tokens, audio_tokens], dim=1)
-            reference_tensor = _load_reference_tensor(path)
+            reference_tensor = _load_reference_tensors(path)
             return Sample(codes, data.get("text_conditions", None), reference_tensor)

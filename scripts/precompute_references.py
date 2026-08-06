@@ -15,10 +15,13 @@ Runs ON THE BOX (needs the :8001 service up; see Task 3). Stdlib POST + safetens
 import argparse
 import json
 import os
+import sys
 import urllib.request
 
 from safetensors.torch import load as st_load
-from safetensors.torch import save_file
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from finetune.data.reference_io import save_references  # noqa: E402
 
 
 def embed(url: str, text: str):
@@ -45,15 +48,21 @@ def main() -> None:
     rows = [json.loads(l) for l in open(args.manifest) if l.strip()]
     n_ref = n_skip = 0
     for i, rec in enumerate(rows):
-        if not rec.get("retrieval") or not rec.get("reference"):
+        # Stage 3 manifests carry an ordered `references` list (one per <RAG> marker);
+        # the Stage 2b synthetic manifests carried a single `reference` + `retrieval` flag.
+        refs = rec.get("references")
+        if refs is None:
+            refs = [rec["reference"]] if rec.get("retrieval") and rec.get("reference") else []
+        if not refs:
             n_skip += 1
             continue
-        tensor = embed(args.url, rec["reference"])
+        tensors = [embed(args.url, text) for text in refs]
         out = os.path.join(args.audiodir, f"{rec['id']}.ref.safetensors")
-        save_file({"reference": tensor.contiguous()}, out)
-        n_ref += 1
+        save_references(out, tensors)
+        n_ref += len(tensors)
         if i < 3 or i % 25 == 0:
-            print(f"  [{i+1}/{len(rows)}] {rec['id']}  ref {tuple(tensor.shape)} {tensor.dtype} -> {out}")
+            shapes = ", ".join(str(tuple(t.shape)) for t in tensors)
+            print(f"  [{i+1}/{len(rows)}] {rec['id']}  {len(tensors)} ref(s) {shapes} -> {out}")
 
     print(f"done: {n_ref} reference tensors written, {n_skip} skipped (no-retrieval) -> {args.audiodir}")
 
