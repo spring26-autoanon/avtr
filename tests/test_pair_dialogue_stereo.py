@@ -177,6 +177,29 @@ def test_main_rejects_excluding_eval_conv(tmp_path):
         ])
 
 
+def test_main_no_eval_writes_whole_conversations(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    _fake_source(src)
+    main(["--src", str(src), "--dst", str(dst), "--main-name", "danielle", "--no-eval"])
+    names = sorted(p.name for p in dst.glob("*.wav"))
+    assert names == ["danielle_clays.wav", "danielle_joshuarhodes.wav"]
+    # the 10 s conversation is written whole, not carved
+    assert sf.info(str(dst / "danielle_joshuarhodes.wav")).frames == 10 * 24000
+
+
+def test_main_no_eval_ignores_missing_eval_conv(tmp_path):
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    _fake_source(src)
+    # a bogus --eval-conv must not abort when --no-eval is set
+    main(["--src", str(src), "--dst", str(dst), "--main-name", "danielle",
+          "--no-eval", "--eval-conv", "9999999999"])
+    assert (dst / "danielle_joshuarhodes.wav").exists()
+
+
 REAL_SRC = Path(__file__).resolve().parents[1] / "finetune/data/datastereo/clean_moshi_audio_24khz"
 REAL_DST = Path(__file__).resolve().parents[1] / "finetune/data/prepared_dialogue"
 

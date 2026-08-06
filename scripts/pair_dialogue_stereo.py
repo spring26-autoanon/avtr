@@ -130,6 +130,8 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--eval-center-frac", type=float, default=0.5)
     ap.add_argument("--exclude-conv", default="",
                     help="comma-separated conv_ids to skip entirely (e.g. bad recordings)")
+    ap.add_argument("--no-eval", action="store_true",
+                    help="write every conversation whole; do not carve an eval slice")
     args = ap.parse_args(argv)
 
     src = Path(args.src)
@@ -137,13 +139,13 @@ def main(argv: list[str] | None = None) -> None:
     dst.mkdir(parents=True, exist_ok=True)
 
     exclude = {x for x in args.exclude_conv.split(",") if x}
-    if args.eval_conv in exclude:
+    if not args.no_eval and args.eval_conv in exclude:
         raise SystemExit(
             f"--eval-conv {args.eval_conv} is also in --exclude-conv; pick a different eval conv."
         )
 
     convs = discover_conversations(src, args.main_name)
-    if args.eval_conv not in convs:
+    if not args.no_eval and args.eval_conv not in convs:
         raise SystemExit(
             f"--eval-conv {args.eval_conv} not found among: {sorted(convs)}"
         )
@@ -156,7 +158,7 @@ def main(argv: list[str] | None = None) -> None:
         stereo, _sr, delta = combine_to_stereo(main_path, partner_path)
         print(f"conv {conv_id}  partner={partner_spk}  "
               f"len={stereo.shape[0] / TARGET_SR:.1f}s  align_delta={delta} frames")
-        if conv_id == args.eval_conv:
+        if not args.no_eval and conv_id == args.eval_conv:
             before, ev, after = carve_eval(
                 stereo, TARGET_SR, args.eval_sec, args.eval_center_frac
             )
