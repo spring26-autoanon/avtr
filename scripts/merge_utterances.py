@@ -47,14 +47,15 @@ def merge_utterances(ch0, ch1, gap: float = 1.5):
     return utts
 
 
-def _stamp(t: float) -> str:
-    """Seconds -> MM:SS.s. Minutes are not wrapped at 60 — the recording runs to 85 min."""
-    minutes = int(t) // 60
-    return f"{minutes:02d}:{t - 60 * minutes:04.1f}"
-
-
 def format_transcript(utts) -> str:
-    return "\n".join(f"[{_stamp(u['start'])}] {u['speaker']}: {u['text']}" for u in utts)
+    """Timestamped transcript for the segmenter, in RAW SECONDS.
+
+    Deliberately not MM:SS. The segmenter must return absolute-second boundaries, and an
+    MM:SS display forces it to convert every timestamp by hand — it did that wrong
+    systematically past the first window, putting whole windows' worth of segments outside
+    their own time range. Printing the number it must echo back removes the arithmetic.
+    """
+    return "\n".join(f"[{u['start']:.1f}] {u['speaker']}: {u['text']}" for u in utts)
 
 
 def load_alignments(path):

@@ -43,8 +43,74 @@ def snap_bounds(start, end, utts):
     )
 
 
+def clamp_to_window(segments, win_start, win_end, tol=30.0):
+    """Drop segments whose bounds fall outside the window the LLM was actually shown.
+
+    Gemini regularly emits timestamps beyond its window. Unclamped, snap_bounds matches them
+    against the whole recording, so a hallucinated time lands somewhere arbitrary and then
+    blocks legitimate segments there under the no-overlap rule — in one run this cost a
+    29-minute hole. `tol` allows a small straddle at the edges.
+    """
+    out = []
+    for seg in segments:
+        if seg["end"] <= seg["start"]:
+            continue
+        if seg["start"] < win_start - tol or seg["end"] > win_end + tol:
+            continue
+        out.append(seg)
+    return out
+
+
 def _turns_in(turns, start, end):
     return [t for t in turns if t["start"] >= start - 1e-6 and t["end"] <= end + 1e-6]
+
+
+def _overlap(a_start, a_end, b_start, b_end):
+    return max(0.0, min(a_end, b_end) - max(a_start, b_start))
+
+
+def attach_real_turns(start, end, llm_turns, utts):
+    """Build a segment's turns from the REAL utterances in [start, end].
+
+    The LLM's timestamps are only advisory — being off by tenths of a second used to push a
+    turn outside the snapped bounds and get an otherwise good dialogue discarded. Whisper's
+    utterances are ground truth for timing and text; the LLM contributes only `kind` and
+    `reference`, matched to each utterance by greatest temporal overlap. An utterance the LLM
+    said nothing about defaults to smalltalk, which is the safe direction: no <RAG>.
+    """
+    turns = []
+    for u in utts:
+        if u["start"] < start - 1e-6 or u["end"] > end + 1e-6:
+            continue
+        kind, reference = "smalltalk", None
+        if u["speaker"] == "DANIELLE":
+            best, best_ov = None, 0.0
+            for t in llm_turns:
+                if t["speaker"] != "DANIELLE":
+                    continue
+                ov = _overlap(u["start"], u["end"], t["start"], t["end"])
+                if ov > best_ov:
+                    best, best_ov = t, ov
+            if best is not None:
+                kind = best.get("kind", "smalltalk")
+                reference = best.get("reference") if kind != "smalltalk" else None
+        turns.append({"speaker": u["speaker"], "start": u["start"], "end": u["end"],
+                      "kind": kind, "reference": reference, "text": u["text"]})
+    return turns
+
+
+def trim_to_speaker_bounds(turns):
+    """Trim to the first JOSHUA turn and the last DANIELLE turn.
+
+    A unit must open on a question and close on her answer. Trimming rather than dropping
+    keeps the dialogue when the LLM merely over-reached at one end.
+    """
+    first = next((i for i, t in enumerate(turns) if t["speaker"] == "JOSHUA"), None)
+    last = next((i for i in range(len(turns) - 1, -1, -1)
+                 if turns[i]["speaker"] == "DANIELLE"), None)
+    if first is None or last is None or last <= first:
+        return []
+    return turns[first:last + 1]
 
 
 def split_long(segment, utts, max_sec=MAX_SEC):
@@ -105,8 +171,13 @@ def validate_segments(segments, utts, max_sec=MAX_SEC, min_sec=MIN_SEC):
         if e <= s:
             problems.append(f"{seg['id']}: empty after snapping")
             continue
-        snapped.append({**seg, "start": s, "end": e,
-                        "turns": _turns_in(seg["turns"], s, e)})
+        turns = trim_to_speaker_bounds(attach_real_turns(s, e, seg["turns"], utts))
+        if not turns:
+            problems.append(f"{seg['id']}: no JOSHUA-question -> DANIELLE-answer span inside")
+            continue
+        # the trim may have moved the edges in; follow them
+        snapped.append({**seg, "start": turns[0]["start"], "end": turns[-1]["end"],
+                        "turns": turns})
 
     snapped.sort(key=lambda s: s["start"])
 
@@ -161,7 +232,10 @@ SCHEMA = {
 
 PROMPT = """You are given a timestamped transcript of a real recorded conversation between
 JOSHUA (asks questions) and DANIELLE (a warm, knowledgeable assistant who answers them).
-Timestamps are [MM:SS.s] and are absolute seconds from the start of the recording.
+Each line begins with [SECONDS] — the absolute start time of that turn, in seconds from the
+beginning of the recording. Every start/end you return MUST be copied verbatim from these
+bracketed numbers. Do not convert, rescale, or restart them at zero: a unit beginning at the
+line "[1543.2] JOSHUA: ..." has start 1543.2, not 0 and not 25.7.
 
 Split the transcript into DIALOGUE UNITS. A unit is a self-contained stretch of conversation:
 it begins with a JOSHUA turn and ends with a DANIELLE turn. Prefer units that contain a MODE
@@ -170,11 +244,24 @@ casual chat — because those teach the model to switch. Do not split a follow-u
 answer it follows up on. Units must not overlap. Aim for 20-90 seconds. Leave retakes, false
 starts and dead air out of every unit.
 
+COVERAGE MATTERS: this transcript is roughly 12 minutes of near-continuous conversation, so
+expect to emit on the order of 10-25 units — one per topic or sub-topic. Work through the
+WHOLE transcript from the first timestamp to the last; do not stop after the first few. Every
+stretch of real conversation should belong to some unit. A long thread on one topic should be
+split into several units at natural question boundaries rather than emitted as one long unit
+or skipped.
+
 Then label EACH of DANIELLE's turns:
   "grounded"  - she answers a question using specific external facts.
   "decline"   - she says she does not know / cannot answer, instead of guessing.
   "smalltalk" - casual conversation needing no external facts.
 Label every JOSHUA turn "smalltalk" with no reference.
+
+IMPORTANT: many of DANIELLE's turns are QUESTIONS she asks JOSHUA to keep the conversation
+going ("Is there one you've heard of recently?"), or warm acknowledgements of what he just
+said. Those are "smalltalk", never "grounded" — she is asking or reacting, not answering from
+facts. Only label a turn "grounded" when she is stating specific external information.
+A turn that both states facts AND ends with a follow-up question is still "grounded".
 
 For each "grounded" turn write a "reference": a 2-5 sentence encyclopedic passage, in neutral
 reference-work prose, that CONTAINS the facts she states. Include some surrounding detail she
@@ -186,8 +273,9 @@ a retrieval system would have wrongly surfaced. It must not answer the question.
 
 For "smalltalk" turns omit "reference".
 
-Copy each turn's spoken words into "text". Use the exact absolute-second values from the
-transcript for every start and end.
+Copy each turn's spoken words into "text". Every start and end must be one of the bracketed
+second-values shown above, copied exactly. The first unit in this excerpt should begin at or
+near {win_start:.1f} and the last should end at or near {win_end:.1f}.
 
 TRANSCRIPT:
 {transcript}
@@ -209,7 +297,16 @@ def call_gemini(prompt: str, model: str, key: str, schema=SCHEMA, retries: int =
             with urllib.request.urlopen(req, timeout=180) as r:
                 resp = json.load(r)
             return json.loads(resp["candidates"][0]["content"]["parts"][0]["text"])
-        except (urllib.error.HTTPError, urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
+        except urllib.error.HTTPError as e:
+            # 4xx other than rate-limiting will never succeed on retry (a retired model
+            # 404s even though it is still listed by the models endpoint) — fail fast.
+            detail = e.read()[:300].decode(errors="replace")
+            if 400 <= e.code < 500 and e.code != 429:
+                raise RuntimeError(f"gemini {e.code} for model '{model}': {detail}") from e
+            last = e
+            print(f"  [retry {attempt+1}/{retries}] HTTP {e.code}: {detail}", file=sys.stderr)
+            time.sleep(2 * (attempt + 1))
+        except (urllib.error.URLError, KeyError, json.JSONDecodeError) as e:
             last = e
             print(f"  [retry {attempt+1}/{retries}] {type(e).__name__}: {e}", file=sys.stderr)
             time.sleep(2 * (attempt + 1))
@@ -289,7 +386,7 @@ def main() -> None:
     ap.add_argument("--ch0", required=True, help="channel-0 (Danielle) alignments json")
     ap.add_argument("--ch1", required=True, help="channel-1 (Joshua) alignments json")
     ap.add_argument("--out", default="replay/retrieval_segments.jsonl")
-    ap.add_argument("--model", default="gemini-2.5-flash")
+    ap.add_argument("--model", default="gemini-flash-latest")
     ap.add_argument("--window-sec", type=float, default=720.0)
     ap.add_argument("--overlap-sec", type=float, default=60.0)
     args = ap.parse_args()
@@ -306,12 +403,29 @@ def main() -> None:
     raw = []
     wins = windows(utts, args.window_sec, args.overlap_sec)
     for wi, chunk in enumerate(wins):
-        print(f"  window {wi + 1}/{len(wins)}  "
-              f"[{chunk[0]['start'] / 60:.1f}-{chunk[-1]['end'] / 60:.1f} min]")
-        resp = call_gemini(PROMPT.format(transcript=format_transcript(chunk)), args.model, key)
-        raw += normalize(resp.get("segments", []), wi)
+        win_start, win_end = chunk[0]["start"], chunk[-1]["end"]
+        print(f"  window {wi + 1}/{len(wins)}  [{win_start / 60:.1f}-{win_end / 60:.1f} min]",
+              flush=True)
+        prompt = PROMPT.format(transcript=format_transcript(chunk),
+                               win_start=win_start, win_end=win_end)
+        resp = call_gemini(prompt, args.model, key)
+        proposed = normalize(resp.get("segments", []), wi)
+        # Clamp and snap against THIS window only — an out-of-window timestamp must not be
+        # matched against utterances elsewhere in the recording.
+        inside = clamp_to_window(proposed, win_start, win_end)
+        if len(inside) < len(proposed):
+            print(f"    {len(proposed) - len(inside)} of {len(proposed)} segments fell "
+                  f"outside the window; dropped", flush=True)
+        raw += [{**s, "_utts": chunk} for s in inside]
 
-    kept, problems = validate_segments(dedupe(raw), utts)
+    # snap each segment against its own window's utterances, then validate globally
+    prepared = []
+    for seg in raw:
+        chunk = seg.pop("_utts")
+        s, e = snap_bounds(seg["start"], seg["end"], chunk)
+        prepared.append({**seg, "start": s, "end": e})
+
+    kept, problems = validate_segments(dedupe(prepared), utts)
 
     claimed = sum(s["end"] - s["start"] for s in kept)
     total = max(u["end"] for u in utts)

@@ -45,7 +45,7 @@ def test_validate_drops_segment_with_no_danielle_turn():
     segs = [_seg("s0", 0.0, 9.0, [_turn("JOSHUA", 0.0, 9.0)])]
     kept, problems = validate_segments(segs, utts)
     assert kept == []
-    assert any("no DANIELLE" in p for p in problems)
+    assert any("no JOSHUA-question -> DANIELLE-answer span" in p for p in problems)
 
 
 def test_validate_drops_overlapping_second_segment():
@@ -113,21 +113,22 @@ def test_validate_drops_over_long_segment_with_no_internal_joshua_turn():
     assert any("too long" in p for p in problems)
 
 
-def test_validate_drops_segment_not_starting_on_joshua():
+def test_validate_drops_segment_with_no_joshua_turn_at_all():
     utts = _utts([("DANIELLE", 0.0, 5.0), ("DANIELLE", 5.5, 10.0)])
     segs = [_seg("s0", 0.0, 10.0, [_turn("DANIELLE", 0.0, 5.0), _turn("DANIELLE", 5.5, 10.0)])]
     kept, problems = validate_segments(segs, utts)
     assert kept == []
-    assert any("does not start on a JOSHUA turn" in p for p in problems)
+    assert any("no JOSHUA-question -> DANIELLE-answer span" in p for p in problems)
 
 
-def test_validate_drops_segment_not_ending_on_danielle():
+def test_validate_trims_a_trailing_joshua_turn_rather_than_dropping():
     utts = _utts([("JOSHUA", 0.0, 2.0), ("DANIELLE", 2.5, 8.0), ("JOSHUA", 8.5, 10.0)])
     segs = [_seg("s0", 0.0, 10.0, [_turn("JOSHUA", 0.0, 2.0), _turn("DANIELLE", 2.5, 8.0),
                                    _turn("JOSHUA", 8.5, 10.0)])]
     kept, problems = validate_segments(segs, utts)
-    assert kept == []
-    assert any("does not end on a DANIELLE turn" in p for p in problems)
+    assert len(kept) == 1, problems
+    assert [t["speaker"] for t in kept[0]["turns"]] == ["JOSHUA", "DANIELLE"]
+    assert kept[0]["end"] == 8.0          # edge followed the trim
 
 
 def test_validate_orders_segments_by_start_time():
@@ -201,3 +202,90 @@ def test_normalize_strips_references_from_smalltalk_and_rejects_bad_kinds():
 def test_normalize_ids_are_unique_across_windows():
     raw = [{"start": 0.0, "end": 10.0, "turns": []}]
     assert normalize(raw, 0)[0]["id"] != normalize(raw, 1)[0]["id"]
+
+
+from segment_retrieval_audio import attach_real_turns, trim_to_speaker_bounds
+
+
+def test_attach_real_turns_uses_utterances_not_llm_timestamps():
+    """Whisper utterances are ground truth; the LLM only supplies labels."""
+    utts = _utts([("JOSHUA", 0.0, 2.0), ("DANIELLE", 2.5, 10.0)])
+    # LLM turn timings are deliberately wrong by a few tenths
+    llm = [_turn("JOSHUA", 0.1, 2.2), _turn("DANIELLE", 2.4, 10.4, "grounded", "a passage")]
+    turns = attach_real_turns(0.0, 10.0, llm, utts)
+    assert [(t["speaker"], t["start"], t["end"]) for t in turns] == [
+        ("JOSHUA", 0.0, 2.0), ("DANIELLE", 2.5, 10.0),
+    ]
+    assert turns[1]["kind"] == "grounded"
+    assert turns[1]["reference"] == "a passage"
+
+
+def test_attach_real_turns_defaults_unlabelled_utterances_to_smalltalk():
+    utts = _utts([("JOSHUA", 0.0, 2.0), ("DANIELLE", 2.5, 10.0), ("DANIELLE", 11.0, 15.0)])
+    llm = [_turn("DANIELLE", 2.5, 10.0, "grounded", "p")]
+    turns = attach_real_turns(0.0, 15.0, llm, utts)
+    assert [t["kind"] for t in turns] == ["smalltalk", "grounded", "smalltalk"]
+    assert turns[2]["reference"] is None
+
+
+def test_attach_real_turns_carries_the_utterance_text():
+    utts = [{"speaker": "DANIELLE", "start": 0.0, "end": 5.0, "text": "the real words"}]
+    turns = attach_real_turns(0.0, 5.0, [_turn("DANIELLE", 0.0, 5.0, "grounded", "p")], utts)
+    assert turns[0]["text"] == "the real words"
+
+
+def test_trim_drops_leading_danielle_and_trailing_joshua():
+    turns = [_turn("DANIELLE", 0.0, 1.0), _turn("JOSHUA", 1.0, 2.0),
+             _turn("DANIELLE", 2.0, 8.0), _turn("JOSHUA", 8.0, 9.0)]
+    out = trim_to_speaker_bounds(turns)
+    assert [t["speaker"] for t in out] == ["JOSHUA", "DANIELLE"]
+
+
+def test_trim_returns_empty_when_no_valid_span_exists():
+    assert trim_to_speaker_bounds([_turn("JOSHUA", 0.0, 1.0)]) == []
+    assert trim_to_speaker_bounds([]) == []
+
+
+def test_validate_trims_instead_of_dropping_a_bad_boundary():
+    """The old behaviour discarded a good dialogue over a boundary rounding mismatch."""
+    utts = _utts([("DANIELLE", 0.0, 1.0), ("JOSHUA", 2.0, 4.0),
+                  ("DANIELLE", 5.0, 12.0), ("JOSHUA", 13.0, 14.0)])
+    llm = [_turn("DANIELLE", 0.0, 1.0), _turn("JOSHUA", 2.0, 4.0),
+           _turn("DANIELLE", 5.0, 12.0, "grounded", "p"), _turn("JOSHUA", 13.0, 14.0)]
+    kept, problems = validate_segments([_seg("s0", 0.0, 14.0, llm)], utts)
+    assert len(kept) == 1, problems
+    assert kept[0]["turns"][0]["speaker"] == "JOSHUA"
+    assert kept[0]["turns"][-1]["speaker"] == "DANIELLE"
+    assert kept[0]["start"] == 2.0 and kept[0]["end"] == 12.0
+
+
+from segment_retrieval_audio import clamp_to_window
+
+
+def test_clamp_drops_segments_outside_the_window_shown_to_the_llm():
+    """Gemini emits timestamps beyond its window; unclamped they snap to arbitrary
+    places elsewhere in the recording and block legitimate segments as 'overlaps'."""
+    segs = [
+        {"id": "w1-0", "start": 700.0, "end": 760.0, "turns": []},   # inside
+        {"id": "w1-1", "start": 2100.0, "end": 2160.0, "turns": []},  # far outside
+    ]
+    out = clamp_to_window(segs, 660.0, 1380.0)
+    assert [s["id"] for s in out] == ["w1-0"]
+
+
+def test_clamp_keeps_a_segment_straddling_the_edge_by_a_little():
+    segs = [{"id": "w1-0", "start": 1370.0, "end": 1400.0, "turns": []}]
+    out = clamp_to_window(segs, 660.0, 1380.0, tol=30.0)
+    assert [s["id"] for s in out] == ["w1-0"]
+
+
+def test_clamp_drops_inverted_or_empty_spans():
+    segs = [{"id": "x", "start": 800.0, "end": 800.0, "turns": []},
+            {"id": "y", "start": 900.0, "end": 850.0, "turns": []}]
+    assert clamp_to_window(segs, 660.0, 1380.0) == []
+
+
+def test_snap_bounds_only_considers_the_utterances_it_is_given():
+    """Snapping must be window-local, or an out-of-range timestamp lands anywhere."""
+    window = _utts([("JOSHUA", 700.0, 702.0), ("DANIELLE", 703.0, 710.0)])
+    assert snap_bounds(701.0, 709.0, window) == (700.0, 710.0)

@@ -77,7 +77,7 @@ def main() -> None:
     ap.add_argument("--in", dest="inp", default="replay/retrieval_segments.jsonl")
     ap.add_argument("--out", default="replay/retrieval_segments.filtered.jsonl")
     ap.add_argument("--dropped", default="replay/retrieval_dropped.jsonl")
-    ap.add_argument("--model", default="gemini-2.5-flash")
+    ap.add_argument("--model", default="gemini-flash-latest")
     args = ap.parse_args()
 
     key = os.environ.get("GEMINI_API_KEY")

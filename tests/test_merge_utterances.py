@@ -54,15 +54,16 @@ def test_format_transcript_is_timestamped_and_labelled():
     ]
     text = format_transcript(utts)
     assert text.splitlines() == [
-        "[00:12.4] JOSHUA: what is diwali",
-        "[00:19.1] DANIELLE: the festival of lights",
+        "[12.4] JOSHUA: what is diwali",
+        "[19.1] DANIELLE: the festival of lights",
     ]
 
 
-def test_format_transcript_stamps_past_an_hour():
-    """The recording is 85 min, so timestamps run past 60:00."""
+def test_format_transcript_uses_raw_seconds_not_mm_ss():
+    """The segmenter must echo absolute seconds back; MM:SS made it convert by hand and it
+    got whole windows wrong. The printed number is the number it should return."""
     utts = [{"speaker": "DANIELLE", "start": 4805.2, "end": 4806.0, "text": "late"}]
-    assert format_transcript(utts) == "[80:05.2] DANIELLE: late"
+    assert format_transcript(utts) == "[4805.2] DANIELLE: late"
 
 
 def test_default_gap_merges_a_pause_that_would_split_one_answer():

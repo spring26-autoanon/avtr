@@ -107,6 +107,15 @@ cd ~/moshi-finetune
 ~/fork-venv/bin/python scripts/precompute_references.py \
   --manifest replay/retrieval_manifest.jsonl --audiodir replay/retrieval
 
+# Top up with the 16 synthetic decline clips from Stage 2b. Her recording contains ZERO
+# decline turns, and those examples are what taught trial 4's ckpt 400 to decline instead
+# of confabulate. INTERIM: clone voice, terminal Q->A shape, ~3.2 min against ~40 min of
+# real audio. Replace with real recorded declines when a session is possible.
+# Must run AFTER precompute_references (it does not re-encode) and BEFORE build_manifest.
+~/fork-venv/bin/python scripts/add_decline_clips.py \
+  --manifest replay/render_manifest.jsonl \
+  --srcdir replay/audio --dstdir replay/retrieval
+
 ~/fork-venv/bin/python scripts/build_manifest.py \
   --wav-dir replay/retrieval --out-dir replay/retrieval --no-eval
 
