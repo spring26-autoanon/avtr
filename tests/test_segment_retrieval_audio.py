@@ -3,7 +3,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from segment_retrieval_audio import snap_bounds, split_long, validate_segments
+from segment_retrieval_audio import (
+    dedupe,
+    normalize,
+    snap_bounds,
+    split_long,
+    turn_mix,
+    validate_segments,
+    windows,
+)
 
 
 def _utts(spec):
@@ -129,3 +137,67 @@ def test_validate_orders_segments_by_start_time():
     early = _seg("s0", 0.0, 10.0, [_turn("JOSHUA", 0.0, 2.0), _turn("DANIELLE", 2.5, 10.0)])
     kept, _ = validate_segments([late, early], utts)
     assert [s["id"] for s in kept] == ["s0", "s1"]
+
+
+def test_windows_overlap_so_boundary_dialogues_are_seen_whole():
+    utts = [{"speaker": "JOSHUA", "start": float(t), "end": t + 0.5, "text": "w"}
+            for t in range(0, 1500, 10)]
+    ws = windows(utts, window_sec=720.0, overlap_sec=60.0)
+    assert len(ws) >= 2
+    # window 2 starts before window 1 ends
+    assert ws[1][0]["start"] < ws[0][-1]["end"]
+    # every utterance appears somewhere
+    seen = {u["start"] for w in ws for u in w}
+    assert seen == {u["start"] for u in utts}
+
+
+def test_dedupe_drops_segments_repeated_across_window_overlap():
+    segs = [
+        {"id": "w0-1", "start": 700.0, "end": 750.0, "turns": []},
+        {"id": "w1-0", "start": 700.3, "end": 750.2, "turns": []},
+        {"id": "w1-1", "start": 800.0, "end": 850.0, "turns": []},
+    ]
+    out = dedupe(segs, tol=1.0)
+    assert [s["start"] for s in out] == [700.0, 800.0]
+
+
+def test_turn_mix_counts_only_her_turns():
+    segs = [{
+        "id": "s0", "start": 0.0, "end": 50.0,
+        "turns": [
+            {"speaker": "JOSHUA", "start": 0.0, "end": 2.0, "kind": "smalltalk", "reference": None},
+            {"speaker": "DANIELLE", "start": 2.0, "end": 20.0, "kind": "grounded", "reference": "r"},
+            {"speaker": "JOSHUA", "start": 20.0, "end": 22.0, "kind": "smalltalk", "reference": None},
+            {"speaker": "DANIELLE", "start": 22.0, "end": 50.0, "kind": "smalltalk", "reference": None},
+        ],
+    }]
+    mix = turn_mix(segs)
+    assert mix == {"grounded": 1, "decline": 0, "smalltalk": 1, "total": 2, "retrieval_share": 0.5}
+
+
+def test_normalize_forces_joshua_turns_to_smalltalk_with_no_reference():
+    raw = [{"start": 0.0, "end": 10.0, "turns": [
+        {"speaker": "JOSHUA", "start": 0.0, "end": 2.0, "kind": "grounded", "reference": "nope"},
+        {"speaker": "DANIELLE", "start": 2.0, "end": 10.0, "kind": "grounded", "reference": "yes"},
+    ]}]
+    out = normalize(raw, 0)
+    assert out[0]["turns"][0]["kind"] == "smalltalk"
+    assert out[0]["turns"][0]["reference"] is None
+    assert out[0]["turns"][1]["reference"] == "yes"
+
+
+def test_normalize_strips_references_from_smalltalk_and_rejects_bad_kinds():
+    raw = [{"start": 0.0, "end": 10.0, "turns": [
+        {"speaker": "JOSHUA", "start": 0.0, "end": 2.0, "kind": "smalltalk"},
+        {"speaker": "DANIELLE", "start": 2.0, "end": 6.0, "kind": "smalltalk", "reference": "x"},
+        {"speaker": "DANIELLE", "start": 6.0, "end": 10.0, "kind": "nonsense", "reference": "y"},
+    ]}]
+    out = normalize(raw, 0)
+    assert out[0]["turns"][1]["reference"] is None
+    assert out[0]["turns"][2]["kind"] == "smalltalk"
+    assert out[0]["turns"][2]["reference"] is None
+
+
+def test_normalize_ids_are_unique_across_windows():
+    raw = [{"start": 0.0, "end": 10.0, "turns": []}]
+    assert normalize(raw, 0)[0]["id"] != normalize(raw, 1)[0]["id"]
