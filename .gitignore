@@ -111,3 +111,4 @@ finetune/data/datastereo/
 finetune/data/prepared/*.wav
 finetune/data/prepared_dialogue/*.wav
 finetune/data/prepared_retrieval/*.wav
+replay/retrieval/
