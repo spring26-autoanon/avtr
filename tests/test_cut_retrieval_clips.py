@@ -92,7 +92,7 @@ def test_cut_all_writes_clip_json_and_manifest(tmp_path):
     ])]
     outdir = tmp_path / "clips"
     manifest = tmp_path / "manifest.jsonl"
-    cut_all(master, alignments, segments, outdir, manifest)
+    cut_all(master, alignments, segments, outdir, manifest, tail_sec=0.0)
 
     info = sf.info(str(outdir / "ret-0.wav"))
     assert info.channels == 2 and info.samplerate == 24000 and info.subtype == "PCM_24"
@@ -118,7 +118,8 @@ def test_cut_all_audio_matches_the_master_slice(tmp_path):
         _turn("JOSHUA", 10.0, 11.0, "smalltalk"),
         _turn("DANIELLE", 11.0, 20.0, "smalltalk"),
     ])]
-    cut_all(master, alignments, segments, tmp_path / "clips", tmp_path / "m.jsonl")
+    cut_all(master, alignments, segments, tmp_path / "clips", tmp_path / "m.jsonl",
+            tail_sec=0.0)
     clip, _ = sf.read(str(tmp_path / "clips" / "ret-0.wav"), always_2d=True)
     expect, _ = sf.read(str(master), start=10 * 24000, stop=20 * 24000, always_2d=True)
     assert np.array_equal(clip, expect)
@@ -244,3 +245,57 @@ def test_smalltalk_between_her_grounded_turns_does_not_split_them(tmp_path):
     cut_all(master, alignments, segments, tmp_path / "clips", tmp_path / "m.jsonl")
     data = json.load(open(tmp_path / "clips" / "ret-0.json"))
     assert sum(1 for w in data["alignments"] if w[0] == "<RAG>") == 1
+
+
+def test_clip_extends_past_her_last_word_so_it_does_not_end_on_silence(tmp_path):
+    """97% of clips ended within 0.5s of her final word, teaching 'after you speak,
+    everything stops' -- the empty-buffer stall. Carrying a few seconds of the ongoing
+    conversation past her turn means the clip stops mid-flow instead."""
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    alignments = [_al("hello", 11.0, 11.5), _al("answer", 14.0, 19.0)]
+    segments = [_segment("ret-0", 10.0, 20.0, [
+        _turn("JOSHUA", 10.0, 13.0, "smalltalk"),
+        _turn("DANIELLE", 14.0, 20.0, "grounded", "a reference"),
+    ])]
+    cut_all(master, alignments, segments, tmp_path / "c", tmp_path / "m.jsonl", tail_sec=3.0)
+    info = sf.info(str(tmp_path / "c" / "ret-0.wav"))
+    assert abs(info.duration - 13.0) < 1e-3          # 10 s segment + 3 s tail
+
+
+def test_tail_is_clamped_at_the_end_of_the_master(tmp_path):
+    master = tmp_path / "master.wav"
+    _write_master(master, seconds=21.0)
+    alignments = [_al("hi", 11.0, 11.5), _al("bye", 14.0, 19.0)]
+    segments = [_segment("ret-0", 10.0, 20.0, [
+        _turn("JOSHUA", 10.0, 13.0, "smalltalk"),
+        _turn("DANIELLE", 14.0, 20.0, "smalltalk"),
+    ])]
+    cut_all(master, alignments, segments, tmp_path / "c", tmp_path / "m.jsonl", tail_sec=5.0)
+    assert abs(sf.info(str(tmp_path / "c" / "ret-0.wav")).duration - 11.0) < 1e-3
+
+
+def test_tail_is_clamped_so_the_clip_never_exceeds_duration_sec(tmp_path):
+    master = tmp_path / "master.wav"
+    _write_master(master, seconds=200.0)
+    alignments = [_al("hi", 11.0, 11.5), _al("long", 14.0, 98.0)]
+    segments = [_segment("ret-0", 5.0, 99.0, [
+        _turn("JOSHUA", 5.0, 13.0, "smalltalk"),
+        _turn("DANIELLE", 14.0, 99.0, "smalltalk"),
+    ])]
+    cut_all(master, alignments, segments, tmp_path / "c", tmp_path / "m.jsonl", tail_sec=10.0)
+    assert sf.info(str(tmp_path / "c" / "ret-0.wav")).duration <= 100.001
+
+
+def test_tail_audio_comes_from_the_master_not_silence(tmp_path):
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    alignments = [_al("hi", 11.0, 11.5), _al("bye", 14.0, 19.0)]
+    segments = [_segment("ret-0", 10.0, 20.0, [
+        _turn("JOSHUA", 10.0, 13.0, "smalltalk"),
+        _turn("DANIELLE", 14.0, 20.0, "smalltalk"),
+    ])]
+    cut_all(master, alignments, segments, tmp_path / "c", tmp_path / "m.jsonl", tail_sec=3.0)
+    clip, _ = sf.read(str(tmp_path / "c" / "ret-0.wav"), always_2d=True)
+    expect, _ = sf.read(str(master), start=10 * 24000, stop=23 * 24000, always_2d=True)
+    assert np.array_equal(clip, expect)

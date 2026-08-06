@@ -24,6 +24,8 @@ import soundfile as sf
 
 TARGET_SR = 24000
 RETRIEVAL_KINDS = ("grounded", "decline")
+MAX_CLIP_SEC = 100.0     # duration_sec in every training config
+TAIL_SEC = 3.0           # conversation carried past her final turn (see cut_all)
 
 
 def slice_alignments(alignments, start, end):
@@ -87,8 +89,15 @@ def _retrieval_turns(segment):
     return out
 
 
-def cut_all(master_path, alignments, segments, outdir, manifest_path):
-    """Cut every segment. Returns the list of manifest rows written."""
+def cut_all(master_path, alignments, segments, outdir, manifest_path, tail_sec=TAIL_SEC):
+    """Cut every segment. Returns the list of manifest rows written.
+
+    `tail_sec` of the ongoing conversation is carried past her final turn. Without it 97% of
+    clips ended within 0.5 s of her last word, so half of every training batch taught
+    "after you speak, everything stops" — the empty-buffer stall, where the model emits a
+    couple of tokens and then produces nothing for tens of seconds. The tail is her partner
+    starting his next turn, so the clip stops mid-flow instead of on her silence.
+    """
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
 
@@ -96,11 +105,16 @@ def cut_all(master_path, alignments, segments, outdir, manifest_path):
     if info.samplerate != TARGET_SR or info.channels != 2:
         raise SystemExit(f"{master_path}: expected 2ch/{TARGET_SR} Hz, got "
                          f"{info.channels}ch/{info.samplerate} Hz")
+    master_dur = info.frames / float(info.samplerate)
 
     rows = []
     for seg in segments:
         start, end = seg["start"], seg["end"]
-        clip_alignments = slice_alignments(alignments, start, end)
+        # clamp the tail at the master's end and at duration_sec
+        end = min(end + tail_sec, master_dur, start + MAX_CLIP_SEC)
+        # alignments are sliced to the ORIGINAL span: the tail is her partner talking,
+        # and channel 1 never contributes SPEAKER_MAIN text.
+        clip_alignments = slice_alignments(alignments, start, seg["end"])
         if not clip_alignments:
             print(f"  SKIP {seg['id']}: no Danielle words inside")
             continue
@@ -147,13 +161,17 @@ def main() -> None:
     ap.add_argument("--segments", default="replay/retrieval_segments.filtered.jsonl")
     ap.add_argument("--outdir", default="replay/retrieval")
     ap.add_argument("--manifest", default="replay/retrieval_manifest.jsonl")
+    ap.add_argument("--tail-sec", type=float, default=TAIL_SEC,
+                    help="seconds of ongoing conversation carried past her final turn, so "
+                         "clips do not end on her silence (empty-buffer stall)")
     args = ap.parse_args()
 
     with open(args.alignments) as f:
         alignments = json.load(f)["alignments"]
     segments = [json.loads(line) for line in open(args.segments) if line.strip()]
 
-    rows = cut_all(args.master, alignments, segments, args.outdir, args.manifest)
+    rows = cut_all(args.master, alignments, segments, args.outdir, args.manifest,
+                   tail_sec=args.tail_sec)
 
     total = sum(r["duration_sec"] for r in rows)
     n_ret = sum(len(r["references"]) for r in rows)
