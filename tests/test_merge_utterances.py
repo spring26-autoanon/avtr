@@ -63,3 +63,16 @@ def test_format_transcript_stamps_past_an_hour():
     """The recording is 85 min, so timestamps run past 60:00."""
     utts = [{"speaker": "DANIELLE", "start": 4805.2, "end": 4806.0, "text": "late"}]
     assert format_transcript(utts) == "[80:05.2] DANIELLE: late"
+
+
+def test_default_gap_merges_a_pause_that_would_split_one_answer():
+    """Default is 1.5 s, measured from the real recording (see merge_utterances docstring):
+    at 0.6 s the merge over-splits her turns by 37% against the speaker-change floor."""
+    ch0 = [["answer", [1.0, 1.4], "SPEAKER_MAIN"], ["continues", [2.2, 2.6], "SPEAKER_MAIN"]]
+    assert len(merge_utterances(ch0, [])) == 1              # 0.8 s pause -> still one turn
+    assert len(merge_utterances(ch0, [], gap=0.6)) == 2     # old default would have split it
+
+
+def test_default_gap_still_splits_a_real_turn_boundary():
+    ch0 = [["done", [1.0, 1.4], "SPEAKER_MAIN"], ["new", [5.0, 5.4], "SPEAKER_MAIN"]]
+    assert len(merge_utterances(ch0, [])) == 2

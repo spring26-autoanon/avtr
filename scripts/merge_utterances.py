@@ -25,8 +25,15 @@ def _words(alignments, speaker):
     return out
 
 
-def merge_utterances(ch0, ch1, gap: float = 0.6):
-    """Interleave both channels in time order, grouping same-speaker words < `gap` apart."""
+def merge_utterances(ch0, ch1, gap: float = 1.5):
+    """Interleave both channels in time order, grouping same-speaker words < `gap` apart.
+
+    The default is set from the real recording, not guessed. Splitting on speaker change
+    alone yields 704 turns; at gap=0.6 the merge yields 965 utterances (37% over-split) and
+    only flattens out around 1.5 s (763, 8% over). Over-splitting matters because a single
+    answer chopped in two can have its <RAG> marker placed mid-answer instead of at the
+    start, so err toward merging her consecutive runs.
+    """
     words = _words(ch0, DANIELLE) + _words(ch1, JOSHUA)
     words.sort(key=lambda w: (w["start"], w["speaker"]))
 
