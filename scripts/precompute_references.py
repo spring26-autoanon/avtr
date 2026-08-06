@@ -46,6 +46,23 @@ def main() -> None:
     args = ap.parse_args()
 
     rows = [json.loads(l) for l in open(args.manifest) if l.strip()]
+
+    # Preflight: one probe against the encoder before iterating, so a service that is not
+    # running fails in one clear line rather than a urllib traceback on the first clip.
+    try:
+        probe = embed(args.url, "preflight check")
+    except Exception as e:
+        raise SystemExit(
+            f"reference encoder unreachable at {args.url} ({type(e).__name__}: {e}).\n"
+            f"Start it on the second GPU before running this, e.g.:\n"
+            f"  CUDA_VISIBLE_DEVICES=1 ~/fork-venv/bin/python -m moshi.server_conditioner \\\n"
+            f"    --config hf://kyutai/moshika-rag-pytorch-bf16/config.json \\\n"
+            f"    --moshi-weight hf://kyutai/moshika-rag-pytorch-bf16/model.safetensors \\\n"
+            f"    --conditioner reference_with_time --cuda-device 0 --port 8001\n"
+            f"(--cuda-device 0 is required: it makes attn_bias and the model share a device.)"
+        ) from e
+    print(f"encoder OK at {args.url}: probe tensor {tuple(probe.shape)} {probe.dtype}")
+
     n_ref = n_skip = 0
     for i, rec in enumerate(rows):
         # Stage 3 manifests carry an ordered `references` list (one per <RAG> marker);
