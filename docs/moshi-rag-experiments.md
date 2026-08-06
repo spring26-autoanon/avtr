@@ -77,6 +77,32 @@ Consolidated record of every training trial toward the goal: a LoRA that makes M
   late=retrieval/formal). **No single checkpoint is both.** `checkpoint_000600` = keeper of this run
   (retrieval); `000400` = keeper for personality.
 
+### 5. Stage 3 — real recorded retrieval dialogue (`moshika_rag_stage3`) → **audition pending**
+- **The fix under test:** retrieval and persona were previously trained in stylistically opposite
+  datasets (natural dialogue vs formal clone-voice Q&A), forcing the trade. Stage 3 puts retrieval
+  *inside* her natural conversation, in her real voice, so **54 of 80 clips contain a mode switch**
+  (casual talk and retrieval in the same clip) and 44 carry more than one retrieval turn.
+- **Data:** Danielle + Joshua Rhodes, one 84.65-min recording, isolated tracks (measured −51 dB
+  channel isolation, 0.1% overlap). Segmented into 78 clips / 68.4 min, plus the 16 Stage-2b
+  synthetic decline clips (3.2 min) as an interim top-up — **she recorded zero declines**, and those
+  examples are what taught trial 4's ckpt 400 to decline rather than confabulate. Replace with real
+  recorded declines when a session is possible.
+- **Turn mix:** 133 grounded / 1 decline / 194 smalltalk → `retrieval_share` 0.41. Smalltalk+decline
+  at 58% of her turns is what set **`RAG_TOKEN_WEIGHT=15`** (the rule: ≥30% → 15, else 8–10).
+- **Config:** `example/moshika_rag_stage3.yaml`, fresh LoRA rank 64 on moshika-rag
+  (`config.spike.json`), **0.5/0.5 native sampling weights** (`dataset.py parse_data_sources`)
+  rather than a premixed manifest, 800 steps, ckpt every 100.
+- **Run:** completed cleanly 2026-08-06, 3h02m, loss **3.773 → 2.389 (step 92) → 1.963 (step 616)**,
+  peak 26.4 GB. All 8 checkpoints saved.
+- **Enabling fix:** `train.py` conditioned only the **first** ⟨ret⟩ frame (`hit[0]`). With
+  multi-retrieval clips every later retrieval turn trained with no conditioning while the loss still
+  demanded a grounded answer — confabulation taught directly. Now the i-th marker pairs with the
+  i-th reference, each span clamped at the next marker
+  (`finetune/data/reference_injection.py`, N-tensor `reference_io`).
+- **Results:** audition pending. Judge **switching**, not either mode: chit-chat → factual question
+  (trial 4's failure), retrieval → back to casual without staying formal, no ⟨ret⟩ in pure chit-chat,
+  voice throughout.
+
 ---
 
 ## Root-cause synthesis (why no checkpoint does both)
