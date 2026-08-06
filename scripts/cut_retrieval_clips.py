@@ -63,10 +63,28 @@ def insert_rag_markers(alignments, retrieval_turn_starts):
 
 
 def _retrieval_turns(segment):
-    """Her retrieval turns, in time order — the order the references must be listed in."""
-    turns = [t for t in segment["turns"]
-             if t["speaker"] == "DANIELLE" and t["kind"] in RETRIEVAL_KINDS and t.get("reference")]
-    return sorted(turns, key=lambda t: t["start"])
+    """Her retrieval turns, in time order — one per QUESTION, not one per fragment.
+
+    A retrieval trigger corresponds to a question being answered. If JOSHUA has not spoken
+    since her last retrieval turn, she did not retrieve again: her single answer was merely
+    split into fragments by the pause-merge, and Gemini labelled each fragment `grounded`.
+    Emitting a <RAG> per fragment would train the model to fire ⟨ret⟩ repeatedly while it is
+    still speaking one reply — over-triggering baked straight into the data. One real clip
+    had four triggers inside a single Gurpurab answer, one of them mid-sentence.
+
+    Only a JOSHUA turn opens a new retrieval opportunity; her own smalltalk aside does not.
+    """
+    out = []
+    joshua_since = True          # the segment always opens on a JOSHUA turn
+    for t in sorted(segment["turns"], key=lambda x: x["start"]):
+        if t["speaker"] == "JOSHUA":
+            joshua_since = True
+            continue
+        if t["kind"] in RETRIEVAL_KINDS and t.get("reference"):
+            if joshua_since:
+                out.append(t)
+                joshua_since = False
+    return out
 
 
 def cut_all(master_path, alignments, segments, outdir, manifest_path):

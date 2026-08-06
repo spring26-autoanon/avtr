@@ -188,3 +188,59 @@ def test_cut_all_smalltalk_only_clip_has_no_markers_and_no_references(tmp_path):
     data = json.load(open(outdir / "ret-0.json"))
     assert not any(w[0] == "<RAG>" for w in data["alignments"])
     assert json.loads(manifest.read_text().strip())["references"] == []
+
+
+def test_consecutive_grounded_turns_share_one_trigger(tmp_path):
+    """One <RAG> per QUESTION. If Joshua does not ask again, she did not retrieve again --
+    her long answer merely got split into fragments by the pause-merge, and firing once per
+    fragment would train the model to emit the trigger repeatedly while still speaking."""
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    alignments = [_al("first", 12.0, 12.5), _al("second", 20.0, 20.5), _al("third", 30.0, 30.5)]
+    segments = [_segment("ret-0", 10.0, 40.0, [
+        _turn("JOSHUA", 10.0, 11.0, "smalltalk"),
+        _turn("DANIELLE", 12.0, 19.0, "grounded", "ref one"),
+        _turn("DANIELLE", 20.0, 29.0, "grounded", "ref two"),    # no Joshua in between
+        _turn("DANIELLE", 30.0, 40.0, "grounded", "ref three"),  # still no Joshua
+    ])]
+    outdir = tmp_path / "clips"
+    manifest = tmp_path / "m.jsonl"
+    cut_all(master, alignments, segments, outdir, manifest)
+    data = json.load(open(outdir / "ret-0.json"))
+    assert sum(1 for w in data["alignments"] if w[0] == "<RAG>") == 1
+    row = json.loads(manifest.read_text().strip())
+    assert row["references"] == ["ref one"]
+
+
+def test_a_new_question_earns_a_new_trigger(tmp_path):
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    alignments = [_al("first", 12.0, 12.5), _al("second", 30.0, 30.5)]
+    segments = [_segment("ret-0", 10.0, 40.0, [
+        _turn("JOSHUA", 10.0, 11.0, "smalltalk"),
+        _turn("DANIELLE", 12.0, 19.0, "grounded", "ref one"),
+        _turn("JOSHUA", 20.0, 29.0, "smalltalk"),                # he asks again
+        _turn("DANIELLE", 30.0, 40.0, "grounded", "ref two"),
+    ])]
+    outdir = tmp_path / "clips"
+    manifest = tmp_path / "m.jsonl"
+    cut_all(master, alignments, segments, outdir, manifest)
+    data = json.load(open(outdir / "ret-0.json"))
+    assert sum(1 for w in data["alignments"] if w[0] == "<RAG>") == 2
+    assert json.loads(manifest.read_text().strip())["references"] == ["ref one", "ref two"]
+
+
+def test_smalltalk_between_her_grounded_turns_does_not_split_them(tmp_path):
+    """Only a JOSHUA turn marks a new question; her own aside does not."""
+    master = tmp_path / "master.wav"
+    _write_master(master)
+    alignments = [_al("a", 12.0, 12.5), _al("b", 20.0, 20.5), _al("c", 30.0, 30.5)]
+    segments = [_segment("ret-0", 10.0, 40.0, [
+        _turn("JOSHUA", 10.0, 11.0, "smalltalk"),
+        _turn("DANIELLE", 12.0, 19.0, "grounded", "ref one"),
+        _turn("DANIELLE", 20.0, 29.0, "smalltalk"),
+        _turn("DANIELLE", 30.0, 40.0, "grounded", "ref two"),
+    ])]
+    cut_all(master, alignments, segments, tmp_path / "clips", tmp_path / "m.jsonl")
+    data = json.load(open(tmp_path / "clips" / "ret-0.json"))
+    assert sum(1 for w in data["alignments"] if w[0] == "<RAG>") == 1
