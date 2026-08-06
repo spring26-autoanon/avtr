@@ -1,0 +1,43 @@
+# Stage 3 — real recorded retrieval dialogue + natural dialogue, one LoRA.
+#
+# GOAL (the thing to judge it on): casual conversation AND retrieval in ONE session, with
+# fluid switching between them — not retrieval at one checkpoint and personality at another,
+# which is where every earlier trial landed. See docs/moshi-rag-experiments.md.
+# Spec: docs/superpowers/specs/2026-08-05-stage3-retrieval-audio-prep-design.md
+#
+# Sampling weights (dataset.py parse_data_sources) rather than a premixed manifest: exact,
+# independent of each side's duration, and retunable by editing one line. Underlying
+# durations are ~85 min retrieval vs 135.3 min natural, but the weights govern sampling.
+#
+# RAG_TOKEN_WEIGHT is passed in the ENVIRONMENT, not set here. Choose it from the turn mix
+# segment_retrieval_audio.py reports: 15 if smalltalk+decline are >= 30% of her turns,
+# otherwise 8-10. Prefer moving that lever over the sampling ratio — it targets only the
+# trigger token, while the ratio moves voice, style and fact memorisation at once.
+data:
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.5,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.5"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-rag-pytorch-bf16"
+  # reference_with_time in fuser.streaming_sum (for the injected reference), not a module;
+  # first_speaker prepend off. Same config Stage 2b trained under.
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.spike.json"
+full_finetuning: false
+lora: { enable: true, rank: 64, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+duration_sec: 100
+batch_size: 8
+max_steps: 800
+gradient_checkpointing: true
+optim: { lr: 4e-6, weight_decay: 0.1, pct_start: 0.05 }
+# eval_loss goes NaN when the eval set has fewer than batch_size windows; the 10 min slice
+# is 6 windows at duration_sec 100. Pick checkpoints by ear, as in every prior run.
+do_eval: false
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_rag_stage3"
