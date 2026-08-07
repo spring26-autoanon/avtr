@@ -254,6 +254,10 @@ or skipped.
 Then label EACH of DANIELLE's turns:
   "grounded"  - she answers a question using specific external facts.
   "decline"   - she says she does not know / cannot answer, instead of guessing.
+  "persona"   - she answers a question ABOUT HERSELF: her name, where she is from, her job,
+                her tattoos, plants, martial arts, music taste, travel. These state specific
+                facts, but they are facts about her own life, not retrieved knowledge.
+                Label these "persona", never "grounded", and omit "reference".
   "smalltalk" - casual conversation needing no external facts.
 Label every JOSHUA turn "smalltalk" with no reference.
 
@@ -341,8 +345,13 @@ def dedupe(segments, tol=1.0):
 
 
 def turn_mix(segments):
-    """Count HER turns by kind. retrieval_share sets RAG_TOKEN_WEIGHT (see the spec)."""
-    counts = {"grounded": 0, "decline": 0, "smalltalk": 0}
+    """Count HER turns by kind. retrieval_share sets RAG_TOKEN_WEIGHT (see the spec).
+
+    `persona` turns state specific facts but are answered from the weights, not retrieval, so
+    they are counted and then excluded from the share — otherwise tonight's ~45 identity
+    answers would inflate it and pick the wrong weight.
+    """
+    counts = {"grounded": 0, "decline": 0, "persona": 0, "smalltalk": 0}
     for seg in segments:
         for t in seg["turns"]:
             if t["speaker"] != "DANIELLE":
@@ -365,13 +374,13 @@ def normalize(raw_segments, window_index):
         turns = []
         for t in seg.get("turns", []):
             kind = t.get("kind", "smalltalk")
-            if kind not in ("grounded", "decline", "smalltalk"):
+            if kind not in ("grounded", "decline", "persona", "smalltalk"):
                 kind = "smalltalk"
             speaker = "DANIELLE" if t.get("speaker", "").upper().startswith("D") else "JOSHUA"
             if speaker == "JOSHUA":
                 kind = "smalltalk"
             reference = t.get("reference") or None
-            if kind == "smalltalk":
+            if kind in ("smalltalk", "persona"):
                 reference = None
             turns.append({"speaker": speaker, "start": float(t["start"]),
                           "end": float(t["end"]), "kind": kind, "reference": reference,

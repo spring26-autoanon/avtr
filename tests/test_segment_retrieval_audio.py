@@ -173,7 +173,7 @@ def test_turn_mix_counts_only_her_turns():
         ],
     }]
     mix = turn_mix(segs)
-    assert mix == {"grounded": 1, "decline": 0, "smalltalk": 1, "total": 2, "retrieval_share": 0.5}
+    assert mix == {"grounded": 1, "decline": 0, "persona": 0, "smalltalk": 1, "total": 2, "retrieval_share": 0.5}
 
 
 def test_normalize_forces_joshua_turns_to_smalltalk_with_no_reference():
