@@ -201,15 +201,54 @@ python3 scripts/cut_retrieval_clips.py --master ... --alignments ... --segments 
   --outdir replay/persona --manifest replay/persona_manifest.jsonl
 ```
 
-### 3.2 Existing data
+### 3.2 Existing data — disposition
 
-| set | minutes | markers | status |
+Which directory goes into which run. **Getting this wrong is silent** — nothing crashes, the
+run just trains on the wrong thing for five hours.
+
+| directory | what it is | min | markers | Track A | Track B |
+|---|---|---|---|---|---|
+| `finetune/data/prepared_dialogue/` | 4 stereo, natural dialogue (Joshua + Clay) | 135.3 | 0 | ✅ | ✅ unmarked |
+| `replay/retrieval/` | 78 clips, `<RAG>` + refs, 3 s tails | 72.3 | 119 | ❌ | ✅ |
+| `replay/retrieval_nomarkers/` | same audio, markers stripped, no refs | 72.3 | 0 | ✅ | ❌ |
+| synthetic declines (in `replay/retrieval/`) | Stage-2b, marked + ref | 3.2 | 16 | ❌ | ✅ retire once real declines land |
+| `finetune/data/prepared/` | 9 monologues, **silent right channel** | 57.8 | 0 | ❌ | ❌ |
+| new recording (tonight) | persona / declines / overlap | ~35–40 | TBD | ✅ all | split, see below |
+
+**Three traps:**
+
+1. **`finetune/data/prepared/` must never be used again.** Those are the original Option-A
+   monologues with a silent user channel — the data that taught the model the user never
+   speaks and produced the monologuing failure. Still on disk; just keep it out of every
+   manifest.
+2. **The two retrieval directories are the same 72 minutes and are not interchangeable.**
+   `interleaver._tokenize` maps `<RAG>` to raw token id 4 — the rag token on moshika-rag, an
+   ordinary word token on plain moshika. Marked clips on Track A inject nonsense into the
+   text stream; stripped clips on Track B have no reference to condition on.
+3. **The dialogue goes into Track B unmarked, and that is now correct** rather than merely
+   tolerable — see §4.1b. Before the loss mask it was 135 min of trigger suppression.
+
+**Splitting tonight's recording when you cut it:**
+
+| part | ~min | markers | why |
 |---|---|---|---|
-| Retrieval clips | 72.3 | 119 | ready, 3 s tails, `replay/retrieval/` |
-| Synthetic declines | 3.2 | 16 | interim, retire once real declines exist |
-| Natural dialogue | 135.3 | **0** | 639 of her turns; see §3.3 |
-| Marker-stripped retrieval | 72.3 | 0 | `replay/retrieval_nomarkers/` — Track A only |
-| New persona/declines | ~35 | TBD | tomorrow |
+| 1 — persona | 20 | **none** | she is not retrieving her own name. Pure voice + identity; masked by §4.1b at zero cost to the trigger |
+| 2 — declines | 10 | **marked + reference** | the retrieve-then-find-nothing case. With the diffuse negative signal masked away, these are now the **main** counterweight against over-triggering — check the count after cutting |
+| 3 — interruption/overlap | 5–10 | none | turn-taking and barge-in |
+
+### 3.2b Launch commands
+
+```bash
+# Track A — plain moshika. No env vars: token 4 is an ordinary token here.
+uv run torchrun --nproc-per-node 1 -m train example/moshika_voice_max.yaml
+
+# Track B run 4a — mask + upweight together.
+RAG_TOKEN_WEIGHT=25 MASK_UNLABELLED_RAG=1 \
+  uv run torchrun --nproc-per-node 1 -m train example/moshika_rag_stage4a.yaml
+```
+
+`MASK_UNLABELLED_RAG` defaults to off, so forgetting it silently reproduces Stage 3's
+behaviour. Confirm it is set before walking away from a 3-hour run.
 
 ### 3.3 Mine the natural dialogue — keep it, don't discard it
 

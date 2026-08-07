@@ -1,5 +1,10 @@
 # NEXT_STEPS — moshi-finetune voice clone
 
+> ⚠️ **STALE as of 2026-08-07.** Stages 2–4 superseded this. The live plan is
+> `docs/stage4_training_spec.md` (what to run, with which data) and
+> `docs/moshi-rag-experiments.md` (what every run produced). Parts 1–3 below are
+> historical.
+
 _Status as of 2026-07-20. Read alongside `CLAUDE.md` (plan of record) and the
 per-run gotchas in memory (`a100-runtime-gotchas`)._
 
