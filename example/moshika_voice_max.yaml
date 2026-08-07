@@ -1,0 +1,51 @@
+# TRACK A — maximum voice clone on PLAIN moshika. No retrieval.
+#
+# Goal: the best-sounding Danielle we can produce, with nothing else to protect.
+# This is the safe deliverable: no retrieval behaviour to damage, and the settings are the
+# repo's own recommended ones (README "Recommended settings for quick training") rather than
+# anything we invented.
+#
+# Deliberately the OPPOSITE direction from the RAG track. There we minimise intervention to
+# preserve base behaviour; here we maximise it, because voice is the only objective.
+#
+#   README: rank 128, batch_size 16, max_steps 2000, lr 2e-6
+#   Stage 3 used rank 64, batch 8, 800 steps, lr 4e-6 — half the rank, and DOUBLE the
+#   learning rate both the README and the moshi-rag paper recommend.
+#
+# ⚠️ PREREQUISITE: strip <RAG> markers from the retrieval clips before using them here.
+# interleaver._tokenize maps "<RAG>" to raw token id 4, which is the rag token on moshika-rag
+# but an ordinary token on plain moshika — feeding it here injects garbage into the text
+# stream. Use marker-free copies of the clips (see scripts/strip_rag_markers.py).
+data:
+  # dialogue + marker-STRIPPED retrieval clips + the new persona/decline session.
+  # Update this line once the 2026-08-07 recording is cut.
+  train_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl,/home/leenatantawy/moshi-finetune/replay/retrieval_nomarkers/train.jsonl"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  # Plain moshika (female voice), NOT moshika-rag. Ships no config.json — do not set
+  # config_path; moshi's built-in default LM architecture is correct and the "loads default
+  # models" warning is expected.
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"
+full_finetuning: false
+lora: { enable: true, rank: 128, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+duration_sec: 100
+batch_size: 16
+max_steps: 2000
+gradient_checkpointing: true
+optim:
+  lr: 2.0e-6          # README and the moshi-rag paper both use 2e-6; our runs used 4e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+# eval_loss is NaN unless the eval set has >= batch_size windows. At batch 16 and
+# duration_sec 100 that needs >= ~27 min; the 10 min slice is 6 windows. Pick by ear.
+do_eval: false
+do_ckpt: true
+ckpt_freq: 200      # 2000 steps -> 10 checkpoints
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_voice_max"
