@@ -79,10 +79,13 @@ def parse_log(text):
 
     round_trips = []
     refs = [t for t in references if t]
+    ref_idx = 0
     for t in [t for t in triggers if t]:
-        nxt = next((r for r in refs if r >= t), None)
-        if nxt:
-            round_trips.append(round((nxt - t).total_seconds(), 3))
+        while ref_idx < len(refs) and refs[ref_idx] < t:
+            ref_idx += 1
+        if ref_idx < len(refs):
+            round_trips.append(round((refs[ref_idx] - t).total_seconds(), 3))
+            ref_idx += 1
 
     return {"triggers": n_trig, "references": n_ref, "stall_lines": n_stall,
             "longest_stall_sec": longest, "round_trips": round_trips,
@@ -131,11 +134,13 @@ def known_good(sessions):
         rs = [s["results"][qid] for s in sessions if qid in s["results"]]
         if kind == "factual":
             ok = sum(1 for r in rs if r["fired"] and r["passed"])
+        elif kind == "decline":
+            ok = sum(1 for r in rs if r["passed"])
         else:
             ok = sum(1 for r in rs if r["passed"] and not r["fired"])
-        bucket = persona if kind == "persona" else demo if kind in ("factual", "decline", "greeting", "personal") else demo
+        bucket = persona if kind == "persona" else demo
         (bucket if ok >= need else avoid).append(qid)
-    return {"demo": [q for q in demo], "persona": persona, "avoid": avoid}
+    return {"demo": demo, "persona": persona, "avoid": avoid}
 
 
 def _render(card, kg):

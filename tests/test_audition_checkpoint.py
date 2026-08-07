@@ -85,3 +85,19 @@ def test_known_good_factual_needs_fire_and_pass():
 def test_persona_questions_listed_separately():
     kg = known_good([_session(1), _session(2), _session(3)])
     assert "q02" in kg["persona"] and "q02" not in kg["demo"]
+
+
+def test_decline_may_fire_and_still_be_known_good():
+    """Real declines are trained marked+referenced: fire-then-decline-gracefully is correct."""
+    fired_decline = {"q07": {"fired": True, "passed": True, "notes": "fired, then declined"}}
+    kg = known_good([_session(1, fired_decline), _session(2, fired_decline), _session(3, fired_decline)])
+    assert "q07" in kg["demo"]
+
+
+def test_round_trip_consumes_each_reference_once():
+    log = """\
+2026-08-08 10:00:05,000 INFO [RAG] model emitted ret token
+2026-08-08 10:00:05,500 INFO [RAG] model emitted ret token
+2026-08-08 10:00:06,900 INFO Generated reference: only one
+"""
+    assert parse_log(log)["round_trips"] == [1.9]
