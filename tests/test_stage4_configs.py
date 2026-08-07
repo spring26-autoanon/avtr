@@ -115,3 +115,16 @@ def test_rag_token_weight_stays_out_of_the_configs():
     """Chosen from the measured turn mix and passed in the environment."""
     for p in (S4A, S4B):
         assert "rag_token_weight" not in cfg(p)
+
+
+def test_voice_track_includes_the_michelle_session():
+    """122.8 min of her voice, discovered 2026-08-07 in the raw Zoom originals — the largest
+    single addition of voice data. Track A (voice-max) takes everything."""
+    assert "prepared_michelle" in cfg(VOICE)["data"]["train_data"]
+
+
+def test_rag_tracks_exclude_the_michelle_session():
+    """Deliberate: 4a/4b must stay attributable against Stage 3, with exactly one data delta
+    (the persona recording). Michelle joins a Friday rerun only as a baselined change."""
+    for p in (S4A, S4B):
+        assert "prepared_michelle" not in cfg(p)["data"]["train_data"], p.name
