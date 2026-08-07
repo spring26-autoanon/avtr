@@ -191,13 +191,60 @@ improves. That asymmetry should be reflected in the settings, and none of these 
 
 | knob | Stage 3 | proposal | why |
 |---|---|---|---|
-| LoRA rank | 64 | **16 or 32** | rank 64 is a lot of capacity to overwrite base behaviour with 1.26 hr of data |
+| LoRA rank | 64 | **32** | one halving from the only value with evidence behind it |
 | steps | 800 | **~400** | run 1's history: voice imprints by ~300 steps; beyond that damage accrues while voice plateaus |
-| sampling | 0.5 retrieval / 0.5 dialogue | **retrieval-only**, or 0.8/0.2 | the marker-free half is the trigger suppressant |
+| sampling | 0.5 retrieval / 0.5 dialogue | depends on §6a | if dialogue mining yields markers, keep it; otherwise 0.8/0.2 |
 | `RAG_TOKEN_WEIGHT` | 25 | **25**, revisit after the delay fix | 15 never fired; 25 fires ~50% |
 | serve scaling | 2.0 | **2.0** | 1.5 costs filler and prosody |
 
-Rank and step count are the two most valuable ablations and the cheapest to run.
+**Rank 32, not 16.** Rank 64 is the *only* setting with evidence behind it — every successful
+voice clone in this project used it. A two-step drop to 16 risks conflating "lost her voice"
+with "rank too low" when several other things are changing simultaneously. Halve once, see
+what it costs.
+
+### Sequencing — do not change everything at once
+
+Stage 3 taught this the hard way: a checkpoint was called a regression from one session and
+the call was wrong. With five knobs in flight, a worse run tells us nothing.
+
+| run | change | isolates |
+|---|---|---|
+| **4a** | delay fix + reference dropout only. Rank 64, 800 steps, 0.5/0.5 unchanged. | Does the lead/delay structure fix grounding and restore filler? This is the change with a confirmed failure to point at — "Argentina" 1.8 s early. |
+| **4b** | + rank 32, ~400 steps | Does less intervention preserve triggering and turn-taking, at what voice cost? |
+| **4c** | + data ratio (mined dialogue, or 0.8/0.2, or retrieval-only) | Does the marker ratio drive triggering? |
+
+Each run is ~3 hours plus audition. The harness (§6) is what makes this affordable.
+
+## 6a. Mine the natural dialogue for markers — measure before committing
+
+The 135 minutes of natural dialogue is the largest block of her voice we have, and the
+reason to drop it is only that it is **marker-free** and therefore suppresses the trigger.
+If markers can be added where she genuinely states facts, we keep the voice data *and* fix
+the ratio — strictly better than discarding it.
+
+**Why the density may be higher than "friends chatting" suggests.** Under our persona design,
+**her talking about herself is retrievable content**. Casual conversation with Clay and
+Joshua very likely contains her discussing travel, work, plants, training — which is exactly
+the persona material §3 says we lack. Mining may surface persona data that is already
+recorded.
+
+**Do the cheap measurement first.** The channel-0 transcripts already exist on the box and
+are small. Joshua's side is *not* needed to answer "how many of her turns state facts."
+
+1. `rsync` the ch0 `.json` alignments for `danielle_clays`, `..._train_a`, `..._train_b`.
+2. Merge to utterances, hand her turns to Gemini, ask which are knowledge-dependent or
+   self-descriptive, and count.
+3. **Decision rule:** ≥150 markable turns → worth the channel-1 Whisper pass and full
+   labelling. Under ~50 → drop the idea; the dialogue half gets reweighted or removed
+   instead.
+
+Only after the count justifies it: channel-1 Whisper pass (GPU, user-run), then the same
+segment → label → reference → lead/body pipeline the retrieval clips use.
+
+**Caveat.** Marking a turn that is *not* genuinely knowledge-dependent is worse than leaving
+it unmarked — it trains spurious triggering, the failure the base already exhibits. The
+faithfulness screen (recalibrated for subject match, not completeness) applies here too, and
+the bar for marking should be higher than for the recorded retrieval clips.
 
 ## 6. New work required
 
