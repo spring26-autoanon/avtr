@@ -237,11 +237,28 @@ def test_real_outputs_format_and_channels():
     )
     assert abs(parts - orig) <= 1
 
-    # left channel == Danielle source, right == Clay source (first 1 s, exact copy)
-    out, _ = sf.read(str(REAL_DST / "danielle_clays.wav"), start=0, stop=24000, always_2d=True)
+    # 2026-08-07: danielle_clays.wav was rebuilt from the raw Zoom originals
+    # (finetune/data/AudioOriginal), restoring Clay's uncompressed dynamics. It is no
+    # longer a sample-exact copy of the cleaned datastereo exports (uniform ~49 ms AAC
+    # decode offset), so channel identity is verified statistically at the best lag.
+    start_sample = 300 * 24000  # 5 min in, guarantees speech
+    stop_sample = start_sample + 60 * 24000  # 60 s window
+    out, _ = sf.read(str(REAL_DST / "danielle_clays.wav"), start=start_sample, stop=stop_sample, always_2d=True)
     dan, _ = sf.read(str(REAL_SRC / "audioDanielleDeLosa21556527425_24khz.wav"),
-                     start=0, stop=24000, always_2d=True)
+                     start=start_sample, stop=stop_sample, always_2d=True)
     clay, _ = sf.read(str(REAL_SRC / "audioClayS11556527425_24khz.wav"),
-                      start=0, stop=24000, always_2d=True)
-    assert np.array_equal(out[:, 0], dan[:, 0])
-    assert np.array_equal(out[:, 1], clay[:, 0])
+                      start=start_sample, stop=stop_sample, always_2d=True)
+
+    def best_corr(a, b):
+        a = a - a.mean()
+        b = b - b.mean()
+        xc = np.correlate(a[: 24000 * 5], b[: 24000 * 5], "full")
+        lag = int(xc.argmax() - (24000 * 5 - 1))
+        b = np.roll(b, lag)
+        n = min(len(a), len(b))
+        return float(np.corrcoef(a[:n], b[:n])[0, 1])
+
+    assert best_corr(out[:, 0], dan[:, 0]) > 0.85
+    assert best_corr(out[:, 1], clay[:, 0]) > 0.85
+    # and the channels must not be swapped:
+    assert best_corr(out[:, 0], dan[:, 0]) > best_corr(out[:, 0], clay[:, 0])
