@@ -35,16 +35,19 @@ full_finetuning: false
 lora: { enable: true, rank: 128, scaling: 2., ft_embed: false }
 first_codebook_weight_multiplier: 100.
 text_padding_weight: .5
-duration_sec: 100
-batch_size: 16
+# 200 s windows, batch 8: same tokens/step as the README's 16x100, but the adapter trains
+# positions to 200 s. Prior adapters (trained at 100 s) went unresponsive at ~99 s of live
+# session — the base model trained on 5-min sequences, so an adapter that never saw a
+# context past 100 s extrapolates off-distribution there. 2026-08-07.
+duration_sec: 200
+batch_size: 8
 max_steps: 2000
 gradient_checkpointing: true
 optim:
   lr: 2.0e-6          # README and the moshi-rag paper both use 2e-6; our runs used 4e-6
   weight_decay: 0.1
   pct_start: 0.05
-# eval_loss is NaN unless the eval set has >= batch_size windows. At batch 16 and
-# duration_sec 100 that needs >= ~27 min; the 10 min slice is 6 windows. Pick by ear.
+# do_eval is false; at batch 8 / duration 200 the 10-min eval slice is only 3 windows anyway.
 do_eval: false
 do_ckpt: true
 ckpt_freq: 200      # 2000 steps -> 10 checkpoints

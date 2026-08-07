@@ -38,9 +38,12 @@ def test_voice_track_uses_plain_moshika_and_stripped_config():
 
 
 def test_voice_track_matches_the_readme_recommendation():
+    """Batch 8 / duration 200 maintains the same tokens/step as README's 16 / 100 (the safe
+    deliverable), while extending the trained context horizon to 200 s. Prior adapters
+    (trained at 100 s) went unresponsive at ~99 s of live session."""
     c = cfg(VOICE)
     assert c["lora"]["rank"] == 128
-    assert c["batch_size"] == 16
+    assert c["batch_size"] == 8
     assert c["max_steps"] == 2000
     assert float(c["optim"]["lr"]) == 2e-6
 
@@ -128,3 +131,13 @@ def test_rag_tracks_exclude_the_michelle_session():
     (the persona recording). Michelle joins a Friday rerun only as a baselined change."""
     for p in (S4A, S4B):
         assert "prepared_michelle" not in cfg(p)["data"]["train_data"], p.name
+
+
+def test_voice_track_trains_200s_windows():
+    """Prior adapters went unresponsive at ~99 s of live session — exactly duration_sec.
+    The LoRA wraps all attention but only ever saw <=100 s contexts; the base model
+    trained on 5-min sequences. 200 s doubles the trained horizon (batch halved to keep
+    tokens/step at the smoke-tested level)."""
+    c = cfg(VOICE)
+    assert c["duration_sec"] == 200
+    assert c["batch_size"] == 8
