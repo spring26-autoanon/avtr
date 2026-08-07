@@ -242,13 +242,26 @@ run just trains on the wrong thing for five hours.
 # Track A — plain moshika. No env vars: token 4 is an ordinary token here.
 uv run torchrun --nproc-per-node 1 -m train example/moshika_voice_max.yaml
 
-# Track B run 4a — mask + upweight together.
-RAG_TOKEN_WEIGHT=25 MASK_UNLABELLED_RAG=1 \
+# Track B run 4a — all four switches. Every one defaults to OFF.
+RAG_TOKEN_WEIGHT=25 MASK_UNLABELLED_RAG=1 RAG_DELAY=1 RAG_REF_DROPOUT=0.2 \
   uv run torchrun --nproc-per-node 1 -m train example/moshika_rag_stage4a.yaml
 ```
 
-`MASK_UNLABELLED_RAG` defaults to off, so forgetting it silently reproduces Stage 3's
-behaviour. Confirm it is set before walking away from a 3-hour run.
+| env var | run 4a | what it does |
+|---|---|---|
+| `RAG_TOKEN_WEIGHT` | 25 | upweight the ⟨ret⟩ positives (Stage 3, unchanged) |
+| `MASK_UNLABELLED_RAG` | 1 | drop the ⟨ret⟩ logit from the loss on reference-free examples (§4.1b) |
+| `RAG_DELAY` | 1 | inject at `hit + d'` per Eq. 3 instead of at the hit (§4.1) |
+| `RAG_REF_DROPOUT` | 0.2 | skip injection for a turn; the marker itself stays trainable |
+
+⚠️ **All four default to off**, so a forgotten variable silently reproduces Stage 3 for three
+hours. Check the launch line before walking away. They are env vars rather than config keys
+because the configs are committed and these change per run — the same reason
+`RAG_TOKEN_WEIGHT` was one in Stage 3.
+
+Delay and dropout draw from a `random.Random(args.seed)` stream created in `_train`, separate
+from the global RNG, so toggling them does not shift data order or init and runs stay
+comparable.
 
 ### 3.3 Mine the natural dialogue — keep it, don't discard it
 
@@ -327,8 +340,19 @@ Requirements:
 - `d_lead` comes from the manifest, per retrieval turn.
 - Keep it deterministic under a seed for reproducibility.
 
-Tests to add alongside the existing 12: delay shifts the span; a long delay suppresses
-injection; dropout fires at the configured rate; sampling respects Eq. 3's two branches.
+**Status: DONE** (`f518674`, `eaa2200`). `sample_delay_sec(d_lead, rng)` implements Eq. 3;
+`build_reference_condition` gained `sample_delay`, `dropout`, `leads`, `default_lead`, `rng`.
+15 tests in `tests/test_reference_delay.py`, 171 in the suite.
+
+Two things to know:
+
+- **`d_lead` falls back to `DEFAULT_LEAD_SEC = 1.2`** — her measured median — for any turn the
+  manifest hasn't labelled. So the delay works *now*, before §4.2 lead labelling exists, and
+  sharpens once it does. At a 1.2 s lead the delay is U(0, 1.2), mean 0.6 s ≈ 7 frames.
+- **Dropout is per retrieval turn, not per example**, which gives more independent samples
+  from a small corpus. A dropped turn keeps its ⟨ret⟩ in the text stream, so the trigger is
+  still trained; only the conditioning is withheld. The paper's learnable `h_dropout` is the
+  part a LoRA cannot add — omission is the approximation, as noted above.
 
 ### 4.1b `finetune/loss.py` — mask the rag token on unlabelled windows
 
@@ -453,8 +477,9 @@ was the wrong one.
 ## 7. Execution order for tomorrow
 
 **Before the recording** (local, no GPU):
-1. Implement the loss mask (§4.1b), delay + dropout (§4.1), and lead labelling (§4.2),
-   with tests. **The loss mask is the highest-value change in this plan** — do it first.
+1. ~~Loss mask (§4.1b), delay + dropout (§4.1)~~ — **DONE**, `63caa2d` / `f518674` /
+   `eaa2200`, 171 tests pass. Lead labelling (§4.2) is still open but no longer blocking:
+   the delay falls back to the measured 1.2 s median.
 2. Build the audition harness (§4.4).
 3. Dialogue mining count (§3.3 step 1) — now *optional*, and only informs 4c. Skip it if
    time is short; masking is the primary fix for the same failure.
