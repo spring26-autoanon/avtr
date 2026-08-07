@@ -245,6 +245,19 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             batch = next(data_loader)
             codes = batch.codes
 
+            # Which examples in this microbatch carry a reference. Examples WITHOUT one are
+            # windows where we never verified whether retrieval was warranted, so their text
+            # loss must not push P(⟨ret⟩) down (see finetune/loss.py). Opt-in per run:
+            # MASK_UNLABELLED_RAG=1 alongside RAG_TOKEN_WEIGHT on the moshika-rag track only.
+            # Track A trains on plain moshika, where token 4 is an ordinary token.
+            rag_loss_mask = None
+            if os.environ.get("MASK_UNLABELLED_RAG", "0") == "1":
+                refs_for_mask = getattr(batch, "reference_tensors", None) or [None] * len(codes)
+                rag_loss_mask = torch.tensor(
+                    [not (r is not None and len(r)) for r in refs_for_mask],
+                    device=codes.device,
+                )
+
             condition_tensors = None
             if batch.condition_attributes is not None:
                 condition_tensors = model.condition_provider.prepare(
@@ -284,6 +297,7 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 },
                 rag_token_id=4,
                 rag_token_weight=float(os.environ.get("RAG_TOKEN_WEIGHT", "1.0")),
+                rag_loss_mask=rag_loss_mask,
             )
             audio_loss = compute_loss_with_mask(
                 output.logits,
