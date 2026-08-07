@@ -1,16 +1,20 @@
 # Recording session brief — Danielle
 
-**This is the final recording before we submit.** Roughly 40 minutes of talking, in three
-parts. Everything here comes from measuring your last two recordings, so none of it is
-guesswork.
+**This is the final recording before we submit.** Roughly 50 minutes of talking, in seven
+short parts. Everything here comes from measuring your last two recordings — we counted what
+is and isn't already in the audio — so none of it is guesswork.
+
+**If you run short on time,** do Parts 1, 2, 4 and 5. Those four cover things the model has
+literally no examples of.
 
 ---
 
 ## The one-line version
 
-Talk exactly the way you already do — warm, natural, brisk. Three things to add:
-**say who you are out loud**, **say "I don't know" sometimes**, and **let the two of you talk
-over each other**. Plus one habit to lean into: when you're answering a factual question,
+Talk exactly the way you already do — warm, natural, brisk. Four things to add:
+**say who you are out loud**, **say "I don't know" sometimes**, **let the two of you talk
+over each other**, and **drift between chatting and answering questions** instead of keeping
+them separate. Plus one habit to lean into: when you're answering a factual question,
 **start general and get specific**.
 
 ---
@@ -22,9 +26,10 @@ three are about material that simply isn't in the recordings yet.
 
 1. **It doesn't know who you are.** Asked "tell me about yourself," it says *"I'm just an AI
    chatbot, I don't have personal details."* In 85 minutes of Q&A, Joshua never asks who you
-   are and you never say. (Your older conversations with Clay and Joshua *do* have you
-   talking about music, work, Tampa, your cat — so a lot of your personality is already in
-   there. What's missing is the explicit stuff: your name, where you're from, what you do.)
+   are and you never say. (Your older conversations with Clay and Joshua *do* cover
+   some of this — we counted 29 mentions of Tampa and Brooklyn, 29 of music, 14 of travel.
+   What's missing is saying it *about yourself*, plus your name, which appears **zero** times
+   in 135 minutes.)
 2. **It has never heard you say "I don't know."** So when it doesn't know something, it
    invents. Last night it claimed the first World Cup was in France, with six teams
    including Ecuador and Peru.
@@ -79,10 +84,11 @@ sentence, like the "Oh, the very first one — that's going way back, one of the
 tournaments down in South America" above. That's ten to twelve words.
 
 Three seconds isn't arbitrary. We can only train the model on delays as long as the runway
-you give it, and the lookup takes 1.7–3.4 seconds. At your current pace — a 0.4 to 1.2 second
-gap — **none** of the training examples represent how long the lookup really takes, which is
-why it answers before the document arrives. At three seconds, about a third do; at four,
-roughly two thirds. This one habit is the highest-value thing in the session.
+you give it, and the lookup takes 1.7–3.4 seconds. At your current 0.4–0.7 second gap,
+**none** of the training examples represent how long the lookup really takes — which is
+exactly why it answers before the document arrives. At three seconds about a third of them
+do; at four, roughly two thirds. **This one habit is the highest-value thing in the
+session.**
 
 Don't force it if it feels wrong on a given answer. Sounding like yourself matters more than
 hitting a target on every turn.
@@ -93,23 +99,33 @@ hitting a target on every turn.
 
 Joshua asks about you; you answer as yourself.
 
-**Priority order.** The first three are the real gap — the rest is already partly covered by
-your older recordings, so spend the time at the top of the list.
+**Priority order — this changed after we counted what's actually in your old recordings.**
+Three topics we'd assumed were covered turn out to be completely absent, and one we'd ranked
+near the top is already the best-covered thing you have.
 
-| Priority | Topic | What to cover |
-|---|---|---|
-| **1** | **Your name** | "What's your name?" · "Who am I talking to?" · "Do you have a name?" · "Introduce yourself" |
-| **2** | **Where you're from** | Brooklyn originally; Tampa now |
-| **3** | **Work** | Director of Digital Platforms, legal industry. Data strategy, single source of truth, reporting, AI adoption |
-| 4 | Travel | Mostly Europe. Ireland is the favourite — Dublin, Cliffs of Moher, Giant's Causeway. Dream trip: puffin migration in Iceland |
-| 5 | Tattoos | 20+, including a full sleeve. Travel sleeve — one from every new country. American and Japanese traditional |
-| 6 | Plants | 60+. First was a six-inch Ikea monstera, now six feet after eight years. Favourite: finger leaf philodendron |
-| 7 | Fighting | Tae kwon do, wrestling, krav maga, bare-knuckle. Started in middle school, competed for years |
-| 8 | Music | Metal, hardcore, punk. Hellfest this year. Minor Threat, Hatebreed, Emmure, H2O, Deftones. Bucket list: System of a Down |
+| Priority | Topic | In the old audio | What to cover |
+|---|---|---|---|
+| **1** | **Your name** | **0 mentions** | "What's your name?" · "Who am I talking to?" · "Do you have a name?" · "Introduce yourself" |
+| **2** | **Fighting** | **0** | Tae kwon do, wrestling, krav maga, bare-knuckle. Started in middle school, competed for years |
+| **3** | **Plants** | **0** | 60+. First was a six-inch Ikea monstera, now six feet after eight years. Favourite: finger leaf philodendron |
+| **4** | **Tattoos** | **1** | 20+, including a full sleeve. Travel sleeve — one from every new country. American and Japanese traditional |
+| **5** | **Work** | 7, thin | Director of Digital Platforms, legal industry. Data strategy, single source of truth, reporting, AI adoption |
+| 6 | Where you're from | 29 | Brooklyn originally; Tampa now |
+| 7 | Travel | 14 | Mostly Europe. Ireland is the favourite — Dublin, Cliffs of Moher, Giant's Causeway. Dream trip: puffin migration in Iceland |
+| 8 | Music | 29 | Metal, hardcore, punk. Hellfest this year. Minor Threat, Hatebreed, Emmure, H2O, Deftones. Bucket list: System of a Down |
 
-**Cover the top three 8–10 different ways each.** Repetition across varied phrasings is what
-makes it stick — many short exchanges beat one long monologue. Have Joshua circle back later
-in different words. The bottom four or five can be 3–4 exchanges each.
+**Your name first, 8–10 different ways.** It is the single biggest hole — 135 minutes of you
+talking and it never comes up once.
+
+**Then 2–5, about 6 exchanges each.** Fighting, plants and tattoos have no coverage at all, so
+the model has never heard you use the words. These need real content, not one-liners.
+
+**6–8 only need 2–3 exchanges each.** The *content* is already in the old recordings — what's
+missing is you saying it about yourself, so a short direct answer is enough: "I'm originally
+from Brooklyn, been in Tampa a few years now." You don't need to re-tell the stories.
+
+Repetition across varied phrasings is what makes it stick — many short exchanges beat one long
+monologue. Have Joshua circle back later in different words.
 
 ### How to say it
 
@@ -177,6 +193,74 @@ so overlapping speech records cleanly on each track.
 
 ---
 
+## Part 4 — How a conversation starts (~2 minutes) ⭐
+
+Every clip we have is cut from the *middle* of a long session, so the model has **no examples
+at all** of a conversation beginning. That's the first thing anyone hears when they try it.
+
+**8–10 short takes.** Joshua opens cold, you answer, hand it back:
+
+> **J:** "Hey Danielle." → **D:** "Hey! What's up?"
+> **J:** "Hi, how's it going?" → **D:** "Good, good — bit of a long day. How are you?"
+> **J:** "Hey, you there?" → **D:** "Yeah, I'm here. What's going on?"
+
+Vary it every time — different greeting, different energy, sometimes a question back,
+sometimes not. Don't settle into one stock hello.
+
+---
+
+## Part 5 — Drifting between chatting and questions (~5 minutes) ⭐
+
+**This is the most important new thing, and it's the one we have nothing for.**
+
+Right now the model has learned two separate modes that never meet: your old recordings are
+pure casual chat, and last session was 85 minutes of Joshua straight-up quizzing you. So it
+has never heard a factual question arrive *in the middle of a normal conversation* — which is
+exactly what happens when someone actually uses it.
+
+**6–8 exchanges that wander in and out.** Start casual, let a real question surface naturally,
+answer it, then drift back to chatting:
+
+> **J:** "…anyway, I finally booked Iceland."
+> **D:** "No way, when? I'm so jealous."
+> **J:** "March. Actually — how long is the flight from Tampa?"
+> **D:** "Ooh, that's a long one, you're definitely connecting somewhere. I think it's around
+> ten hours all in."
+> **J:** "Brutal. Okay so what do I even pack for March—"
+> **D:** "Layers. So many layers…"
+
+The key is that the question **isn't announced**. No "okay, quiz time." It just comes up, gets
+answered, and the conversation carries on. Remember the three-second runway on the answer.
+
+---
+
+## Part 6 — Being interrupted mid-fact (~3 minutes)
+
+Part 3 covers interrupting during normal chat. This is the harder one: Joshua cuts in while
+you're **in the middle of answering a factual question**, and you have to take it and pick
+back up without restarting the whole answer.
+
+> **D:** "Yeah, so the Cliffs of Moher are on the west coast, they run for about—"
+> **J:** "Wait, is that near Galway?"
+> **D:** "Yeah, just south of it. Anyway, about fourteen kilometres along the coast."
+
+4–5 of these. It's the thing most likely to happen in a live demo and we have zero examples.
+
+---
+
+## Part 7 — Follow-up questions on the same thing (~3 minutes)
+
+Every factual exchange we've recorded is one question, one answer, done. Nobody ever asks a
+second question about the same topic.
+
+> **J:** "Who won the first World Cup?" → **D:** [answers]
+> **J:** "And who came second?" → **D:** "That was Argentina — they lost the final four-two."
+> **J:** "Wait, what year again?" → **D:** "1930."
+
+5–6 of these. Short follow-ups are fine — the point is the second and third turn, not depth.
+
+---
+
 ## Setup — must match last time exactly
 
 - **Same microphones, same room, same distance from the mic.** Consistency across sessions is
@@ -198,9 +282,11 @@ so overlapping speech records cleanly on each track.
 - Keep your natural "Yeah…", "Actually…", "I think…"
 - Ask Joshua questions back
 - Let tangents happen
-- Interrupt and be interrupted (Part 3)
+- Interrupt and be interrupted (Parts 3 and 6)
 - Decline without guessing, then keep talking
 - Say "let me look that up" if it comes naturally
+- Let questions surface mid-chat instead of announcing them (Part 5)
+- Vary how you open — no two greetings the same (Part 4)
 
 **Don't**
 - Say "as an AI", "chatbot", or "assistant"
@@ -214,12 +300,20 @@ so overlapping speech records cleanly on each track.
 
 ## Time budget
 
-| Part | Length | Exchanges |
-|---|---|---|
-| 1 — Who you are | ~20 min | ~45, weighted to name / hometown / job |
-| 2 — Declines | ~10 min | 15–20 |
-| 3 — Interruption | ~5–10 min | free-form |
-| **Total** | **~35–40 min** | |
+| Part | Length | Exchanges | Priority |
+|---|---|---|---|
+| 1 — Who you are | ~20 min | ~45, weighted to **name**, then fighting / plants / tattoos | **must** |
+| 2 — Declines | ~10 min | 15–20 | **must** |
+| 3 — Interruption (casual) | ~5 min | free-form | if time |
+| 4 — Conversation openings | ~2 min | 8–10 | **must** |
+| 5 — Drifting between modes | ~5 min | 6–8 | **must** |
+| 6 — Interrupted mid-fact | ~3 min | 4–5 | if time |
+| 7 — Follow-up questions | ~3 min | 5–6 | if time |
+| **Total** | **~48 min** | | |
+
+**If you're running out of steam, cut 3, 6 and 7** — in that order — and protect 1, 2, 4 and
+5. Parts 4 and 5 are only seven minutes together and they cover things the model has zero
+examples of, so they're worth more per minute than anything else here.
 
 Breaks are fine — we cut it into short clips anyway. If a take goes wrong, pause and restart
 that exchange; we'll drop the false start.
