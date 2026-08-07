@@ -125,6 +125,14 @@ Track B satisfactory → done training; otherwise Friday-night contingency chose
 - triggering still weak → 4c data-ratio (spec §2 preference order)
 - noise-distraction dominant → F3 augmentation run
 
+**Friday-optional (local, no GPU): lead labelling (spec §4.2) on the existing retrieval
+manifests** — Gemini marks where each turn's lead ends → real per-turn `d_lead` replaces the
+1.2 s fallback, sharpening Eq. 3 for any Friday/Saturday-night rerun. The existing corpora
+need no other reprocessing: the loss mask, delay, and dropout are training-time behaviours
+and apply to the old 119 markers and 135-min dialogue as-is. Runway cannot be manufactured
+in old audio (spliced silence would teach the freeze-stall); longer leads come only from
+tonight's raw recording.
+
 ### Saturday — lock and rehearse
 
 Audition any overnight run by noon → **lock both checkpoints**. Afternoon: serving
@@ -152,6 +160,10 @@ standby.
 - **Direct demo artifact:** per-checkpoint `known_good.md` — questions that fired and
   grounded in ≥ 2 of 3 sessions (demo script), persona questions answered in character,
   known-bad list the demo must avoid.
+- **Scaling A/B:** the harness supports scoring the locked checkpoint at
+  `MOSHI_LORA_SCALING=2.0` vs `1.5` (serve-time, zero retraining). Default stays 2.0 —
+  Stage 3 showed 1.5 trades filler/prosody/grounding for triggering, the wrong direction
+  under decision 1 — but if 4a's triggering underperforms, the comparison costs minutes.
 - Implementation: `scripts/audition_checkpoint.py` parses serve.log and emits the scorecard;
   a checklist doc drives the live sessions. The user runs sessions; the script turns each into
   numbers in minutes.
