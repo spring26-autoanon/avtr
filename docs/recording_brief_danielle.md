@@ -74,6 +74,16 @@ more of that**, especially before names, numbers, dates and places.
 
 > Big picture first. **Then** the name, number, or date.
 
+**Aim for about three seconds** of general talk before the specific fact — roughly one full
+sentence, like the "Oh, the very first one — that's going way back, one of the early
+tournaments down in South America" above. That's ten to twelve words.
+
+Three seconds isn't arbitrary. We can only train the model on delays as long as the runway
+you give it, and the lookup takes 1.7–3.4 seconds. At your current pace — a 0.4 to 1.2 second
+gap — **none** of the training examples represent how long the lookup really takes, which is
+why it answers before the document arrives. At three seconds, about a third do; at four,
+roughly two thirds. This one habit is the highest-value thing in the session.
+
 Don't force it if it feels wrong on a given answer. Sounding like yourself matters more than
 hitting a target on every turn.
 

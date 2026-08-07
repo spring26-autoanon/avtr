@@ -340,6 +340,24 @@ Requirements:
 - `d_lead` comes from the manifest, per retrieval turn.
 - Keep it deterministic under a seed for reproducibility.
 
+**⚠️ Measured limitation — the delay barely engages on the current corpus.** Eq. 3 bounds
+`d'` by `d_lead`, and her measured leads are 0.43-1.2 s, so the sampled delay is 0.2-0.6 s
+against a real serve latency of 1.7-3.4 s. Simulated over the 119 real markers:
+
+| d_lead | mean d' | % of draws >= 1.7 s |
+|---|---|---|
+| 0.43 s (her Q&A median) | 0.21 s | **0%** |
+| 1.20 s (her overall median, our default) | 0.60 s | **0%** |
+| 3.0 s | 1.50 s | 32% |
+| 4.0 s | 2.00 s | 63% |
+
+So the delay fix and the recording brief are **the same fix from two directions**: the code
+can only train delays as long as the runway in the audio. The brief now asks for ~3 s of
+general talk before the specific fact, with this reasoning attached. Until longer leads
+exist, expect 4a's delay contribution to be small — do not read a null result as the delay
+being wrong. The answer windows are not the constraint: median 18.7 s after each marker
+(p10 6.3 s), so nothing is being suppressed for lack of room.
+
 **Status: DONE** (`f518674`, `eaa2200`). `sample_delay_sec(d_lead, rng)` implements Eq. 3;
 `build_reference_condition` gained `sample_delay`, `dropout`, `leads`, `default_lead`, `rng`.
 15 tests in `tests/test_reference_delay.py`, 171 in the suite.
