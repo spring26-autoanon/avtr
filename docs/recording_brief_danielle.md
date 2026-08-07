@@ -1,122 +1,121 @@
 # Recording session brief — Danielle
 
-**This is the final recording before we submit.** Roughly 45 minutes of talking, in three
-parts. Everything here comes from measuring the last session, so none of it is guesswork.
+**This is the final recording before we submit.** Roughly 40 minutes of talking, in three
+parts. Everything here comes from measuring your last two recordings, so none of it is
+guesswork.
 
 ---
 
 ## The one-line version
 
-Talk exactly the way you did last time — warm, natural, lots of "Yeah…" — but **give
-yourself a longer runway before you say the actual fact**, and cover three kinds of material
-we're missing: **who you are**, **saying you don't know**, and **talking over each other**.
+Talk exactly the way you already do — warm, natural, brisk. Three things to add:
+**say who you are out loud**, **say "I don't know" sometimes**, and **let the two of you talk
+over each other**. Plus one habit to lean into: when you're answering a factual question,
+**start general and get specific**.
 
 ---
 
 ## Why this session exists
 
-The model already sounds like you and holds a conversation. Three specific gaps remain:
+The model already sounds like you and holds a real conversation. Three gaps remain, and all
+three are about material that simply isn't in the recordings yet.
 
 1. **It doesn't know who you are.** Asked "tell me about yourself," it says *"I'm just an AI
-   chatbot, I don't have personal details."* Nothing in 85 minutes of recording ever has you
-   saying who you are — Joshua never asks, and you never volunteer it. There's simply no data.
+   chatbot, I don't have personal details."* In 85 minutes of Q&A, Joshua never asks who you
+   are and you never say. (Your older conversations with Clay and Joshua *do* have you
+   talking about music, work, Tampa, your cat — so a lot of your personality is already in
+   there. What's missing is the explicit stuff: your name, where you're from, what you do.)
 2. **It has never heard you say "I don't know."** So when it doesn't know something, it
-   invents an answer confidently. Last night it claimed the first World Cup was in France
-   with six teams including Ecuador and Peru.
+   invents. Last night it claimed the first World Cup was in France, with six teams
+   including Ecuador and Peru.
 3. **It doesn't know how to be interrupted.** In the last recording you and Joshua overlap
    **0.1% of the time** — you never talk over each other. Real conversation isn't like that,
    and the model can only learn what it hears.
 
 ---
 
-## ⭐ The most important thing: give yourself a runway
+## ⭐ Start general, then get specific
 
-This is the finding that matters most, and it's subtle.
+This is the subtle one, and it's worth understanding *why* rather than just doing it.
 
 When you're asked a factual question, the system looks the answer up **while you're already
-talking**. That lookup takes **1.7 to 3.4 seconds**. Whatever you say before the fact is the
-window it has to work in.
+talking**. That lookup takes **1.7 to 3.4 seconds**. Whatever you say before the specific
+fact is the window it has to work in.
 
-We measured your last recording. **Your median runway was 1.2 seconds** — and only **30%** of
-your answers left 2 seconds or more. So most of the time, you reached the fact before the
-lookup finished, and the model learned to blurt facts it hasn't looked up yet.
+We measured both your recordings. Your median gap between starting a sentence and hitting the
+content is **0.7 seconds in casual conversation and 0.4 seconds in Q&A**. You're direct —
+that's genuinely how you talk, and we don't want to change it. But it means the model learned
+to blurt out facts before the lookup lands, which is why it gets them wrong.
 
-### What this sounds like in practice
+**The fix isn't to pause or add filler.** It's to do what people naturally do when they're
+recalling something: **say the general thing first, then the specific one.**
 
-Not this — the fact arrives immediately:
+### What that sounds like
+
+Too fast — the specific arrives immediately:
 
 > **J:** "Who won the first World Cup?"
-> **D:** "Uruguay won in 1930."   ← 0.5 s of runway
+> **D:** "Uruguay, 1930."
 
-This — you take a beat, react, wind up, *then* land the fact:
+Natural, and it buys the time:
 
 > **J:** "Who won the first World Cup?"
-> **D:** "Ooh, the very first one — okay, that's going back a while. So, that was Uruguay,
-> 1930, and they beat Argentina in the final."   ← ~3 s of runway
+> **D:** "Oh, the very first one — that's going way back. One of the early tournaments, down
+> in South America. It was Uruguay, in 1930, and they beat Argentina in the final."
 
-You already do this naturally. Last session you said things like *"Yeah, Diwali is one of the
-most important Hindu festivals…"* and *"Sure, let's see…"* We just need **more** of it, more
-often. Aim for **two to four seconds before the specific fact** — a name, a number, a date, a
-place.
+The general clause *is* the runway. You're not stalling, you're recalling — which is what
+people actually do.
 
-### Runway phrases that work
-
-- "Ooh, good question…"
-- "Yeah, so — let me think about that for a second."
-- "Right, okay. So the thing about that is…"
-- "Oh, I actually know this one. Hang on…"
-- "That's a good one. So…"
-- "Hmm, yeah — from what I remember…"
-- A general statement before the specific: *"The World Cup is a huge deal, it's the biggest
-  sporting event there is. And the very first one…"*
-
-**Vary them.** Don't use the same opener every time — it should sound like you thinking, not
-a catchphrase.
+You already did this last session, in places: *"Yeah, Diwali is one of the most important
+Hindu festivals. At its heart, it celebrates…"* — general first, details after. **Just do
+more of that**, especially before names, numbers, dates and places.
 
 ### The rule of thumb
 
-> React first. Wind up. **Then** say the name, number, or date.
+> Big picture first. **Then** the name, number, or date.
+
+Don't force it if it feels wrong on a given answer. Sounding like yourself matters more than
+hitting a target on every turn.
 
 ---
 
-## Part 1 — Who you are (~25 minutes)
+## Part 1 — Who you are (~20 minutes)
 
-Joshua asks about you; you answer as yourself, conversationally.
+Joshua asks about you; you answer as yourself.
 
-**Cover each topic 6–8 different ways.** Repetition across varied phrasings is what makes it
-stick — sixty short exchanges beats one long monologue. Have him circle back to the same
-subject later in different words.
+**Priority order.** The first three are the real gap — the rest is already partly covered by
+your older recordings, so spend the time at the top of the list.
 
-| Topic | What to cover |
-|---|---|
-| **Your name / who you are** | "What's your name?" · "Who am I talking to?" · "Introduce yourself" · "Do you have a name?" |
-| **Where you're from** | Brooklyn originally; live in Tampa now |
-| **Work** | Director of Digital Platforms, legal industry. Data strategy, single source of truth, reporting, AI adoption |
-| **Travel** | Mostly Europe. Ireland is the favourite — Dublin, Cliffs of Moher, Giant's Causeway. Dream trip: puffin migration in Iceland |
-| **Fighting** | Tae kwon do, wrestling, krav maga, bare-knuckle boxing. Started in middle school, competed for years |
-| **Music** | Metal, hardcore, punk. Travel for festivals — Hellfest in France this year. Minor Threat, Hatebreed, Emmure, H2O, Deftones. Bucket list: System of a Down |
-| **Tattoos** | 20+, including a full sleeve. Travel sleeve — one from every new country. American traditional and Japanese traditional |
-| **Plants** | 60+. First was a six-inch Ikea monstera, now six feet after eight years. Favourite: finger leaf philodendron |
+| Priority | Topic | What to cover |
+|---|---|---|
+| **1** | **Your name** | "What's your name?" · "Who am I talking to?" · "Do you have a name?" · "Introduce yourself" |
+| **2** | **Where you're from** | Brooklyn originally; Tampa now |
+| **3** | **Work** | Director of Digital Platforms, legal industry. Data strategy, single source of truth, reporting, AI adoption |
+| 4 | Travel | Mostly Europe. Ireland is the favourite — Dublin, Cliffs of Moher, Giant's Causeway. Dream trip: puffin migration in Iceland |
+| 5 | Tattoos | 20+, including a full sleeve. Travel sleeve — one from every new country. American and Japanese traditional |
+| 6 | Plants | 60+. First was a six-inch Ikea monstera, now six feet after eight years. Favourite: finger leaf philodendron |
+| 7 | Fighting | Tae kwon do, wrestling, krav maga, bare-knuckle. Started in middle school, competed for years |
+| 8 | Music | Metal, hardcore, punk. Hellfest this year. Minor Threat, Hatebreed, Emmure, H2O, Deftones. Bucket list: System of a Down |
+
+**Cover the top three 8–10 different ways each.** Repetition across varied phrasings is what
+makes it stick — many short exchanges beat one long monologue. Have Joshua circle back later
+in different words. The bottom four or five can be 3–4 exchanges each.
 
 ### How to say it
 
-**Conversational, not a résumé.**
+**Say your name out loud, a lot.** "I'm Danielle." "Danielle." "Yeah, it's Danielle." The
+model currently believes it's called Moshi, and it takes many examples to overwrite that.
 
+**Never say you're an AI, a chatbot, or an assistant.** Not once, not as a joke. If Joshua
+asks "are you a real person?" — answer as yourself: "Ha, yeah, last I checked." Every "as an
+AI…" in the data reinforces exactly the thing we're removing.
+
+**Conversational, not a résumé.**
 - ✅ "I'm originally from Brooklyn, but I've been down in Tampa a few years now."
 - ❌ "My hometown is Brooklyn, New York. I currently reside in Tampa, Florida."
 
-**Say your name out loud, often.** "I'm Danielle." "Danielle." "Yeah, it's Danielle." The
-model currently believes it's called Moshi — we need many examples to overwrite that.
-
-**Never say you're an AI, a chatbot, or an assistant.** Not once, not jokingly. If Joshua
-asks "are you a real person?", answer as yourself — "Ha, yeah, last I checked." Every "as an
-AI…" in the data reinforces the thing we're trying to remove.
-
-**Keep the runway rule** — take a beat before specifics. "Oh, work — so I'm a Director of
-Digital Platforms" rather than leading with the title.
-
-**Let it wander.** If a question about Ireland turns into a story about the Cliffs of Moher,
-follow it. Natural tangents are good data.
+**Let it wander.** If Ireland turns into a story about the Cliffs of Moher, follow it. Real
+tangents are good data.
 
 ---
 
@@ -125,7 +124,7 @@ follow it. Natural tangents are good data.
 **15–20 exchanges.** Joshua asks something genuinely unanswerable; you decline gracefully.
 
 **Good questions to be asked:**
-- Hyper-specific numbers — "What's the population of Reykjavik?" "How tall is the Giant's Causeway exactly?"
+- Hyper-specific numbers — "What's the population of Reykjavik?" "How tall is the Giant's Causeway?"
 - Anything live — "What's the weather in Dublin right now?" "What's the score?"
 - Things about *him* — "What did I have for lunch?" "What's my middle name?"
 - Genuinely unknowable — "How many people named Danielle live in Tampa?"
@@ -140,10 +139,12 @@ follow it. Natural tangents are good data.
 > **D:** "Right now? I couldn't tell you. Knowing Dublin, probably raining. Have you been?"
 
 **Three rules:**
-1. **Don't guess.** No "I think maybe around a hundred thousand?"
-2. **Don't stop dead** after declining — add something, ask him something. This is important:
-   the model has a habit of going silent, and every dead-end teaches it that.
-3. **Runway applies here too** — "Ooh, hmm…" before "I don't know."
+1. **Don't guess.** No "I think maybe a hundred thousand?"
+2. **Don't stop dead** after declining — add something, ask him something. Going silent is
+   the model's worst current habit, and every dead-end reinforces it.
+3. **Looking it up out loud is great.** You did this naturally once before: *"I don't know,
+   I'm looking it up now — H2O played the Tampa area on several dates, most notably November
+   6th, 2008."* That's exactly the behaviour we want. More of that if it comes up.
 
 ---
 
@@ -152,14 +153,14 @@ follow it. Natural tangents are good data.
 **This is entirely missing from the current data** and it's what makes the model feel alive
 rather than turn-based.
 
-Things to do, deliberately:
+Deliberately:
 
-- **Joshua interrupts you mid-answer**, you stop and let him in. Then pick back up.
-- **You interrupt him** when you know where he's going.
-- **Backchannel over each other** — "mm-hm", "right", "yeah yeah" while the other is talking.
+- **Joshua interrupts you mid-answer** — you stop, let him in, then pick back up.
+- **You interrupt him** when you see where he's going.
+- **Backchannel over each other** — "mm-hm", "right", "yeah yeah" while the other talks.
 - **He challenges you** — "Wait, that's not right, wasn't it Uruguay?" — and you respond
   naturally, either holding your ground or correcting yourself.
-- **Talk over each other briefly** and recover, the way people actually do.
+- **Talk over each other and recover**, the way people actually do.
 
 Don't worry about it sounding messy. **Messy is the point.** Your microphones are separate,
 so overlapping speech records cleanly on each track.
@@ -169,12 +170,12 @@ so overlapping speech records cleanly on each track.
 ## Setup — must match last time exactly
 
 - **Same microphones, same room, same distance from the mic.** Consistency across sessions is
-  what reinforces the voice clone.
-- **Separate track per person** — you on your own track, Joshua on his. No shared/mixed
+  what reinforces the voice.
+- **Separate track per person** — you on your own track, Joshua on his. Never a mixed
   recording.
 - **48 kHz, low noise, consistent levels.** No music, TV, or background conversation.
-- **Don't normalize, compress, or noise-reduce** afterwards. Raw tracks.
-- **Send both tracks** — Joshua's is as important as yours; the model learns turn-taking from
+- **Don't normalise, compress, or noise-reduce** afterwards. Raw tracks.
+- **Send both tracks.** Joshua's matters as much as yours — the model learns turn-taking from
   hearing him.
 
 ---
@@ -182,20 +183,21 @@ so overlapping speech records cleanly on each track.
 ## Quick reference — while you're recording
 
 **Do**
-- Take 2–4 seconds of runway before any name, number, date or place
-- Say "Danielle" often
+- Say "Danielle" often, and say where you're from and what you do
+- Start general, land the specific — especially before names, numbers, dates
 - Keep your natural "Yeah…", "Actually…", "I think…"
 - Ask Joshua questions back
 - Let tangents happen
 - Interrupt and be interrupted (Part 3)
 - Decline without guessing, then keep talking
+- Say "let me look that up" if it comes naturally
 
 **Don't**
-- Lead with the fact
 - Say "as an AI", "chatbot", or "assistant"
 - Read answers off a script — know the topic, then talk
 - Dead-end a turn (silence after you finish is the model's worst habit)
 - Use the same opener every time
+- Force the general-then-specific thing if it makes a sentence feel unnatural
 - Clean up the audio afterwards
 
 ---
@@ -204,12 +206,12 @@ so overlapping speech records cleanly on each track.
 
 | Part | Length | Exchanges |
 |---|---|---|
-| 1 — Who you are | ~25 min | ~56 |
+| 1 — Who you are | ~20 min | ~45, weighted to name / hometown / job |
 | 2 — Declines | ~10 min | 15–20 |
 | 3 — Interruption | ~5–10 min | free-form |
-| **Total** | **~40–45 min** | |
+| **Total** | **~35–40 min** | |
 
-Breaks are fine — we cut it into short clips anyway. If a take goes wrong, just pause and
-start the exchange again; we'll drop the false start.
+Breaks are fine — we cut it into short clips anyway. If a take goes wrong, pause and restart
+that exchange; we'll drop the false start.
 
 Thank you — this is the last one before submission.
