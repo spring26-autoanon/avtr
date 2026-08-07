@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 import pprint
+import random
 import shutil
 from contextlib import ExitStack
 from pathlib import Path
@@ -64,6 +65,9 @@ def train(config: str):
 def _train(args: TrainArgs, exit_stack: ExitStack):
     # 1. Initial setup and checks
     set_random_seed(args.seed)
+    # Dedicated stream for reference delay/dropout so those draws don't shift the
+    # data-order or init RNG, keeping runs comparable across the env-var switches.
+    reference_rng = random.Random(args.seed)
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Init NCCL
@@ -276,8 +280,14 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                 if present:
                     first = present[0]
                     dim = (first[0] if isinstance(first, list) else first).shape[-1]
+                    # RAG_DELAY=1 places each reference at hit + d' (Eq. 3) instead of at
+                    # the hit, matching serve time where the document takes 1.7-3.4 s to
+                    # arrive. RAG_REF_DROPOUT is the paper's 0.2. Both off by default.
                     ref_cond, ref_mask = build_reference_condition(
-                        codes[:, 0, :], refs, dim, next(model.parameters()).dtype
+                        codes[:, 0, :], refs, dim, next(model.parameters()).dtype,
+                        sample_delay=os.environ.get("RAG_DELAY", "0") == "1",
+                        dropout=float(os.environ.get("RAG_REF_DROPOUT", "0.0")),
+                        rng=reference_rng,
                     )
                     if condition_tensors is None:
                         condition_tensors = {}
