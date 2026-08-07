@@ -99,9 +99,55 @@ Consolidated record of every training trial toward the goal: a LoRA that makes M
   demanded a grounded answer — confabulation taught directly. Now the i-th marker pairs with the
   i-th reference, each span clamped at the next marker
   (`finetune/data/reference_injection.py`, N-tensor `reference_io`).
-- **Results:** audition pending. Judge **switching**, not either mode: chit-chat → factual question
-  (trial 4's failure), retrieval → back to casual without staying formal, no ⟨ret⟩ in pure chit-chat,
-  voice throughout.
+- **Run 1 results (RAG_TOKEN_WEIGHT=15):** voice good, conversation coherent at ckpt 400 — but
+  **retrieval NEVER fired** at 400 or 600, on vague or direct factual phrasings, and severe
+  **empty-buffer stalls** (25 s of silence, sometimes failing to answer a greeting).
+  Ckpt 600 was incoherent (non-sequiturs). Two causes found:
+  - **The stall was our own data bug.** `trim_to_speaker_bounds` ended every clip on her final
+    word — 76/78 within 0.5 s, median 0.00 s — so half of each batch taught "after you speak,
+    everything stops". Fixed by carrying 3 s of the partner's next turn into each clip (0/78 now
+    end on her silence).
+  - **15 was too low a trigger weight.** Trial 4 needed 25; the turn-mix rule that produced 15 was
+    extrapolated from a single run.
+
+### 5b. Stage 3 run 2 — tail fix + RAG_TOKEN_WEIGHT=25 → **retrieval WORKS, firing is stochastic**
+Same data re-cut with 3 s tails (78 clips, 72.3 min + 16 declines), weight 25, 800 steps,
+loss 3.77 → 1.75. Auditioned ckpts 400 and 500 across five live sessions.
+
+**What works — first time in the project:**
+- **The full retrieval loop fires end to end**: ⟨ret⟩ → Gemini writes a passage → :8001 ARC
+  encoder → `streaming_sum` injected into the running LM, ~3 s round trip.
+- **Answers are grounded in the reference, paraphrased not recited.** Reference *"first FIFA World
+  Cup took place in nineteen thirty in Uruguay… defeating Argentina"* → she said *"The first World
+  Cup took place in Uruguay in nineteen thirty. Uruguay won, beating Argentina four to two."*
+  (the 4–2 is hers, and correct).
+- **Mode switching in one session, with no spurious triggers**: casual → retrieve → retrieve →
+  casual. ⟨ret⟩ correctly did NOT fire on "Do you like to play soccer?" or "Have you ever been to
+  Australia?".
+- **Generalises past the training corpus** — "capital of Australia" retrieved and answered
+  (Canberra) despite nothing like it in the data.
+- **The vague phrasing works.** "Tell me a little bit about the World Cup" is the exact open form
+  trial 4 confabulated on.
+- **Stalls hugely reduced**: best session max 2.1 s vs run 1's 25 s.
+
+**Honest limitations:**
+- **Firing is stochastic, not reliable.** Same checkpoint, same question, fires in one session and
+  not the next — roughly half the time across 5 sessions. When it does not fire she confabulates
+  confidently (claimed the first World Cup was in France with six teams including Ecuador and Peru).
+- **Stalls are intermittent**, 2 s to 18 s, not eliminated.
+- **No self-identity.** Says "I'm just a chatbot"; the base assistant persona survives. A persona
+  block was added to the reference prompt template (`serving/`), but it only surfaces when ⟨ret⟩
+  fires on a personal question, which is the least reliable case.
+- **400 vs 500 is not distinguishable** from these sessions — an apparent 500 regression turned out
+  to be session variance.
+
+**Next levers, in order:** more retrieval data (biggest — 75 min against 135 min of dialogue);
+weight above 25; real recorded declines to replace the 16 synthetic clips; and training data where
+she talks about herself, since retrieval alone has not displaced the "I'm a chatbot" identity.
+
+**Serving notes:** run the audition on the *idle* GPU — sharing with training pushed steps from
+80 ms to 110 ms, starving the audio buffer and producing crackle that mimics a model fault. Use
+local DSM STT (drop `--gradium-stt`); the hosted one drops the session after 35–75 s.
 
 ---
 
