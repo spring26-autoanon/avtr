@@ -82,7 +82,46 @@ Budget **5–7 hours** for 2000 steps. Start this one first.
 **Do not change more than one thing per run.** Stage 3's lesson: a checkpoint was called a
 regression from a single session and the call was wrong.
 
-### Run 4a — delay fix + reference dropout only
+### Run 4a — mask the negative + delay fix + reference dropout
+
+Three changes, but they address two *different* failures and neither substitutes for the
+other, so they ship together.
+
+**(i) Mask `⟨ret⟩` from the text loss on unlabelled windows — fixes TRIGGERING.**
+
+`loss.py` is plain cross-entropy over the text stream. On any window whose target never
+contains token 4, cross-entropy pushes **P(⟨ret⟩) down at every position**. We have 135
+markers against thousands of marker-free windows, so the dominant gradient is "never emit
+this token." `RAG_TOKEN_WEIGHT=25` upweights the 135 positives against that much larger
+force — which is exactly why it moved triggering from 0% to ~50% and stalled there.
+
+The fix follows from what we actually know:
+
+- **Labelled clip** — ground truth is known everywhere: fire at the marker, nowhere else.
+  Train normally, positives and negatives.
+- **Unlabelled window** — we never verified whether retrieval was warranted. Asserting
+  "don't retrieve here" is an unsupported claim. Say nothing instead.
+
+```
+if this example has no reference tensor:
+    logits[..., rag_token_id] = -inf      # before cross_entropy
+```
+
+Masking to `-inf` drops the token from the softmax denominator, so no gradient pushes it
+down. Per-example, keyed on `batch.reference_tensors[b] is None`, which train.py already has.
+
+**This largely subsumes the dialogue-mining work (§3.3).** If marker-free windows no longer
+suppress, marker density stops being the binding constraint — all 135 min of dialogue stays
+in for voice and persona at no cost to triggering, and mining becomes optional polish.
+
+⚠️ Masking also removes the only signal teaching the model *not* to over-trigger. Base
+moshika-rag already over-fires (it retrieved on "what's your favourite colour"). The real
+recorded declines are the counterweight; watch criterion 8 in the audition.
+
+**(ii) Delay + (iii) dropout — fix GROUNDING**, not triggering. Detailed in §4.1.
+
+Everything else held at Stage 3 values (rank 64, batch 8, 800 steps, lr 4e-6) so the run
+still isolates *these* changes from the hyperparameter question, which is 4b's job.
 
 **Config:** `example/moshika_rag_stage4a.yaml`. Every Stage 3 hyperparameter held (rank 64,
 batch 8, 800 steps, lr 4e-6) so the run isolates the injection change.
@@ -115,14 +154,15 @@ relax that before touching rank: try 4e-6 × 400, or 2e-6 × 800.
 
 ### Run 4c — data ratio
 
-Set by the dialogue-mining result (§3.3). Options in preference order:
+**Only run this if 4a's masking fails to restore triggering.** With the negative masked,
+marker density stops being the binding constraint, and every option below costs voice data
+to buy something masking already bought. Options in preference order:
 
-1. **Mined dialogue with markers** — keeps all 135 min of voice *and* fixes the marker
-   density. Best outcome if the count supports it.
+1. **Mined dialogue with markers** — keeps all 135 min of voice *and* raises marker density.
 2. **0.8 retrieval / 0.2 dialogue** — cuts the marker-free signal 60% without discarding the
    voice or the persona content in the dialogue.
 3. **Retrieval-only** — cleanest marker density, but discards Clay (the only second
-   conversation partner) and the persona-rich casual turns.
+   conversation partner) and the persona-rich casual turns. Highest cost to voice.
 
 ---
 
@@ -251,6 +291,20 @@ Requirements:
 Tests to add alongside the existing 12: delay shifts the span; a long delay suppresses
 injection; dropout fires at the configured rate; sampling respects Eq. 3's two branches.
 
+### 4.1b `finetune/loss.py` — mask the rag token on unlabelled windows
+
+Add a per-example boolean (`has_reference`) to `compute_loss_with_mask`. Where it is False,
+set the rag-token logit to `-inf` before `F.cross_entropy`, so the token is excluded from the
+softmax and receives no downward gradient.
+
+Interaction with `rag_token_weight`: the 25× upweight still applies on labelled examples. It
+may be able to come *down* once the negative pressure is gone — a cheap follow-up ablation,
+not a change to make in the same run.
+
+Tests: masked example contributes no gradient at the rag logit; unmasked example is
+unchanged; a labelled example still trains both the marker position and the non-marker
+positions; the mask is per-example, not per-batch.
+
 ### 4.2 `scripts/segment_retrieval_audio.py` — lead labelling
 
 Add `lead_end_word_index` per grounded/decline turn to the schema and to `normalize`.
@@ -360,9 +414,11 @@ was the wrong one.
 ## 7. Execution order for tomorrow
 
 **Before the recording** (local, no GPU):
-1. Dialogue mining count (§3.3 step 1) — decides run 4c's data.
+1. Implement the loss mask (§4.1b), delay + dropout (§4.1), and lead labelling (§4.2),
+   with tests. **The loss mask is the highest-value change in this plan** — do it first.
 2. Build the audition harness (§4.4).
-3. Implement delay + dropout (§4.1) and lead labelling (§4.2), with tests.
+3. Dialogue mining count (§3.3 step 1) — now *optional*, and only informs 4c. Skip it if
+   time is short; masking is the primary fix for the same failure.
 
 **Launch early, it is the long pole:**
 4. **Track A** on the marker-stripped clips + dialogue — 5–7 hours, and it is the safe
@@ -371,7 +427,7 @@ was the wrong one.
 **After the recording lands (evening):**
 5. Pair → upload → annotate both channels → segment → cut the persona/decline audio.
 6. Fold into the retrieval manifest; re-run `precompute_references` and the gate.
-7. **Run 4a** (~3 h) with the delay fix.
+7. **Run 4a** (~3 h) — loss mask + delay fix + dropout.
 8. Audition 4a with the harness. Only then decide on 4b and 4c.
 
 **Standing rules:** back up checkpoints to the Mac as they land; stop the box when idle; keep
