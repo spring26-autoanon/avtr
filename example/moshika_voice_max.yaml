@@ -23,10 +23,14 @@ data:
   eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
   shuffle: true
 moshi_paths:
-  # Plain moshika (female voice), NOT moshika-rag. Ships no config.json — do not set
-  # config_path; moshi's built-in default LM architecture is correct and the "loads default
-  # models" warning is expected.
+  # Plain moshika (female voice), NOT moshika-rag. It ships no config.json, and under the
+  # pinned fork (moshi 0.2.13) the built-in DEFAULT architecture includes the RAG ARC
+  # conditioner, which crashes on the meta device at load. Verified fix (wb-gpu-training,
+  # 2026-08-07 smoke: 1 step, loss 2.101, peak 35 GB): point config_path at the
+  # conditioner-stripped moshika-rag config — same 7B dims, no conditioners/fuser
+  # (scripts/strip_config.py output).
   hf_repo_id: "kyutai/moshika-pytorch-bf16"
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.stripped.json"
 full_finetuning: false
 lora: { enable: true, rank: 128, scaling: 2., ft_embed: false }
 first_codebook_weight_multiplier: 100.

@@ -27,11 +27,14 @@ def test_every_key_is_accepted_by_the_trainer():
         assert not set(cfg(p)) - fields, p.name
 
 
-def test_voice_track_uses_plain_moshika_and_no_config_path():
-    """Plain moshika ships no config.json; setting config_path loads the wrong architecture."""
+def test_voice_track_uses_plain_moshika_and_stripped_config():
+    """Under the pinned fork, the DEFAULT architecture (no config.json) includes the RAG
+    ARC conditioner, which crashes on the meta device at load — verified live on
+    wb-gpu-training 2026-08-07. Plain moshika therefore trains with the conditioner-
+    stripped moshika-rag config: identical 7B dims, no conditioners/fuser."""
     c = cfg(VOICE)
     assert c["moshi_paths"]["hf_repo_id"] == "kyutai/moshika-pytorch-bf16"
-    assert "config_path" not in c["moshi_paths"]
+    assert c["moshi_paths"]["config_path"].endswith("config.stripped.json")
 
 
 def test_voice_track_matches_the_readme_recommendation():
