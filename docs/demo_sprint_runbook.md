@@ -36,6 +36,7 @@ rm -rf runs/moshika_voice_max   # trainer refuses an existing run dir
 sed 's/max_steps:.*/max_steps: 1/; s/do_ckpt:.*/do_ckpt: false/' \
   example/moshika_voice_max.yaml > /tmp/smoke.yaml
 CUDA_VISIBLE_DEVICES=0 uv run torchrun --nproc-per-node 1 -m train /tmp/smoke.yaml
+rm -rf runs/moshika_voice_max   # smoke occupies the run dir; clear it so tonight's real launch starts clean
 
 ⚠️ If `uv sync` fails on setuptools or the box lacks uv, fall back to the ultra-box
 pattern: create `~/fork-venv` and `pip install -e .` — see `docs/stage3_a100_runbook.md`
