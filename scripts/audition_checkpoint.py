@@ -164,6 +164,10 @@ def main():
     ap.add_argument("--out-dir", required=True)
     a = ap.parse_args()
     sessions = [json.load(open(p)) for p in a.sessions]
+    idents = {(s.get("checkpoint"), s.get("scaling")) for s in sessions}
+    if len(idents) > 1:
+        raise SystemExit(f"sessions mix checkpoints/scalings {sorted(idents)} — "
+                         "one scorecard must come from ONE checkpoint at ONE scaling")
     card = score(sessions, parse_log(Path(a.log).read_text(errors="replace")))
     kg = known_good(sessions)
     out = Path(a.out_dir)

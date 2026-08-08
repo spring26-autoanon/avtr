@@ -42,3 +42,37 @@ rm -rf runs/moshika_voice_max   # smoke occupies the run dir; clear it so tonigh
 pattern: create `~/fork-venv` and `pip install -e .` — see `docs/stage3_a100_runbook.md`
 preamble for the interpreter-not-uv rule. Verified 2026-08-07: smoke passed, peak 35 GB
 at rank 128 / batch 16 — no batch halving needed.
+
+## 5. Session-liveness hardening (STT) — boot preflight + stall shrinking
+
+Two failure classes wear the "timeout" costume. Keep them separate:
+
+**HARD DROPS — Gradium hosted STT kills the session at 35–75 s.** Cured by local DSM STT
+(launch lines already omit `--gradium-stt`). Only remaining risk is reintroduction. Gate
+EVERY serve start (audition and demo):
+
+```bash
+# 1. no gradium/STT env may be set in the serving shell
+env | grep -i -E "gradium|STT_URL" && echo "!! STT ENV PRESENT — unset before serving" || echo "env clean"
+# 2. the serve command line must not contain --gradium-stt (read it before pressing enter)
+# 3. after boot, confirm the local STT loaded (no gradium URL in the log):
+grep -i -m2 -E "stt|asr" ~/serve.log
+```
+
+**STALLS — 2–18 s silences with the session alive**: the audible "timeout". Attack order:
+1. **Checkpoint choice** — the audition harness scores `longest_stall` first-class; stalls
+   outrank trigger rate in the verdict (decision of record).
+2. **stt-wait step-down on the LOCKED checkpoint**: `--stt-wait-time` 2.0 → 1.0 → 0.5.
+   The paper waits 0.5 s and shows an accuracy cliff at 1.5 s total retrieval delay; our
+   2.0 s wait alone can be most of the excess. Three sessions per setting; keep the lowest
+   whose grounded_rate matches 2.0's. Compare `round_trips` in the scorecards.
+3. **Clear speech at the mic** — trigger rate tracks user-speech WER (paper Fig. 6a):
+   directional/headset mic, quiet room, fully-phrased questions.
+
+**Live recovery drill (rehearse once):** if a session ever drops mid-demo — private browser
+window, reconnect, `grep -c "acquired slot" ~/serve.log` to confirm the slot is real, resume
+the script at the current segment. Target < 20 s of stage time.
+
+**Escalation (do NOT attempt on demo eve otherwise):** only if scorecards show retrieval
+failing on garbled context (`Generated reference` lines quoting mis-transcribed questions),
+consider an STT model swap — new moving part, measured risk only.

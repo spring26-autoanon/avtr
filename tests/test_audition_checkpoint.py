@@ -101,3 +101,20 @@ def test_round_trip_consumes_each_reference_once():
 2026-08-08 10:00:06,900 INFO Generated reference: only one
 """
     assert parse_log(log)["round_trips"] == [1.9]
+
+
+def test_cli_rejects_mixed_checkpoint_sessions(tmp_path):
+    """A mistyped --sessions glob must fail loudly, not silently blend two checkpoints
+    into one scorecard (the false 'checkpoint 500 regression' failure mode)."""
+    import json as _json, subprocess, sys
+    log = tmp_path / "serve.log"; log.write_text("")
+    p1, p2 = tmp_path / "a_s1.json", tmp_path / "b_s1.json"
+    p1.write_text(_json.dumps(_session(1)))
+    mixed = _session(2); mixed["checkpoint"] = "OTHER"
+    p2.write_text(_json.dumps(mixed))
+    r = subprocess.run([sys.executable, str(REPO / "scripts/audition_checkpoint.py"),
+                        "--log", str(log), "--sessions", str(p1), str(p2),
+                        "--out-dir", str(tmp_path / "out")],
+                       capture_output=True, text=True)
+    assert r.returncode != 0
+    assert "mix" in (r.stderr + r.stdout)
