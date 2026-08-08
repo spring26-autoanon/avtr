@@ -28,8 +28,13 @@ full_finetuning: false
 lora: { enable: true, rank: 32, scaling: 2., ft_embed: false }
 first_codebook_weight_multiplier: 100.
 text_padding_weight: .5
-duration_sec: 100
-batch_size: 16
+# 300 s windows at batch 8: matches the base model's own 5-minute training sequences, so the
+# adapter's trained horizon equals the base's — prior adapters trained at 100 s went
+# unresponsive at ~99 s of live session. 4b hedges that ceiling; 4a deliberately keeps
+# Stage 3's 100 s so it stays a single-variable test of the loss-mask/delay fixes.
+# Decision 2026-08-08 at launch.
+duration_sec: 300
+batch_size: 8
 max_steps: 400
 gradient_checkpointing: true
 optim: { lr: 2.0e-6, weight_decay: 0.1, pct_start: 0.05 }

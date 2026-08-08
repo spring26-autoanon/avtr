@@ -204,3 +204,12 @@ def test_no_config_references_the_silent_channel_monologues():
     for p in (VOICE, S4A, S4B):
         for src in cfg(p)["data"]["train_data"].split(","):
             assert "/prepared/" not in src, (p.name, src)
+
+
+def test_4b_trains_300s_windows_4a_stays_100():
+    """4b hedges the ~99 s session-death ceiling with 300 s windows (= the base model's own
+    5-min training sequences); 4a deliberately keeps Stage 3's 100 s so it stays a
+    single-variable test of the loss-mask/delay fixes."""
+    assert cfg(S4B)["duration_sec"] == 300
+    assert cfg(S4B)["batch_size"] == 8
+    assert cfg(S4A)["duration_sec"] == 100
