@@ -141,3 +141,66 @@ def test_voice_track_trains_200s_windows():
     c = cfg(VOICE)
     assert c["duration_sec"] == 200
     assert c["batch_size"] == 8
+
+
+def test_voice_track_includes_the_persona_recording_unmarked():
+    """Pass A is the whole recording as long-form dialogue — persona, openings, overlap."""
+    sources = cfg(VOICE)["data"]["train_data"]
+    assert "prepared_persona" in sources
+
+
+def test_voice_track_still_excludes_every_marked_directory():
+    """<RAG> is token 4, an ordinary word on plain moshika. Pass B must not appear here."""
+    sources = cfg(VOICE)["data"]["train_data"]
+    assert "replay/persona/" not in sources
+    assert "replay/retrieval/" not in sources
+
+
+def test_rag_tracks_get_both_passes():
+    """Pass A for voice (unmarked, masked by the loss), Pass B for the trigger."""
+    for p in (S4A, S4B):
+        sources = cfg(p)["data"]["train_data"]
+        assert "prepared_persona" in sources, p.name
+        assert "replay/persona/" in sources, p.name
+
+
+def test_rag_tracks_exclude_the_marker_stripped_copy():
+    """retrieval_nomarkers has no reference tensors — on the RAG track it is dead weight
+    that duplicates audio already present in replay/retrieval/."""
+    for p in (S4A, S4B):
+        assert "retrieval_nomarkers" not in cfg(p)["data"]["train_data"], p.name
+
+
+def test_rag_tracks_keep_explicit_sampling_weights():
+    """These configs sample by weight. An unweighted source silently changes the mix and
+    breaks 4a's single-variable property."""
+    for p in (S4A, S4B):
+        for src in cfg(p)["data"]["train_data"].split(","):
+            assert ":" in src.rsplit("/", 1)[-1], (p.name, src)
+
+
+def test_rag_sampling_weights_sum_to_one():
+    for p in (S4A, S4B):
+        w = [float(s.rsplit(":", 1)[1]) for s in cfg(p)["data"]["train_data"].split(",")]
+        assert abs(sum(w) - 1.0) < 1e-6, (p.name, w)
+
+
+def test_rag_tracks_hold_the_stage3_marked_unmarked_ratio():
+    """0.5 marked / 0.5 unmarked, as Stage 3 had. Changing the mix is run 4c, not 4a."""
+    for p in (S4A, S4B):
+        marked = unmarked = 0.0
+        for src in cfg(p)["data"]["train_data"].split(","):
+            path, weight = src.rsplit(":", 1)
+            if "retrieval_nomarkers" in path or "prepared_dialogue" in path \
+                    or "prepared_persona" in path or "prepared_michelle" in path:
+                unmarked += float(weight)
+            else:
+                marked += float(weight)
+        assert abs(marked - 0.5) < 1e-6 and abs(unmarked - 0.5) < 1e-6, (p.name, marked)
+
+
+def test_no_config_references_the_silent_channel_monologues():
+    """finetune/data/prepared/ is the Option-A corpus that caused the monologuing failure."""
+    for p in (VOICE, S4A, S4B):
+        for src in cfg(p)["data"]["train_data"].split(","):
+            assert "/prepared/" not in src, (p.name, src)

@@ -18,7 +18,7 @@
 # ⚠️ Total adaptation (roughly lr x steps) is ~1/4 of Stage 3. If the voice does not imprint,
 # that is the first thing to relax — try 4e-6 x 400 or 2e-6 x 800 before touching rank.
 data:
-  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.5,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.5"
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.35,/home/leenatantawy/moshi-finetune/replay/persona/train.jsonl:0.15,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.25"
   eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
   shuffle: true
 moshi_paths:

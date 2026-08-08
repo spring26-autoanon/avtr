@@ -19,7 +19,7 @@
 data:
   # dialogue + marker-STRIPPED retrieval clips + the new persona/decline session.
   # Update this line once the 2026-08-07 recording is cut.
-  train_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl,/home/leenatantawy/moshi-finetune/replay/retrieval_nomarkers/train.jsonl,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl"
+  train_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl,/home/leenatantawy/moshi-finetune/replay/retrieval_nomarkers/train.jsonl,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl"
   eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
   shuffle: true
 moshi_paths:

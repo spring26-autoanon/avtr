@@ -16,7 +16,7 @@
 # her turns leave >=2s. The delay fix cannot ground a turn whose lead is shorter than the
 # lookup. The 2026-08-07 recording targets 2-4s of runway to move that number.
 data:
-  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.5,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.5"
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.35,/home/leenatantawy/moshi-finetune/replay/persona/train.jsonl:0.15,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.25"
   eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
   shuffle: true
 moshi_paths:
