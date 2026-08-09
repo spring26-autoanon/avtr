@@ -7,6 +7,7 @@ REPO = Path(__file__).resolve().parents[1]
 VOICE = REPO / "example/moshika_voice_max.yaml"
 S4A = REPO / "example/moshika_rag_stage4a.yaml"
 S4B = REPO / "example/moshika_rag_stage4b.yaml"
+S4C = REPO / "example/moshika_rag_stage4c.yaml"
 
 
 def cfg(p):
@@ -213,3 +214,18 @@ def test_4b_trains_300s_windows_4a_stays_100():
     assert cfg(S4B)["duration_sec"] == 300
     assert cfg(S4B)["batch_size"] == 8
     assert cfg(S4A)["duration_sec"] == 100
+
+
+def test_4c_synthesis_recipe():
+    """Tonight's rerun: 4a's capacity+duration at 4b's lr+window, plus Michelle.
+    Evidence: 100 s adapters die at 1:39 live; 300 s survive; quarter-dose under-imprints."""
+    c = cfg(S4C)
+    assert c["duration_sec"] == 300
+    assert c["lora"]["rank"] == 64
+    assert c["max_steps"] == 800
+    assert c["optim"]["lr"] == 2.0e-6
+    assert "prepared_michelle" in c["data"]["train_data"]
+    w = [float(s.rsplit(":", 1)[1]) for s in c["data"]["train_data"].split(",")]
+    assert abs(sum(w) - 1.0) < 1e-6
+    assert "/prepared/" not in c["data"]["train_data"]
+    assert c["run_dir"].endswith("stage4c")
