@@ -229,3 +229,5 @@ def test_4c_synthesis_recipe():
     assert abs(sum(w) - 1.0) < 1e-6
     assert "/prepared/" not in c["data"]["train_data"]
     assert c["run_dir"].endswith("stage4c")
+    assert "replay/persona_rag/train.jsonl" in c["data"]["train_data"]
+    assert "replay/persona/train.jsonl" not in c["data"]["train_data"]
