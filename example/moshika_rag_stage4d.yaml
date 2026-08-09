@@ -33,4 +33,4 @@ num_ckpt_keep: 10
 save_adapters: true
 seed: 0
 log_freq: 1
-run_dir: "runs/moshika_rag_stage4d"
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_rag_stage4d"
