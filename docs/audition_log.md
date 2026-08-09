@@ -55,3 +55,5 @@ then rsync down. One line per session here, newest last.
 10. **Session variance is large** — single sessions are coin flips; judge on 2-3.
 11. **pkill -f "moshi.server" also kills server_conditioner** (the encoder assassin). Safe: pkill -f "moshi.server --hf".
 12. **Freeze recovery**: a fresh question un-freezes; filler-loop ("I think that's about it") = frozen state marker.
+
+**FINAL TRACK B LOCK (17:2x UTC): 4c-600 @ MOSHI_LORA_SCALING=1.5, rank 64.** 1.75 probe fired too late (scaling raises effective dose raises fire latency — consistent with the ladder). Voice wobble at 1.5 mitigated by reconnect pre-flight ritual. Demo run-sheet from confirmed fires: Florida-origin Q -> work Q -> houseplants + "I thought you had 60?" correction beat -> tattoos attempt -> one factual late, ask-and-move-on on any freeze.
