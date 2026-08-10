@@ -6,7 +6,7 @@
 #                    fires in 5 min at lower effective share, mask + weight 25 carrying it)
 # Launch with all four env flags, same as 4a/4b.
 data:
-  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.30,/home/leenatantawy/moshi-finetune/replay/persona_rag/train.jsonl:0.15,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl:0.15"
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.20,/home/leenatantawy/moshi-finetune/replay/persona_rag/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl:0.15"
   eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
   shuffle: true
 moshi_paths:
