@@ -28,7 +28,7 @@ gradient_checkpointing: true
 optim: { lr: 2.0e-6, weight_decay: 0.1, pct_start: 0.05 }
 do_eval: false
 do_ckpt: true
-ckpt_freq: 100       # 800 steps -> 8 checkpoints, same granularity as before
+ckpt_freq: 50       # 800 steps -> 8 checkpoints, same granularity as before
 num_ckpt_keep: 10
 save_adapters: true
 seed: 0
