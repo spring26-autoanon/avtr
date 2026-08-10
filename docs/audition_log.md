@@ -57,3 +57,20 @@ then rsync down. One line per session here, newest last.
 12. **Freeze recovery**: a fresh question un-freezes; filler-loop ("I think that's about it") = frozen state marker.
 
 **FINAL TRACK B LOCK (17:2x UTC): 4c-600 @ MOSHI_LORA_SCALING=1.5, rank 64.** 1.75 probe fired too late (scaling raises effective dose raises fire latency — consistent with the ladder). Voice wobble at 1.5 mitigated by reconnect pre-flight ritual. Demo run-sheet from confirmed fires: Florida-origin Q -> work Q -> houseplants + "I thought you had 60?" correction beat -> tattoos attempt -> one factual late, ask-and-move-on on any freeze.
+
+## Monday 2026-08-10 — 4c2/4d ladders (clean-reference run + rank-128 run), all @ stt-wait 0.5
+
+| # | Model · ckpt · scale | Fires | Voice | Identity (no fire) | Notes |
+|---|---|---|---|---|---|
+| 14 | 4d·250 @2.0 | — | "a lot like her" | — | can't converse (past cliff) |
+| 15 | 4d·300 @1.5 | good | thin | — | scaling kills voice faster than firing |
+| 16 | 4d·250 @1.75 | some | none | — | 4d verdict: voice needs 2.0, speech needs <250 — no overlap; run closed |
+| 17 | 4d·200 @2.0 | better | not hers enough | — | confirms above |
+| 18 | **4c2·400 @2.0** | **3/17 first-ask** (houseplants, tattoo-style, 1st WC) + clean Bitcoin decline | **hers + ums** | phantom "Ryan Hibbard" | zero stalls; re-ask rescue works; WC fire misdelivered (USA for Uruguay) |
+| 19 | 4c2·600 @2.0 ×2 | 0 | — | superposition ("Rian"; "Brooklyn or Florida depending") | the trough between peaks |
+| 20 | **4c2·700 @2.0** | ~1 (pushback-rescue works) | **best of sprint + laughs** | **CRYSTALLIZED: "You can call me Danielle"** | stall pockets (tattoos/music); "snake/viper" = plant-register fragments |
+| 21 | 4c2·800 @2.0 | 0 | ok | **decoherence: novel "Brooklyn bakery owner" persona from her fragments** | past-peak; talks fine (cliff never arrived) |
+
+## The 4c2 ladder finding (writeup material)
+
+Identity formation along LoRA dose is non-monotonic with a sharp peak: phantom name (400) -> two-identity superposition (600) -> crystallized Danielle (700) -> fragment recombination (800). Voice/register accumulates monotonically (ums at 400, laughs at 700). Fire rate is inversely coupled to imprint depth (3/17 at 400 -> 0 at 800): memorized answers outrace the <ret> marker in the softmax + trigger-head feature drift. Reference rewrite moved the speech cliff past 800 (old 4c walled at 600@2.0). DEMO CANDIDATES: 400@2.0 = retrieval act; 700@2.0 = voice/persona act. 4e (weight 50, persona 0.25, ckpt/50) overnight-tests whether doubled marker gradient keeps firing alive through the 700-style crystallization peak.
