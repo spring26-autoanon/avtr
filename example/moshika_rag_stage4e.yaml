@@ -1,0 +1,36 @@
+# Stage 4c — the synthesis rerun (Sat 2026-08-08 evening), recipe from live audition evidence:
+#   300 s windows  — 4a (100 s) died at exactly 1:39 live; 4b (300 s) survived 5+ min
+#   rank 64, 800 steps — restore the adaptation 4b's quarter dose lacked (voice + identity)
+#   lr 2e-6        — 4b's fluency vouches for it; also every documented source's number
+#   + Michelle     — 123 min more voice; marked share 0.45 (triggering proven robust: 14
+#                    fires in 5 min at lower effective share, mask + weight 25 carrying it)
+# Launch with all four env flags, same as 4a/4b.
+data:
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.20,/home/leenatantawy/moshi-finetune/replay/persona_rag_v2/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.20,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl:0.15"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-rag-pytorch-bf16"
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.spike.json"
+full_finetuning: false
+lora: { enable: true, rank: 64, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+# 300 s windows at batch 8: matches the base model's own 5-minute training sequences, so the
+# adapter's trained horizon equals the base's — prior adapters trained at 100 s went
+# unresponsive at ~99 s of live session. 4b hedges that ceiling; 4a deliberately keeps
+# Stage 3's 100 s so it stays a single-variable test of the loss-mask/delay fixes.
+# Decision 2026-08-08 at launch.
+duration_sec: 300
+batch_size: 8
+max_steps: 800
+gradient_checkpointing: true
+optim: { lr: 2.0e-6, weight_decay: 0.1, pct_start: 0.05 }
+do_eval: false
+do_ckpt: true
+ckpt_freq: 100       # 800 steps -> 8 checkpoints, same granularity as before
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_rag_stage4e"
