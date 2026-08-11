@@ -103,6 +103,23 @@ def test_round_trip_consumes_each_reference_once():
     assert parse_log(log)["round_trips"] == [1.9]
 
 
+def test_backstop_lines_counted():
+    log = (
+        "12:00:01.00 INFO    [slot 0] [RAG] model emitted RAG token, triggering reference generation\n"
+        "12:00:05.00 INFO    [slot 0] [Backstop] engaged\n"
+        "12:00:09.00 INFO    [slot 0] [Backstop] engaged\n"
+    )
+    result = parse_log(log)
+    assert result["backstops"] == 2
+    assert result["backstop_rate"] == 2 / 3
+
+
+def test_backstop_rate_none_when_no_events():
+    result = parse_log("12:00:01.00 INFO    nothing relevant\n")
+    assert result["backstops"] == 0
+    assert result["backstop_rate"] is None
+
+
 def test_cli_rejects_mixed_checkpoint_sessions(tmp_path):
     """A mistyped --sessions glob must fail loudly, not silently blend two checkpoints
     into one scorecard (the false 'checkpoint 500 regression' failure mode)."""

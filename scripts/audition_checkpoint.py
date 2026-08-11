@@ -18,6 +18,7 @@ from pathlib import Path
 TRIGGER_PAT = re.compile(r"model emitted")
 REFERENCE_PAT = re.compile(r"Generated reference")
 STALL_PAT = re.compile(r"LM buffer empty")
+BACKSTOP_PAT = re.compile(r"\[Backstop\] engaged")
 STEP_PAT = re.compile(r"batched step.*?([\d.]+)\s*ms")
 TS_PAT = re.compile(r"(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)")
 STALL_MERGE_GAP_SEC = 1.0  # stall lines closer than this are one stall event
@@ -50,7 +51,7 @@ def _ts(line):
 
 def parse_log(text):
     triggers, references, stalls, step_ms = [], [], [], []
-    n_trig = n_ref = n_stall = 0
+    n_trig = n_ref = n_stall = n_backstop = 0
     for line in text.splitlines():
         t = _ts(line)
         if TRIGGER_PAT.search(line):
@@ -62,9 +63,14 @@ def parse_log(text):
         if STALL_PAT.search(line):
             n_stall += 1
             stalls.append(t)
+        if BACKSTOP_PAT.search(line):
+            n_backstop += 1
         m = STEP_PAT.search(line)
         if m:
             step_ms.append(float(m.group(1)))
+
+    backstop_denom = n_trig + n_backstop
+    backstop_rate = n_backstop / backstop_denom if backstop_denom else None
 
     longest = None
     ts_stalls = [t for t in stalls if t]
@@ -89,7 +95,8 @@ def parse_log(text):
 
     return {"triggers": n_trig, "references": n_ref, "stall_lines": n_stall,
             "longest_stall_sec": longest, "round_trips": round_trips,
-            "step_ms": step_ms}
+            "step_ms": step_ms, "backstops": n_backstop,
+            "backstop_rate": backstop_rate}
 
 
 def score(sessions, log_metrics):
@@ -147,7 +154,8 @@ def _render(card, kg):
     lines = [f"# Scorecard — {card['checkpoint']} (scaling {card['scaling']})", ""]
     for k in ("trigger_rate", "grounded_rate", "spurious_fires", "persona_rate",
               "decline_rate", "voice_mean", "longest_stall_sec", "stall_lines",
-              "round_trips", "step_ms", "interrupt_yields"):
+              "round_trips", "step_ms", "interrupt_yields", "backstops",
+              "backstop_rate"):
         lines.append(f"- **{k}**: {card[k]}")
     lines += ["", "## Demo script (fired+grounded or clean in ≥2/3 sessions)",
               ", ".join(kg["demo"]) or "(none)",
