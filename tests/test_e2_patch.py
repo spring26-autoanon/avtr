@@ -207,7 +207,11 @@ class _FakeTaskGroup:
         return t
 
 
-def test_hook_consumes_pending_force_exactly_once(monkeypatch):
+def test_hook_consumes_on_padding_token_only(monkeypatch):
+    # Consume-on-pad: the force lands in the quiet beat before an answer
+    # (token == 3, the padding token), never on a word token — this is what
+    # makes it stall-proof (a stalled model emitting only padding still gets
+    # served) and speech-safe (mid-sentence word tokens are never hijacked).
     monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
     monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
     fake = _FakeChannel()
@@ -239,29 +243,36 @@ def test_hook_consumes_pending_force_exactly_once(monkeypatch):
     hook = fake.server.runner.lm_gen.on_text_hook
     assert hook is not None
 
-    # A non-word token (<= 3) must not be consumed.
-    tok = _FakeTensor([2])
+    # A word token (> 3) with a pending force must pass through untouched —
+    # her speech is never hijacked mid-word.
+    tok = _FakeTensor([7])
     hook(tok)
-    assert tok._values[0] == 2
+    assert tok._values[0] == 7
     assert 0 in fake.server._e2_force  # still pending, not consumed or expired
 
-    # First word token (> 3) is overwritten with rag_token_id and the pending
-    # entry is cleared.
-    tok = _FakeTensor([100])
+    # Another special token (0/1/2) also passes through — only ==3 consumes.
+    tok = _FakeTensor([1])
+    hook(tok)
+    assert tok._values[0] == 1
+    assert 0 in fake.server._e2_force
+
+    # The padding token (== 3) is overwritten with rag_token_id and the
+    # pending entry is cleared.
+    tok = _FakeTensor([3])
     hook(tok)
     assert tok._values[0] == lm_model.rag_token_id
     assert 0 not in fake.server._e2_force
 
-    # A subsequent word token is left untouched — one-shot only.
-    tok = _FakeTensor([200])
+    # A subsequent padding token is left untouched — one-shot only.
+    tok = _FakeTensor([3])
     hook(tok)
-    assert tok._values[0] == 200
+    assert tok._values[0] == 3
 
 
 def test_hook_does_not_rewrite_past_ttl_deadline(monkeypatch):
     # A force armed with an already-expired deadline must never rewrite a
-    # token, even a word token — and the stale entry must be removed so it
-    # doesn't linger. Installs the hook via the real REPLACEMENT code path
+    # token, even the padding token — and the stale entry must be removed so
+    # it doesn't linger. Installs the hook via the real REPLACEMENT code path
     # (not a hand-rolled copy) so this exercises the actual implementation.
     monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
     monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
@@ -285,10 +296,40 @@ def test_hook_does_not_rewrite_past_ttl_deadline(monkeypatch):
     fake.server._e2_force[fake.slot_idx] = time.monotonic() - 1.0  # expired
     hook = fake.server.runner.lm_gen.on_text_hook
 
-    tok = _FakeTensor([100])  # a word token, would have been rewritten if live
+    tok = _FakeTensor([3])  # padding, would have been rewritten if live
     hook(tok)
-    assert tok._values[0] == 100  # untouched — deadline had already passed
+    assert tok._values[0] == 3  # untouched — deadline had already passed
     assert fake.slot_idx not in fake.server._e2_force  # stale entry removed
+
+
+def test_ttl_env_respected(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+    monkeypatch.setenv("MOSHI_BACKSTOP_TTL", "0.5")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        msg = SimpleNamespace(text="Is this real?")
+        async with asyncio.TaskGroup() as tg:
+            fake._task_group = tg
+            await run(fake, msg)
+        return fake
+
+    before = time.monotonic()
+    fake = asyncio.run(scenario())
+    after = time.monotonic()
+    deadline = fake.server._e2_force[fake.slot_idx]
+    # deadline was set to monotonic() + 0.5 at engage time, somewhere between
+    # `before` and `after` (the delay + scheduling window around it).
+    assert before + 0.5 <= deadline <= after + 0.5 + 0.05
+
+
+def test_ttl_malformed_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_TTL", "oops")
+    ns = {"_os": os}
+    exec(compile(textwrap.dedent(e2._TTL_PARSE), "<ttl_parse>", "exec"), ns)
+    assert ns["_ttl"] == 8.0
 
 
 def test_runtime_stale_force_cleared_by_new_question(monkeypatch):
@@ -320,10 +361,11 @@ def test_runtime_stale_force_cleared_by_new_question(monkeypatch):
 
     fake = asyncio.run(scenario())
     hook = fake.server.runner.lm_gen.on_text_hook
-    # Q1's stale force must be gone; Q2's first word token is NOT hijacked.
-    tok = _FakeTensor([100])
+    # Q1's stale force must be gone; Q2's next padding frame is NOT
+    # hijacked by it (Q2's own timer hasn't engaged yet at this point).
+    tok = _FakeTensor([3])
     hook(tok)
-    assert tok._values[0] == 100
+    assert tok._values[0] == 3
 
 
 def test_runtime_malformed_delay_falls_back_to_default(monkeypatch):
