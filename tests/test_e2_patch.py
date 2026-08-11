@@ -2,6 +2,7 @@ import ast
 import asyncio
 import os
 import textwrap
+import time
 from types import SimpleNamespace
 
 from serving_exp.patches import e2_forced_ret as e2
@@ -29,6 +30,13 @@ def test_env_gated_and_logged():
 
 def test_question_gate_present():
     assert 'endswith("?")' in e2.REPLACEMENT
+
+
+def test_no_direct_trigger_call():
+    # E2 forces the model's OWN fire path via the hook; it must never call
+    # rag_manager.trigger directly the way e1's timer does — that would be a
+    # second, uncoordinated injection path.
+    assert "rag_manager.trigger" not in e2.REPLACEMENT
 
 
 def test_apply_simulation_no_duplicate_loops():
@@ -155,7 +163,12 @@ def test_runtime_engage_after_delay_sets_pending_force_and_logs(monkeypatch):
         return fake
 
     fake = asyncio.run(scenario())
-    assert fake.server._e2_force.get(fake.slot_idx) is True
+    # Armed with a TTL deadline (not a bare True sentinel) so a stale force
+    # can't outlive its window and hijack a later turn/session.
+    deadline = fake.server._e2_force.get(fake.slot_idx)
+    assert deadline is not None
+    assert isinstance(deadline, float)
+    assert deadline > time.monotonic()  # still within its TTL right now
     assert fake._log.calls.count("[Backstop] engaged") == 1
 
 
@@ -211,8 +224,9 @@ def test_hook_consumes_pending_force_exactly_once(monkeypatch):
         # Mutate the SAME dict the hook's closure captured (production never
         # rebinds self.server._e2_force, only mutates it in place via
         # `getattr(self.server, "_e2_force", {})`) — rebinding here would
-        # desync the test from the hook's closed-over reference.
-        fake.server._e2_force[0] = True
+        # desync the test from the hook's closed-over reference. Use a
+        # real future deadline (TTL semantics), not a bare True sentinel.
+        fake.server._e2_force[0] = time.monotonic() + 10.0
         for t in tg.tasks:
             t.cancel()
         for t in tg.tasks:
@@ -229,7 +243,7 @@ def test_hook_consumes_pending_force_exactly_once(monkeypatch):
     tok = _FakeTensor([2])
     hook(tok)
     assert tok._values[0] == 2
-    assert fake.server._e2_force.get(0) is True
+    assert 0 in fake.server._e2_force  # still pending, not consumed or expired
 
     # First word token (> 3) is overwritten with rag_token_id and the pending
     # entry is cleared.
@@ -242,6 +256,74 @@ def test_hook_consumes_pending_force_exactly_once(monkeypatch):
     tok = _FakeTensor([200])
     hook(tok)
     assert tok._values[0] == 200
+
+
+def test_hook_does_not_rewrite_past_ttl_deadline(monkeypatch):
+    # A force armed with an already-expired deadline must never rewrite a
+    # token, even a word token — and the stale entry must be removed so it
+    # doesn't linger. Installs the hook via the real REPLACEMENT code path
+    # (not a hand-rolled copy) so this exercises the actual implementation.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+    fake = _FakeChannel()
+
+    async def scenario():
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)  # installs on_text_hook as a side effect
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+    fake.server._e2_force[fake.slot_idx] = time.monotonic() - 1.0  # expired
+    hook = fake.server.runner.lm_gen.on_text_hook
+
+    tok = _FakeTensor([100])  # a word token, would have been rewritten if live
+    hook(tok)
+    assert tok._values[0] == 100  # untouched — deadline had already passed
+    assert fake.slot_idx not in fake.server._e2_force  # stale entry removed
+
+
+def test_runtime_stale_force_cleared_by_new_question(monkeypatch):
+    # A force armed for Q1 (still within its TTL) must not survive into Q2 —
+    # question-time clearing pops any pending force before rearming.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg1 = SimpleNamespace(text="First question?")
+        await run(fake, msg1)
+        # Simulate Q1's timer having engaged and armed a live (unexpired)
+        # force, still pending because Q1's word token never arrived.
+        fake.server._e2_force[fake.slot_idx] = time.monotonic() + 10.0
+        msg2 = SimpleNamespace(text="Second question?")
+        await run(fake, msg2)  # question-time clearing must pop Q1's force
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        return fake
+
+    fake = asyncio.run(scenario())
+    hook = fake.server.runner.lm_gen.on_text_hook
+    # Q1's stale force must be gone; Q2's first word token is NOT hijacked.
+    tok = _FakeTensor([100])
+    hook(tok)
+    assert tok._values[0] == 100
 
 
 def test_runtime_malformed_delay_falls_back_to_default(monkeypatch):

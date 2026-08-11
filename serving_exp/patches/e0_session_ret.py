@@ -4,6 +4,9 @@ fire's empty-context generation has come and gone (delay), so the note stands.
 
 Gated by MOSHI_E0_PRESEED (path to note text file). apply/revert on the BOX.
 
+MUTUALLY EXCLUSIVE with the other on_text_hook patches (e0/e2): apply at
+most one at a time — hooks overwrite each other.
+
 Usage on box:  python3 e0_session_ret.py apply
                python3 e0_session_ret.py revert
 """

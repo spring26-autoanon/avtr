@@ -70,3 +70,8 @@ new user question arms the timer.
 The plan's Task 4 code sketch (turn-switch anchor + `_last_user_text()`) is
 superseded by this shape; the `## ANCHORS.md` substitution markers resolve to the
 Section B/C/D code above.
+
+## Hook exclusivity
+
+e0 (`e0_session_ret.py`) and e2 (`e2_forced_ret.py`) both install
+`lm_gen.on_text_hook`; apply at most one at a time — hooks overwrite each other.
