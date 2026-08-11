@@ -68,18 +68,47 @@ _TTL_PARSE = '''\
                         _ttl = 8.0
 '''
 
+# v4 FIX 1: how far back (seconds) a native <ret> fire still counts against
+# this question at engage time. Field evidence showed a native fire that
+# lands WHILE the user is still talking — before the terminal "?" that arms
+# the timer even arrives — used to get erased by arming's flag reset,
+# causing a duplicate forced fire. The fix replaces the boolean flag with a
+# timestamp arming never touches (see REPLACEMENT below); this is that
+# timestamp's lookback window. Same early-parse, same-shape fallback as
+# _DELAY_PARSE/_TTL_PARSE.
+_LOOKBACK_PARSE = '''\
+                    try:
+                        _lookback = float(_os.environ.get("MOSHI_BACKSTOP_LOOKBACK", "8.0"))
+                    except ValueError:
+                        _lookback = 8.0
+'''
+
+# v4 FIX 2: minimum gap (seconds) required since the backstop last actually
+# consumed a forced ret (rewrote a pad) before it will arm a new one on this
+# slot. Cumulative injections correlate with late-session audio degradation
+# at the target checkpoint, so this bounds condition-swap density. Native
+# fires are never blocked by this window — it only gates the backstop's own
+# arming. Same early-parse, same-shape fallback as the others above.
+_REFRACTORY_PARSE = '''\
+                    try:
+                        _refractory = float(_os.environ.get("MOSHI_BACKSTOP_REFRACTORY", "6.0"))
+                    except ValueError:
+                        _refractory = 6.0
+'''
+
 REPLACEMENT = ANCHOR + '''
                 import os as _os
                 import time as _time
                 if _os.environ.get("MOSHI_BACKSTOP_FORCE", "") == "1" and msg.text.rstrip().endswith("?"):
                     if not hasattr(self.server, "_e2_force"):
                         self.server._e2_force = {}
-                        self.server._e2_native_fired = {}
+                        self.server._e2_native_ts = {}
+                        self.server._e2_forced_ts = {}
                         _pending = self.server._e2_force
-                        _native = self.server._e2_native_fired
                         _lm_gen = self.server.runner.lm_gen
                         _rag_id = _lm_gen.lm_model.rag_token_id
-                        def _e2_hook(text_token, _p=_pending, _n=_native, _r=_rag_id, _t=_time):
+                        _bs_log = __import__("logging").getLogger("backstop")
+                        def _e2_hook(text_token, _p=_pending, _r=_rag_id, _s=self.server, _t=_time, _log=_bs_log):
                             # A pending entry is a TTL deadline, not a bare
                             # flag: past-deadline entries are dropped
                             # unconditionally (expire) so a stale force from
@@ -93,8 +122,9 @@ REPLACEMENT = ANCHOR + '''
                             # mid-word. If the model fires NATIVELY while a
                             # force is still pending, the pending entry is
                             # cleared (no rewrite needed — it's already a
-                            # ret) and the native flag is set directly, so
-                            # the backstop never lands a duplicate ret on the
+                            # ret) and the native fire is TIMESTAMPED (v4:
+                            # not flagged — see _LOOKBACK_PARSE), so the
+                            # backstop never lands a duplicate ret on the
                             # next padding frame.
                             for _slot in list(_p.keys()):
                                 _deadline = _p[_slot]
@@ -102,32 +132,61 @@ REPLACEMENT = ANCHOR + '''
                                     del _p[_slot]
                                 elif int(text_token[_slot].item()) == _r:
                                     del _p[_slot]
-                                    _n[_slot] = True
+                                    _s._e2_native_ts[_slot] = _t.monotonic()
+                                    _log.info("[Backstop] native fire observed (slot %d)", _slot)
                                 elif int(text_token[_slot].item()) == 3:
                                     text_token[_slot] = _r
                                     del _p[_slot]
-                            for _slot in list(_n.keys()):
+                                    _s._e2_forced_ts[_slot] = _t.monotonic()
+                                    _log.info("[Backstop] forced ret consumed (slot %d)", _slot)
+                            # Native fires with NO pending force in flight —
+                            # the common case, including a fire that lands
+                            # mid-question, before the "?" that will arm a
+                            # timer even arrives — are timestamped on every
+                            # slot in the batch, not just slots the pending
+                            # dict happens to know about.
+                            for _slot in range(len(text_token)):
                                 if _slot not in _p and int(text_token[_slot].item()) == _r:
-                                    _n[_slot] = True
+                                    _s._e2_native_ts[_slot] = _t.monotonic()
+                                    _log.info("[Backstop] native fire observed (slot %d)", _slot)
                         _lm_gen.on_text_hook = _e2_hook
                     # A new question always clears any not-yet-consumed force
                     # from a previous question on this slot — this is the
                     # cross-question guard; the hook's own TTL expiry is the
-                    # cross-session backstop.
+                    # cross-session backstop. v4: this is the ONLY thing
+                    # arming clears — native-fire timestamps are never
+                    # touched here, so a fire observed moments ago (even
+                    # mid-question, before this "?" arrived) still counts at
+                    # engage time (FIX 1).
                     self.server._e2_force.pop(self.slot_idx, None)
-                    self.server._e2_native_fired[self.slot_idx] = False
                     self._backstop_gen = getattr(self, "_backstop_gen", 0) + 1
                     _gen = self._backstop_gen
-''' + _DELAY_PARSE + _TTL_PARSE + '''
-                    async def _e2_backstop_check(_gen=_gen, _delay=_delay, _ttl=_ttl):
-                        import asyncio as _aio
-                        await _aio.sleep(_delay)
-                        if self._backstop_gen == _gen and not getattr(self.server, "_e2_native_fired", {}).pop(self.slot_idx, False):
+''' + _DELAY_PARSE + _TTL_PARSE + _LOOKBACK_PARSE + _REFRACTORY_PARSE + '''
+                    # v4 FIX 2: refractory — if the backstop itself consumed
+                    # a forced ret on this slot too recently, skip arming a
+                    # new one entirely (native fires are never gated by
+                    # this; only our own arming is).
+                    _forced_ts = getattr(self.server, "_e2_forced_ts", {}).get(self.slot_idx, 0.0)
+                    if _time.monotonic() - _forced_ts < _refractory:
+                        self._log.info("[Backstop] refractory skip")
+                    else:
+                        async def _e2_backstop_check(_gen=_gen, _delay=_delay, _ttl=_ttl, _lookback=_lookback):
+                            import asyncio as _aio
+                            await _aio.sleep(_delay)
+                            if self._backstop_gen != _gen:
+                                return
+                            # v4 FIX 1: engage iff no native fire landed on
+                            # this slot within the lookback window — this
+                            # covers a fire that happened mid-question,
+                            # before arming, which the old flag design lost.
+                            _native_ts = getattr(self.server, "_e2_native_ts", {}).get(self.slot_idx, 0.0)
+                            if _time.monotonic() - _native_ts <= _lookback:
+                                return
                             self._log.info("[Backstop] engaged")
                             self.server._e2_force = getattr(self.server, "_e2_force", {})
                             self.server._e2_force[self.slot_idx] = _time.monotonic() + _ttl
 
-                    self._task_group.create_task(_e2_backstop_check())'''
+                        self._task_group.create_task(_e2_backstop_check())'''
 
 
 def main():

@@ -336,7 +336,10 @@ def test_runtime_native_fire_while_force_pending_clears_and_suppresses(monkeypat
     hook(tok)
     assert tok._values[0] == RAG_ID  # already a ret — must not be touched
     assert fake.slot_idx not in fake.server._e2_force  # pending entry cleared
-    assert fake.server._e2_native_fired.get(fake.slot_idx) is True
+    # v4: no more boolean flag — a timestamp, recorded just now.
+    ts = fake.server._e2_native_ts.get(fake.slot_idx)
+    assert ts is not None
+    assert 0.0 <= time.monotonic() - ts < 1.0
 
     # The next padding frame must NOT be rewritten — no duplicate ret.
     tok = _FakeTensor([3])
@@ -415,3 +418,218 @@ def test_runtime_malformed_delay_falls_back_to_default(monkeypatch):
     ns = {"_os": os}
     exec(compile(textwrap.dedent(e2._DELAY_PARSE), "<delay_parse>", "exec"), ns)
     assert ns["_delay"] == 2.5
+
+
+# ---------------------------------------------------------------------------
+# v4: FIX 1 — mid-question native fires count (timestamp, not flag)
+# ---------------------------------------------------------------------------
+
+
+def test_new_env_vars_present():
+    assert "MOSHI_BACKSTOP_LOOKBACK" in e2.REPLACEMENT
+    assert "MOSHI_BACKSTOP_REFRACTORY" in e2.REPLACEMENT
+
+
+def test_attribution_log_strings_present():
+    assert "forced ret consumed" in e2.REPLACEMENT
+    assert "native fire observed" in e2.REPLACEMENT
+
+
+def test_runtime_mid_question_native_fire_counts(monkeypatch):
+    # Field bug: a native <ret> fired WHILE the user is still speaking —
+    # before the terminal "?" ever arrives to arm the timer — used to be
+    # erased by arming's flag reset, causing a duplicate forced fire. v4
+    # replaces the flag with a timestamp that arming never clears.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+
+    async def install_and_fire():
+        fake = _FakeChannel()
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg1 = SimpleNamespace(text="First question?")
+        await run(fake, msg1)  # installs the hook (huge delay; never engages)
+        # Simulate a native fire landing mid-utterance, before any "?" of
+        # THIS question has arrived — exactly what the hook does when the
+        # model samples its own rag token off the wire.
+        hook = fake.server.runner.lm_gen.on_text_hook
+        hook(_FakeTensor([RAG_ID]))
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        return fake
+
+    fake = asyncio.run(install_and_fire())
+    ts_before = fake.server._e2_native_ts[fake.slot_idx]
+    assert ts_before is not None
+
+    # Now the "?" for this question arrives and arms a fresh timer — arming
+    # must NOT clear the native ts recorded a moment ago.
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+
+    async def arm_and_wait():
+        msg2 = SimpleNamespace(text="Is this real?")
+        async with asyncio.TaskGroup() as tg2:
+            fake._task_group = tg2
+            await run(fake, msg2)
+        return fake
+
+    fake = asyncio.run(arm_and_wait())
+    assert fake.server._e2_native_ts[fake.slot_idx] == ts_before  # untouched by arming
+    assert fake.slot_idx not in fake.server._e2_force  # suppressed — never engaged
+    assert "[Backstop] engaged" not in fake._log.calls
+
+
+def test_runtime_stale_native_ts_does_not_suppress(monkeypatch):
+    # A native fire older than the lookback window must NOT suppress this
+    # question's backstop — only a RECENT native fire counts.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+    monkeypatch.setenv("MOSHI_BACKSTOP_LOOKBACK", "0.05")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        msg = SimpleNamespace(text="Is this real?")
+        async with asyncio.TaskGroup() as tg:
+            fake._task_group = tg
+            await run(fake, msg)  # installs hook + dicts
+            fake.server._e2_native_ts[fake.slot_idx] = time.monotonic() - 5.0
+        return fake
+
+    fake = asyncio.run(scenario())
+    assert fake.server._e2_force.get(fake.slot_idx) is not None
+    assert "[Backstop] engaged" in fake._log.calls
+
+
+def test_lookback_malformed_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_LOOKBACK", "oops")
+    ns = {"_os": os}
+    exec(compile(textwrap.dedent(e2._LOOKBACK_PARSE), "<lookback_parse>", "exec"), ns)
+    assert ns["_lookback"] == 8.0
+
+
+# ---------------------------------------------------------------------------
+# v4: FIX 2 — refractory window on arming
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_refractory_skips_arming(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+    monkeypatch.setenv("MOSHI_BACKSTOP_REFRACTORY", "60")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg0 = SimpleNamespace(text="Warm up?")
+        await run(fake, msg0)  # installs hook + dicts, arms (no prior consumption)
+        # Simulate the backstop having just consumed a forced ret.
+        fake.server._e2_forced_ts[fake.slot_idx] = time.monotonic()
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)  # arming attempt within the refractory window
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+        return fake
+
+    fake = asyncio.run(scenario())
+    assert "[Backstop] refractory skip" in fake._log.calls
+    assert fake.slot_idx not in fake.server._e2_force  # no pending/engaged force from the skipped arm
+    assert len(fake._task_group.tasks) == 1  # only msg0's check task — msg's arm was skipped
+
+
+def test_runtime_refractory_does_not_block_native_fires(monkeypatch):
+    # Native fires are never blocked by the refractory window — it only
+    # gates the backstop's OWN arming.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+    fake = _FakeChannel()
+
+    async def scenario():
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)  # installs hook
+        fake.server._e2_forced_ts[fake.slot_idx] = time.monotonic()  # inside refractory
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+    hook = fake.server.runner.lm_gen.on_text_hook
+    tok = _FakeTensor([RAG_ID])
+    hook(tok)
+    assert tok._values[0] == RAG_ID  # untouched, native fire always passes through
+    assert fake.server._e2_native_ts.get(fake.slot_idx) is not None  # still recorded
+
+
+def test_refractory_malformed_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_REFRACTORY", "oops")
+    ns = {"_os": os}
+    exec(compile(textwrap.dedent(e2._REFRACTORY_PARSE), "<refractory_parse>", "exec"), ns)
+    assert ns["_refractory"] == 6.0
+
+
+# ---------------------------------------------------------------------------
+# v4: FIX 3 — attribution logging in the hook
+# ---------------------------------------------------------------------------
+
+
+def test_hook_logs_attribution_on_consume_and_native_fire(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+    fake = _FakeChannel()
+
+    async def scenario():
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)
+        fake.server._e2_force[fake.slot_idx] = time.monotonic() + 10.0
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+    hook = fake.server.runner.lm_gen.on_text_hook
+
+    import logging
+
+    caught = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            caught.append(record.getMessage())
+
+    backstop_logger = logging.getLogger("backstop")
+    handler = _Handler()
+    backstop_logger.addHandler(handler)
+    backstop_logger.setLevel(logging.INFO)
+    try:
+        hook(_FakeTensor([3]))  # consumes the pending force
+    finally:
+        backstop_logger.removeHandler(handler)
+
+    assert any("forced ret consumed" in m for m in caught)
