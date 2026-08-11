@@ -75,3 +75,32 @@ Section B/C/D code above.
 
 e0 (`e0_session_ret.py`) and e2 (`e2_forced_ret.py`) both install
 `lm_gen.on_text_hook`; apply at most one at a time — hooks overwrite each other.
+
+## E: _handle_reference_text — sentinel skip anchor (operator grep 2026-08-11, post-boot)
+
+channel.py:162, stock body (v4.2 sentinel inserts its guard after the received-text log,
+before `if reference_text:` at :174):
+
+```python
+    async def _handle_reference_text(self, reference_text: str | None, lm_label: str = ""):
+        """Forward a freshly generated reference text to the UI and the LM.
+
+        Args:
+            reference_text: Generated reference text.
+            lm_label: Display name of the LLM used for reference generation (sent to client UI).
+        """
+        if reference_text is None:
+            preview, ref_len = "", 0
+        else:
+            preview, ref_len = reference_text[:120], len(reference_text)
+        self._log.info(f"[Reference] received reference text (len={ref_len}) lm={lm_label!r}: '{preview}'")
+        if reference_text:
+```
+
+## Template file locations (same grep session)
+
+LIVE (loaded by the server, both must carry persona/style rules):
+- `~/fork-venv/lib/python3.12/site-packages/moshi/llm/reference_prompt_template.txt`
+- `~/fork-venv/lib/python3.12/site-packages/moshi/llm/reference_prompt_template_simplified.txt`
+Repo copy (keep in sync): `~/moshi-finetune/serving/reference_prompt_template_simplified.txt`
+Backups in ~ (`*.txt.orig`, `*.bak`) — never append to these.

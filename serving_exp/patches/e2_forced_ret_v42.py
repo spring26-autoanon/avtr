@@ -237,15 +237,32 @@ REPLACEMENT = ANCHOR + '''
 
                         self._task_group.create_task(_e2_backstop_check())'''
 
-# Sentinel scaffold: declines injecting a reference the model itself reports
-# as unavailable. Not wired yet — fill from anchors.md section E once that
-# anchor is recorded; shape: anchor = first lines of `_handle_reference_text`
-# body, replacement = anchor + guard:
-#     if reference_text and "no reference available" in reference_text.lower():
-#         self._log.info("[Sentinel] decline reference — injection skipped")
-#         return
-SENTINEL_ANCHOR = None
-SENTINEL_REPLACEMENT = None
+# Sentinel: declines injecting a reference the generator itself marks as
+# unavailable (the templates instruct Gemini to output exactly
+# "Reference: no reference available" for live/unknowable data). The guard
+# sits right after the received-reference log, before any UI/injection use,
+# so a decline reference is logged but never encoded or injected — the
+# model's own trained refusal then answers unassisted.
+# Anchor recorded from operator grep 2026-08-11 (anchors.md section E):
+# channel.py:162-173, the _handle_reference_text signature + docstring +
+# preview block through the received-text log line.
+SENTINEL_ANCHOR = '''    async def _handle_reference_text(self, reference_text: str | None, lm_label: str = ""):
+        """Forward a freshly generated reference text to the UI and the LM.
+
+        Args:
+            reference_text: Generated reference text.
+            lm_label: Display name of the LLM used for reference generation (sent to client UI).
+        """
+        if reference_text is None:
+            preview, ref_len = "", 0
+        else:
+            preview, ref_len = reference_text[:120], len(reference_text)
+        self._log.info(f"[Reference] received reference text (len={ref_len}) lm={lm_label!r}: '{preview}'")'''
+
+SENTINEL_REPLACEMENT = SENTINEL_ANCHOR + '''
+        if reference_text and "no reference available" in reference_text.lower():
+            self._log.info("[Sentinel] decline reference — injection skipped")
+            return'''
 
 
 def main():
