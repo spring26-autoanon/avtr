@@ -20,3 +20,19 @@ def test_env_gated_delayed_and_logged():
     assert "MOSHI_E0_PRESEED" in e0.REPLACEMENT
     assert "sleep(6.0)" in e0.REPLACEMENT
     assert "[E0] armed" in e0.REPLACEMENT and "[E0] injecting delayed preseed" in e0.REPLACEMENT
+
+
+def test_apply_simulation_no_duplicate_loops():
+    stock = (
+        "            async with asyncio.TaskGroup() as tg:\n"
+        "                self._task_group = tg\n"
+        "                tg.create_task(self._recv_loop())\n"
+        "                tg.create_task(self._stt_recv_loop())\n"
+        "                tg.create_task(self._output_loop())\n"
+    )
+    patched = stock.replace(e0.ANCHOR, e0.REPLACEMENT, 1)
+    assert patched != stock  # anchor matched
+    assert patched.count("tg.create_task(self._recv_loop())") == 1
+    assert patched.count("tg.create_task(self._stt_recv_loop())") == 1
+    assert patched.count("tg.create_task(self._output_loop())") == 1
+    assert "MOSHI_E0_PRESEED" in patched

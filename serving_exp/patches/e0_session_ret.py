@@ -20,10 +20,12 @@ TAG = "e0_session_ret"
 # The TaskGroup opening inside Channel.run() — verified present in the stock
 # file on 2026-08-10 (the pre-seed experiment used the same anchor).
 ANCHOR = '''            async with asyncio.TaskGroup() as tg:
-                self._task_group = tg'''
+                self._task_group = tg
+                tg.create_task(self._recv_loop())'''
 
 REPLACEMENT = '''            async with asyncio.TaskGroup() as tg:
                 self._task_group = tg
+                tg.create_task(self._recv_loop())
                 import os as _os
                 _e0_note = _os.environ.get("MOSHI_E0_PRESEED", "")
                 if _e0_note:
@@ -47,8 +49,7 @@ REPLACEMENT = '''            async with asyncio.TaskGroup() as tg:
                         await _aio.sleep(6.0)
                         self._log.info(f"[E0] injecting delayed preseed (len={len(_text)})")
                         await self._async_update_reference(_text)
-                    tg.create_task(_e0_delayed_preseed())
-                tg.create_task(self._recv_loop())'''
+                    tg.create_task(_e0_delayed_preseed())'''
 
 
 def main():
