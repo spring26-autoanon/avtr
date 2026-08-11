@@ -31,3 +31,27 @@
 **Checkpoint law (confirmed across 6 rungs + 4b):** the backstop guarantees knowledge, never speech — it amplifies delivery-healthy checkpoints (400, 4b-300) and cannot rescue stall-pathology rungs (500/600/700/800). Checkpoint choice owns voice and delivery; the backstop owns grounding.
 
 **The one remaining training run** (recommendation, evidence-based): rank 64, 4c recipe, targets = (a) fire-rate via synthetic question-variety (many voices/phrasings per answer), (b) contradiction clips (reference disagrees with memorized answer) to keep asking valuable through crystallization, (c) casual statement-response dialogue for conversational carry. Success metrics: backstop engagement rate driven down on the LOCK protocol; statement-responsiveness; ambient-reference clips NOT required (E2 works without them).
+| 2026-08-11 | VOICEHUNT | 4c2-700 | 2.0 | 2.0 (delay 0.8) | e2 v4.1 | 0 native | 6 forced (3 sessions) | 0 delivered | CONCLUSIVE CLOSE: every note generated+injected, mouth still died 2-3 words in ("Yeah, I—"). Padding-attractor stall is checkpoint-intrinsic; backstop cannot rescue delivery. Also: encoder cold-start 1.74s cost the first note race. | (sessions in serve.log era 05:48) |
+| 2026-08-11 | VOICEHUNT | 4c2-600 | 1.5 | 0.5 (delay 0.8) | e2 v4.1 | 2 native | 7 forced | ~8/9 grounded | Zero stalls, statement-carry, humor (martial-arts joke, pokemon cards), Bitcoin decline PASSED natively. Identity slips: "I am a chatbot", "I don't have vision", "haven't visited" — 1.5 attenuates identity. 1 confab (World Cup US wins). | 2026-08-11_voicehunt_600at15.log |
+| 2026-08-11 | VOICEHUNT | 4c2-600 | 2.0 | 0.5 (delay 0.8) | e2 v4.1 | 0 native | 4 forced | 4/4 grounded | BEST VOICE OF SPRINT (user: um, so, likes). Identity restored (no chatbot slips), zero stalls, statement replies. Cost: wrong-first-then-correct (Florida "Yes I am", houseplants) — at 2.0 she answers before any note can land; only mid-question native fires beat the buffer, and there are none. | 2026-08-11_voicehunt_600at20.log |
+| 2026-08-11 | CONFIRM | 4c2-600 | 2.0 | 0.5 (delay 0.8) | e2 v4.1 | 0 native | ~12 forced + 1 refractory skip | most grounded | Long-session confirm: voice+carry hold, refractory works on double questions, one dropped answer (favorite place — re-ask rescued). NEW FAILURES: Bitcoin decline FULLY flattened ("six thousand" + doubled down "yes that is the live price"); name split ("people call me Danielle sometimes... going by Moshi") — partly a ref-template bug (Gemini said "Danielle goes by Moshi", confused by moshi: transcript labels). | 2026-08-11_confirm_600at20_v41.log |
+
+## AMENDMENT (2026-08-11 morning): voice-optimal config
+
+The fire-vs-imprint election is now QUANTIFIED on one checkpoint: 4c2-600 natives 2 -> 0
+going 1.5 -> 2.0 scaling. Voice, identity, and register all arrive at 2.0; the native
+trigger and the trained decline both die there (decline survival rode on native fires).
+
+REVISED LOCKS:
+- DEMO PRIMARY: 4c2-600 @ 2.0, rank 64, stt-wait 0.5, BACKSTOP_FORCE=1 DELAY=0.8, v4.1.
+  Best voice + ums + statement-carry + healthy delivery; 100% backstop-carried grounding.
+  Known flaws: wrong-first-then-correct on fast identity answers; declines flatten (do not
+  ask live-data questions in the demo, or demo the flatten deliberately); name question
+  yields Moshi/Danielle split.
+- DECLINE-SAFE FALLBACK: 4c2-400 same serve config (3/8 native, declines half-survive,
+  weaker/variable voice, no statement-carry).
+- 700/800: permanently closed (delivery-stall under ideal composite conditions).
+- Ref-template fix for the name split (1 line): "the speaker labeled 'moshi' in the
+  transcript IS Danielle" in both reference templates.
+- LoRA-interpolation "650" (600/700 average) remains the untested voice dial if more
+  timbre is wanted without 700's stalls.
