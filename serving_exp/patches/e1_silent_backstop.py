@@ -36,19 +36,33 @@ REPLACEMENT_FLAG = '''            if text_token == self.server.runner.lm_gen.lm_
 # anchors.md section D — _stt_recv_loop body line, verbatim (exact indentation).
 ANCHOR_TIMER = '''                await self._send_turn_outputs(self.turn_manager.handle_spoken_text(user_text=msg.text))'''
 
-REPLACEMENT_TIMER = '''                await self._send_turn_outputs(self.turn_manager.handle_spoken_text(user_text=msg.text))
+# Parsed EARLY (synchronously, before the check task is created) and guarded —
+# a malformed MOSHI_BACKSTOP_DELAY must degrade to the 2.5s default instead of
+# raising inside the TaskGroup task, where a ValueError would propagate as an
+# ExceptionGroup and tear down every sibling loop (recv/output/stt). Kept as
+# its own constant so tests can exercise the fallback in isolation without
+# waiting out a real delay.
+_DELAY_PARSE = '''\
+                    try:
+                        _delay = float(_os.environ.get("MOSHI_BACKSTOP_DELAY", "2.5"))
+                    except ValueError:
+                        _delay = 2.5
+'''
+
+REPLACEMENT_TIMER = ANCHOR_TIMER + '''
                 import os as _os
                 if _os.environ.get("MOSHI_BACKSTOP", "") == "1" and msg.text.rstrip().endswith("?"):
                     self._backstop_fired = False
                     self._backstop_gen = getattr(self, "_backstop_gen", 0) + 1
                     _gen = self._backstop_gen
-
-                    async def _e1_backstop_check(_gen=_gen):
+''' + _DELAY_PARSE + '''
+                    async def _e1_backstop_check(_gen=_gen, _delay=_delay):
                         import asyncio as _aio
-                        import os as _os2
-                        await _aio.sleep(float(_os2.environ.get("MOSHI_BACKSTOP_DELAY", "2.5")))
+                        await _aio.sleep(_delay)
                         if self._backstop_gen == _gen and not getattr(self, "_backstop_fired", False):
                             self._log.info("[Backstop] engaged")
+                            self._backstop_fired = True
+                            # native fires are never suppressed: an emitted ret token must receive a note (fire-freeze otherwise)
                             await self.rag_manager.trigger(
                                 task_group=self._task_group,
                                 wait_steps=0,

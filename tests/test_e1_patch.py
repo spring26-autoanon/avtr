@@ -1,5 +1,8 @@
 import ast
+import asyncio
+import os
 import textwrap
+from types import SimpleNamespace
 
 from serving_exp.patches import e1_silent_backstop as e1
 
@@ -83,3 +86,124 @@ def test_apply_simulation_no_duplicate_loops():
         )
         == 1
     )
+
+
+# ---------------------------------------------------------------------------
+# Runtime-semantics tests: extract REPLACEMENT_TIMER's appended block (i.e.
+# everything after the anchor line) and actually execute it under real
+# asyncio against a fake Channel, instead of only asserting on the source
+# string. No box access needed — this is pure stdlib.
+# ---------------------------------------------------------------------------
+
+
+class _FakeLog:
+    def __init__(self):
+        self.calls = []
+
+    def info(self, msg):
+        self.calls.append(msg)
+
+
+class _FakeRagManager:
+    def __init__(self):
+        self.calls = []
+
+    async def trigger(self, **kw):
+        self.calls.append(kw)
+
+
+class _FakeTurnManager:
+    def get_context(self):
+        return {}
+
+
+class _FakeChannel:
+    def __init__(self):
+        self._log = _FakeLog()
+        self.rag_manager = _FakeRagManager()
+        self.turn_manager = _FakeTurnManager()
+        self.server = object()
+        self._handle_reference_text = lambda *a, **kw: None
+        self._task_group = None  # set by the test to a real asyncio.TaskGroup
+
+
+def _build_run():
+    """Extract everything in REPLACEMENT_TIMER after the anchor line, dedent
+    it, and wrap it as `async def _run(self, msg): ...` so it can be executed
+    directly against a fake `self`."""
+    appended = e1.REPLACEMENT_TIMER[len(e1.ANCHOR_TIMER):]
+    body = textwrap.indent(textwrap.dedent(appended), "    ")
+    src = "async def _run(self, msg):\n" + body
+    ns = {"asyncio": asyncio, "os": os}
+    exec(compile(src, "<e1_timer_runtime>", "exec"), ns)
+    return ns["_run"]
+
+
+def test_runtime_backstop_engages_on_unfired_question(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        msg = SimpleNamespace(text="Is this real?")
+        async with asyncio.TaskGroup() as tg:
+            fake._task_group = tg
+            await run(fake, msg)
+        return fake
+
+    fake = asyncio.run(scenario())
+    assert len(fake.rag_manager.calls) == 1
+    assert fake.rag_manager.calls[0]["wait_steps"] == 0
+    assert fake._log.calls.count("[Backstop] engaged") == 1
+    assert fake._backstop_fired is True
+
+
+def test_runtime_stale_generation_noop(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.05")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        msg1 = SimpleNamespace(text="First question?")
+        msg2 = SimpleNamespace(text="Second question?")
+        async with asyncio.TaskGroup() as tg:
+            fake._task_group = tg
+            await run(fake, msg1)
+            await asyncio.sleep(0.001)
+            await run(fake, msg2)
+        return fake
+
+    fake = asyncio.run(scenario())
+    assert len(fake.rag_manager.calls) == 1
+
+
+def test_runtime_native_fire_suppresses(monkeypatch):
+    monkeypatch.setenv("MOSHI_BACKSTOP", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")
+    run = _build_run()
+
+    async def scenario():
+        fake = _FakeChannel()
+        msg = SimpleNamespace(text="Is this real?")
+        async with asyncio.TaskGroup() as tg:
+            fake._task_group = tg
+            await run(fake, msg)
+            # simulate a native <ret> fire arriving before the timer expires
+            fake._backstop_fired = True
+        return fake
+
+    fake = asyncio.run(scenario())
+    assert fake.rag_manager.calls == []
+
+
+def test_runtime_malformed_delay_survives(monkeypatch):
+    # The delay is parsed EARLY (synchronously, before the check task is
+    # created), guarded by try/except — a typo'd env var must fall back to
+    # the 2.5s default instead of raising inside the TaskGroup task (which
+    # would propagate as an ExceptionGroup and tear down every sibling loop).
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "oops")
+    ns = {"_os": os}
+    exec(compile(textwrap.dedent(e1._DELAY_PARSE), "<delay_parse>", "exec"), ns)
+    assert ns["_delay"] == 2.5
