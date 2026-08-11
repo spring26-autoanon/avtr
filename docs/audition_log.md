@@ -74,3 +74,10 @@ then rsync down. One line per session here, newest last.
 ## The 4c2 ladder finding (writeup material)
 
 Identity formation along LoRA dose is non-monotonic with a sharp peak: phantom name (400) -> two-identity superposition (600) -> crystallized Danielle (700) -> fragment recombination (800). Voice/register accumulates monotonically (ums at 400, laughs at 700). Fire rate is inversely coupled to imprint depth (3/17 at 400 -> 0 at 800): memorized answers outrace the <ret> marker in the softmax + trigger-head feature drift. Reference rewrite moved the speech cliff past 800 (old 4c walled at 600@2.0). DEMO CANDIDATES: 400@2.0 = retrieval act; 700@2.0 = voice/persona act. 4e (weight 50, persona 0.25, ckpt/50) overnight-tests whether doubled marker gradient keeps firing alive through the 700-style crystallization peak.
+
+## Sunday night 2026-08-10/11 — 4e verdict, pre-seed experiment, wait-window confirmation
+
+- **4e (weight 50 + persona 0.25): fire-dead at every surviving rung** (350-800 @2.0; ckpt rotation deleted 100-300). Rich early confabulated identities at 350-400 = crystallization shifted left as predicted. Verdict: marker gradient cannot outbid answer-memorization; future fix = contradiction training, not louder markers. Also: trainer keeps last 10 ckpts — raise for ladder runs.
+- **Pre-seed patch (MOSHI_PRESEED_REFERENCE, channel.py, backup ~/channel.py.pre_preseed): mechanism works, model ignores it.** Session-start injection loads fine; no-fire questions answer from confabulation anyway; fired notes steer perfectly. FINDING: note-reading is fire-gated — the model only consults the slot after emitting <ret>. A "system prompt" needs training with ambient references or a synthetic fire.
+- **stt-wait 2.0 CONFIRMED as fire-multiplier on deep rungs**: 4c2-700 @2.0/wait2.0 = 3 fires/session (vs ~1 at 0.5), incl. work fire landing 1.2s into the wait window (the dice-roll fingerprint) -> FIRST correct work answer of the sprint. Brooklyn pushback-save clean. WC fire-froze (no audio; recovery = fresh question).
+- **LOCKED SERVE CONFIGS: persona act = 4c2-700 @2.0 + stt-wait 2.0; retrieval act = 4c2-400 @2.0 + stt-wait 0.5.**
