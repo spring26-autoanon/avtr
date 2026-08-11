@@ -1,11 +1,34 @@
 import ast
 import asyncio
+import contextlib
+import logging
 import os
 import textwrap
 import time
 from types import SimpleNamespace
 
 from serving_exp.patches import e2_forced_ret as e2
+
+
+@contextlib.contextmanager
+def _capture_backstop_logs():
+    """Attach a real logging.Handler to the "backstop" logger (the one
+    `_bs_log` in the hook writes to) and yield the list of captured
+    messages, in order."""
+    caught = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record):
+            caught.append(record.getMessage())
+
+    backstop_logger = logging.getLogger("backstop")
+    handler = _Handler()
+    backstop_logger.addHandler(handler)
+    backstop_logger.setLevel(logging.INFO)
+    try:
+        yield caught
+    finally:
+        backstop_logger.removeHandler(handler)
 
 
 def test_replacement_contains_anchor_prefix():
@@ -592,9 +615,13 @@ def test_refractory_malformed_falls_back_to_default(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_hook_logs_attribution_on_consume_and_native_fire(monkeypatch):
+def _install_hook_with_pending(monkeypatch, delay="999"):
+    """Shared setup for the attribution tests below: install the hook (via
+    the real REPLACEMENT code path) and arm a live pending force on slot 0,
+    cancelling the scheduled check so it never fires on its own. Returns the
+    fake channel."""
     monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
-    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", delay)
     run = _build_run()
     fake = _FakeChannel()
 
@@ -613,23 +640,92 @@ def test_hook_logs_attribution_on_consume_and_native_fire(monkeypatch):
                 pass
 
     asyncio.run(scenario())
+    return fake
+
+
+def test_hook_logs_attribution_on_consume_and_native_fire(monkeypatch):
+    fake = _install_hook_with_pending(monkeypatch)
     hook = fake.server.runner.lm_gen.on_text_hook
 
-    import logging
-
-    caught = []
-
-    class _Handler(logging.Handler):
-        def emit(self, record):
-            caught.append(record.getMessage())
-
-    backstop_logger = logging.getLogger("backstop")
-    handler = _Handler()
-    backstop_logger.addHandler(handler)
-    backstop_logger.setLevel(logging.INFO)
-    try:
+    with _capture_backstop_logs() as caught:
         hook(_FakeTensor([3]))  # consumes the pending force
-    finally:
-        backstop_logger.removeHandler(handler)
 
     assert any("forced ret consumed" in m for m in caught)
+    # Tightened (v4.1 regression pin): a forced consumption must NOT also
+    # be mislabeled as a native fire — the rewritten token (now == rag_id,
+    # no longer pending) used to fall through into the second (no-pending)
+    # loop and get logged/stamped a second time as a distinct native event.
+    assert not any("native fire observed" in m for m in caught)
+
+
+def test_forced_consumption_does_not_stamp_native_ts(monkeypatch):
+    # (a) Forced consumption produces ONLY "forced ret consumed" — no
+    # "native fire observed" — and _e2_native_ts is left untouched.
+    fake = _install_hook_with_pending(monkeypatch)
+    hook = fake.server.runner.lm_gen.on_text_hook
+    assert fake.slot_idx not in fake.server._e2_native_ts  # nothing recorded yet
+
+    with _capture_backstop_logs() as caught:
+        hook(_FakeTensor([3]))  # consumes the pending force
+
+    assert sum("forced ret consumed" in m for m in caught) == 1
+    assert not any("native fire observed" in m for m in caught)
+    assert fake.slot_idx not in fake.server._e2_native_ts  # still untouched
+    assert fake.server._e2_forced_ts.get(fake.slot_idx) is not None  # consumption WAS stamped
+
+
+def test_native_while_pending_logs_and_stamps_exactly_once(monkeypatch):
+    # (b) A native fire while a force is pending must log "native fire
+    # observed" exactly once and stamp _e2_native_ts exactly once — not
+    # once from the pending-clear branch and again from the no-pending scan
+    # (the rewritten... well here the token is left untouched, but the slot
+    # leaves `_p` either way, so without the `_handled` guard it would
+    # double-match).
+    fake = _install_hook_with_pending(monkeypatch)
+    hook = fake.server.runner.lm_gen.on_text_hook
+
+    with _capture_backstop_logs() as caught:
+        tok = _FakeTensor([RAG_ID])
+        hook(tok)
+
+    assert tok._values[0] == RAG_ID  # untouched — already a ret
+    assert sum("native fire observed" in m for m in caught) == 1
+    assert not any("forced ret consumed" in m for m in caught)
+    assert fake.slot_idx not in fake.server._e2_force  # pending cleared
+    assert fake.server._e2_native_ts.get(fake.slot_idx) is not None
+
+
+def test_genuine_no_pending_native_fire_logs_and_stamps(monkeypatch):
+    # (c) An ordinary native fire with no pending force at all (the common
+    # case — the model answers on its own before any backstop timer ever
+    # engages) must still log and stamp normally; the _handled guard must
+    # not suppress this legitimate case.
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+    fake = _FakeChannel()
+
+    async def scenario():
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)  # installs the hook; no pending force yet (delay=999)
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+    hook = fake.server.runner.lm_gen.on_text_hook
+    assert fake.slot_idx not in fake.server._e2_force  # confirm: no pending
+
+    with _capture_backstop_logs() as caught:
+        tok = _FakeTensor([RAG_ID])
+        hook(tok)
+
+    assert tok._values[0] == RAG_ID
+    assert sum("native fire observed" in m for m in caught) == 1
+    assert fake.server._e2_native_ts.get(fake.slot_idx) is not None

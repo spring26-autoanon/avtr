@@ -126,6 +126,16 @@ REPLACEMENT = ANCHOR + '''
                             # not flagged — see _LOOKBACK_PARSE), so the
                             # backstop never lands a duplicate ret on the
                             # next padding frame.
+                            # Slots this call already logged/stamped via the
+                            # branches below — the second (no-pending) loop
+                            # must skip them: a forced consumption rewrites
+                            # the token TO _r and deletes the slot from _p,
+                            # and a native-while-pending fire deletes the
+                            # slot from _p too, so without this set BOTH
+                            # would also match the second loop's "not in _p
+                            # and == _r" test and get mislabeled/double
+                            # counted as a second, distinct native fire.
+                            _handled = set()
                             for _slot in list(_p.keys()):
                                 _deadline = _p[_slot]
                                 if _t.monotonic() >= _deadline:
@@ -134,19 +144,27 @@ REPLACEMENT = ANCHOR + '''
                                     del _p[_slot]
                                     _s._e2_native_ts[_slot] = _t.monotonic()
                                     _log.info("[Backstop] native fire observed (slot %d)", _slot)
+                                    _handled.add(_slot)
                                 elif int(text_token[_slot].item()) == 3:
                                     text_token[_slot] = _r
                                     del _p[_slot]
                                     _s._e2_forced_ts[_slot] = _t.monotonic()
                                     _log.info("[Backstop] forced ret consumed (slot %d)", _slot)
+                                    _handled.add(_slot)
                             # Native fires with NO pending force in flight —
                             # the common case, including a fire that lands
                             # mid-question, before the "?" that will arm a
                             # timer even arrives — are timestamped on every
                             # slot in the batch, not just slots the pending
-                            # dict happens to know about.
+                            # dict happens to know about. Slots already
+                            # handled above (forced consumption OR
+                            # native-while-pending) are skipped — otherwise a
+                            # forced rewrite (now == _r, no longer in _p)
+                            # would be mislabeled as a SECOND, distinct
+                            # native fire, corrupting attribution and
+                            # polluting the lookback with a phantom event.
                             for _slot in range(len(text_token)):
-                                if _slot not in _p and int(text_token[_slot].item()) == _r:
+                                if _slot not in _p and _slot not in _handled and int(text_token[_slot].item()) == _r:
                                     _s._e2_native_ts[_slot] = _t.monotonic()
                                     _log.info("[Backstop] native fire observed (slot %d)", _slot)
                         _lm_gen.on_text_hook = _e2_hook
