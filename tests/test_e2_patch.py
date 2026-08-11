@@ -302,6 +302,48 @@ def test_hook_does_not_rewrite_past_ttl_deadline(monkeypatch):
     assert fake.slot_idx not in fake.server._e2_force  # stale entry removed
 
 
+def test_runtime_native_fire_while_force_pending_clears_and_suppresses(monkeypatch):
+    # Regression: a native fire arriving WHILE a force is pending must clear
+    # the pending entry and record the native flag — not leave the pending
+    # entry to fire a duplicate forced <ret> on the very next padding frame
+    # (the E1 "screech mode" this whole design exists to avoid).
+    monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
+    monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "999")
+    run = _build_run()
+    fake = _FakeChannel()
+
+    async def scenario():
+        tg = _FakeTaskGroup()
+        fake._task_group = tg
+        msg = SimpleNamespace(text="Is this real?")
+        await run(fake, msg)  # installs on_text_hook as a side effect
+        for t in tg.tasks:
+            t.cancel()
+        for t in tg.tasks:
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+    # Arm a fresh (unexpired) pending force directly, as the delayed check
+    # would once it engages.
+    fake.server._e2_force[fake.slot_idx] = time.monotonic() + 10.0
+    hook = fake.server.runner.lm_gen.on_text_hook
+
+    # The model fires natively while the force is still pending.
+    tok = _FakeTensor([RAG_ID])
+    hook(tok)
+    assert tok._values[0] == RAG_ID  # already a ret — must not be touched
+    assert fake.slot_idx not in fake.server._e2_force  # pending entry cleared
+    assert fake.server._e2_native_fired.get(fake.slot_idx) is True
+
+    # The next padding frame must NOT be rewritten — no duplicate ret.
+    tok = _FakeTensor([3])
+    hook(tok)
+    assert tok._values[0] == 3
+
+
 def test_ttl_env_respected(monkeypatch):
     monkeypatch.setenv("MOSHI_BACKSTOP_FORCE", "1")
     monkeypatch.setenv("MOSHI_BACKSTOP_DELAY", "0.01")

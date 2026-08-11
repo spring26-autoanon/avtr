@@ -90,11 +90,19 @@ REPLACEMENT = ANCHOR + '''
                             # word tokens (and specials 0/1/2) pass through
                             # untouched while a force is pending, so a
                             # forced ret always lands in silence, never
-                            # mid-word.
+                            # mid-word. If the model fires NATIVELY while a
+                            # force is still pending, the pending entry is
+                            # cleared (no rewrite needed — it's already a
+                            # ret) and the native flag is set directly, so
+                            # the backstop never lands a duplicate ret on the
+                            # next padding frame.
                             for _slot in list(_p.keys()):
                                 _deadline = _p[_slot]
                                 if _t.monotonic() >= _deadline:
                                     del _p[_slot]
+                                elif int(text_token[_slot].item()) == _r:
+                                    del _p[_slot]
+                                    _n[_slot] = True
                                 elif int(text_token[_slot].item()) == 3:
                                     text_token[_slot] = _r
                                     del _p[_slot]
