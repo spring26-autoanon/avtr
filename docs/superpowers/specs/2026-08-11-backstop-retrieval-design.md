@@ -129,3 +129,15 @@ Channel-level, single file, env-gated (`MOSHI_BACKSTOP=1`):
   backups in versioned scripts.
 - Contention lesson stands: all verdict sessions on a quiet box, no training
   running during E-sessions.
+
+## Outcomes (2026-08-11)
+
+E1 verdict: TOKEN-GATED and destabilizing — silent injection closed. E2 verdict: PROVEN
+(forced single ret at boundary; note must land before the answer forms — delay 0.8s on a
+fast checkpoint). Winning mechanism shipped as e2_forced_ret v4.1 (native timestamps with
+8s lookback, 6s refractory, exact forced/native attribution logging). Locked composite:
+4c2-400 @ scaling 2.0, stt-wait 0.5, delay 0.8. Success criteria: grounding ~85% first-ask
+(re-homed to 400; 700-class rungs delivery-limited beyond rescue), non-interference PASS,
+declines PARTIAL (confabulate-then-disclaim; sentinel untested), latency PASS. Training-run
+branch selected: fire-rate + contradiction + statement-response data; ambient-reference
+clips unnecessary. Full evidence: serving_exp/results.md.

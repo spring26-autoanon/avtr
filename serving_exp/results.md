@@ -15,3 +15,19 @@
 
 **E2 VERDICT: PROVEN. Believed-ask restores note-reading and delivery on a healthy checkpoint when the note beats the answer (delay ~0.8s at 4c2-400). Composite system = healthy checkpoint + forced-fire backstop + short delay -> guaranteed grounded answers in her voice. 700 remains delivery-limited regardless (stall pathology, not gating). Polish items: backstop refractory window, first-ask race tuning, statement-gate already holds.**
 | 2026-08-11 | E3-A | 4b-300 | 2.0 | 0.5 (delay 1.5) | e2_forced_ret v3 | 2 native (1 mid-question) | ~6 | mostly grounded | Non-interference QUALIFIED PASS: natives fire and complete (Florida 0.14s post-question, clean). BUG: mid-question native erased by flag-reset-at-arming -> duplicate force. Rescue works on 4b (library->Director). Late-session screech again (~9 injections/2min — cumulative-swap hypothesis). | replay/auditions/logs/2026-08-11_E3_4b-300.log |
+| 2026-08-11 | E3-B v4.1 | 4b-300 | 2.0 | 2.0 (delay 1.5) | e2 v4.1 | 2 native, NO dups | several | mixed | v4.1 FIELD-CONFIRMED: mid-question natives not duplicated; attribution lines in log. Session content poisoned by opening hallucination ("Ruri" woodcarver) -> context cascade. | 2026-08-11_E3_4b-300_v41_ruri.log |
+| 2026-08-11 | LOCK | 4c2-400 | 2.0 | 0.5 (delay 0.8) | e2 v4.1 | 4 native | 4 forced | ~7/8 grounded | Final session: natives+forced interleave cleanly, she asks questions back, all persona+factual grounded. E4: Bitcoin decline HALF-FLATTENED (confabulated number + disclaimer). Statements get no reply (backstop is ?-gated; 400's statement reflex thin). Voice session-variable. Opening hallucinations correlate with backstopped first exchange (Ruri/Borges) -> protocol: open with a statement. | 2026-08-11_LOCK_4c2-400_v41_final.log |
+
+## SYNTHESIS (program complete, 2026-08-11 ~05:40 UTC)
+
+**Mechanism verdicts:** E0 (session-start synthetic ask) = destabilizing, closed. E1 (unsolicited injection) = ignored AND harmful, closed. **E2 (believed-ask backstop) = PROVEN** — a forced single ret at the boundary, landing its note before the answer forms, yields grounded answers in the model's own delivery.
+
+**LOCKED COMPOSITE CONFIG:** 4c2-400, MOSHI_LORA_SCALING=2.0, MOSHI_LORA_RANK=64, stt-wait 0.5, MOSHI_BACKSTOP_FORCE=1, MOSHI_BACKSTOP_DELAY=0.8, patch e2_forced_ret v4.1 (LOOKBACK 8.0, REFRACTORY 6.0).
+
+**Success criteria:** (1) >=90% grounding: re-homed from 700 (delivery-pathology, unrescuable) to 400: ~80-85% first-ask, ~100% with one re-ask — NEAR PASS. (2) Non-interference: PASS (v4.1: natives clean, zero duplicates, exact attribution). (3) Declines: PARTIAL — confabulate-then-disclaim; sentinel mitigation designed, untested. (4) Backstopped-note latency ~1.6s post-question — PASS.
+
+**Operating protocol (hard-won):** open with a STATEMENT not a question (backstopped first exchanges hallucinate: Ruri/Borges); question is the last thing you say; keep the ball moving (statements get no reply); short sessions; reconnect on a weird opening or flat voice roll; encoder-safe pkill only.
+
+**Checkpoint law (confirmed across 6 rungs + 4b):** the backstop guarantees knowledge, never speech — it amplifies delivery-healthy checkpoints (400, 4b-300) and cannot rescue stall-pathology rungs (500/600/700/800). Checkpoint choice owns voice and delivery; the backstop owns grounding.
+
+**The one remaining training run** (recommendation, evidence-based): rank 64, 4c recipe, targets = (a) fire-rate via synthetic question-variety (many voices/phrasings per answer), (b) contradiction clips (reference disagrees with memorized answer) to keep asking valuable through crystallization, (c) casual statement-response dialogue for conversational carry. Success metrics: backstop engagement rate driven down on the LOCK protocol; statement-responsiveness; ambient-reference clips NOT required (E2 works without them).
