@@ -8,3 +8,4 @@
 | 2026-08-11 | E1 s3 | 4c2-400 | 2.0 | 0.5 | e1_silent_backstop | 0 | 1 | 0/1 | HEALTHY checkpoint destabilized: deflect -> 11s silence -> screech after unsolicited injection. | replay/auditions/logs/2026-08-11_E1_4c2-400_destabilized.log |
 
 **E1 VERDICT: TOKEN-GATED, and stronger — unsolicited injection is actively destabilizing (stalls/screech on both a stall-prone and a healthy checkpoint). Silent backstop not viable. E2 (forced single ret at boundary) is required and decisive.**
+| 2026-08-11 | E2 s1 | 4c2-700 | 2.0 | 2.0 | e2_forced_ret (v1) | 0 | 4 armed, 0 consumed | 0/4 | FIELD DEFECT: TTL 2.0s expired before any word token (deep-rung words come 4+s late or never); consume-on-word deadlocks on stalls. Redesign: consume-on-pad. | replay/auditions/logs/2026-08-11_E2_4c2-700_s1.log |
