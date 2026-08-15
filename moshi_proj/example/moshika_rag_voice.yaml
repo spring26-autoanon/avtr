@@ -1,8 +1,6 @@
 # LoRA voice/personality fine-tune targeting the moshi-rag base checkpoint.
 # Run from the repo root on the A100 box:
 #   uv run torchrun --nproc-per-node 1 -m train example/moshika_rag_voice.yaml
-#
-# See CLAUDE.md for the full workflow (data prep, smoke test, packaging).
 
 # ---- data ----
 data:

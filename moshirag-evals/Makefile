@@ -38,7 +38,7 @@ ssh:
 	$(GCLOUD_SSH)
 
 # Run a command on the remote instance, e.g.:  make remote CMD="nvidia-smi"
-# If CMD is `uv run ...`, pass --all-extras (see CLAUDE.md) or gpu-extra
+# If CMD is `uv run ...`, pass --all-extras or gpu-extra
 # packages like transformers/torch won't be checked/protected by uv's sync.
 remote:
 	$(GCLOUD_SSH) -- "$(REMOTE_INIT) && cd $(REMOTE_DIR) && $(CMD)"
@@ -62,7 +62,6 @@ demo:
 pull-sessions:
 	rsync -avz $(SSH_ALIAS):$(REMOTE_DIR)/demo/sessions/ "$(LOCAL_DIR)/demo/sessions/"
 
-# Pull eval results back (see CLAUDE.md's "Code change workflow").
 pull-results:
 	rsync -avz $(SSH_ALIAS):$(REMOTE_DIR)/evals/results/ "$(LOCAL_DIR)/evals/results/"
 

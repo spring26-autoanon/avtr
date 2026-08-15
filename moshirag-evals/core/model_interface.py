@@ -51,9 +51,9 @@ _TAIL_SILENCE_STEPS = 25
 # DEMO_CONFIG for _patch_load_models_generation_overrides() to apply via
 # monkeypatch. Defaults below (0.7/25) match LMGen's own hardcoded values
 # exactly, so adding these two fields changes nothing until a config
-# explicitly overrides them — see CLAUDE.md's pad-token-sampling-drift
-# investigation ("Real root cause of demo response lag") for why these two
-# are the ones worth exposing: sample_token() (moshi/utils/sampling.py) is
+# explicitly overrides them — pad-token-sampling-drift investigation
+# findings on why these two are the ones worth exposing: sample_token()
+# (moshi/utils/sampling.py) is
 # plain temp/top-k/top-p multinomial sampling on text_logits with no
 # repetition penalty or anti-pad bias of any kind, and temp_text/top_k_text
 # are the only knobs that reach it — cfg_coef also reaches text_logits (see
@@ -65,10 +65,9 @@ _DEFAULT_GENERATION = {
     "cfg_coef": 1.0,
     "stt_wait_time": 0.5,
     # Was 2.0 — raised to match scripts/run_demo.sh's own fix: real
-    # Gemini round-trip latency was directly observed at ~2.5-3s (see
-    # CLAUDE.md's Phase 0 prodcheck findings), reliably longer than a 2.0s
-    # budget. Same underlying defect, same fix, applied here too rather
-    # than leaving evals exposed to it.
+    # Gemini round-trip latency was directly observed at ~2.5-3s, reliably
+    # longer than a 2.0s budget. Same underlying defect, same fix, applied
+    # here too rather than leaving evals exposed to it.
     "rag_timeout": 8.0,
     "max_reference_tokens": 64,
     "vad_window_size": 4,
@@ -255,8 +254,7 @@ async def _fetch_and_apply_reference_conditioning(
     Channel patch (demo), so there's one implementation, not two that could
     drift.
 
-    Why this exists — see CLAUDE.md's "SUPERSEDED: GPU contention conclusion
-    was wrong" section for the full evidence chain: a real dual-GPU test
+    Why this exists — full evidence chain: a real dual-GPU test
     proved the ~1.5-1.9s conditioning latency is NOT GPU compute contention
     (the conditioner's own GPU sat ~0% utilized throughout). Root cause,
     confirmed by reading moshi-rag's real `server.py` source: `ServerState.
@@ -289,7 +287,7 @@ async def _fetch_and_apply_reference_conditioning(
     loop). `update_streaming_sum_tensors` stays on the calling (main)
     thread, unchanged from upstream — confirmed cheap (~1ms: eval JSON's
     `context_injection_values` matched the HTTP-only "Received response"
-    log timings to the millisecond, see CLAUDE.md), and it's the one piece
+    log timings to the millisecond), and it's the one piece
     of this that touches live, shared model state, so there's no
     correctness reason to move it off-thread too.
     """
@@ -316,9 +314,8 @@ def _patch_load_models_generation_overrides(temp_text: float, top_k_text: int) -
     load_models(), moshi/inference_utils/utils.py) sample text tokens with
     temp_text/top_k_text from our own config instead of LMGen's hardcoded
     defaults (0.7/25) — see _DEFAULT_GENERATION's entries for these two
-    fields, and CLAUDE.md's "Real root cause of demo response lag" section
-    for why they're the one real lever onto the pad-token-sampling drift
-    (sample_token() applies temp/top-k directly to text_logits, with no
+    fields for why they're the one real lever onto the pad-token-sampling
+    drift (sample_token() applies temp/top-k directly to text_logits, with no
     repetition penalty or anti-pad bias anywhere else in the pipeline).
 
     Patches the module-local name moshi.inference_utils.utils.LMGen — same
@@ -493,8 +490,7 @@ def _maybe_enable_eval_asyncio_debug(loop: "asyncio.AbstractEventLoop") -> None:
     make smoke/gpu_diag_contended.sh-style runs (already fully scripted,
     no live conversation needed) check whether the LocalSpeechToText-off-
     thread fix behaves as expected on real hardware before spending a live
-    demo round trip on it — see CLAUDE.md's "SUPERSEDED: GPU contention
-    conclusion was wrong" section. Eval's own feed loop calls
+    demo round trip on it. Eval's own feed loop calls
     LocalSpeechToText.send_audio() too (InferenceJob's feed loop, the same
     method demo's Channel._recv_loop calls), so this exercises the same
     patched code path — under eval's self-paced (not network-paced) audio
@@ -1094,15 +1090,14 @@ class MoshiRAGAdapter(ModelInterface):
         real-checkpoint tests. This was originally kept opt-in pending a
         "permanent fix" and a scoped spec update — see
         specs/moshirag-evals-requirements.md's "Architecture: Target
-        moshi-rag's Production Server" section and CLAUDE.md's Phase 0/1
-        findings: the broader pivot to targeting
-        moshi-rag's real production architecture (which has never used
-        in-process conditioning for *any* path, not just respond()) makes
-        "always separate-process" the actual permanent fix rather than a
-        workaround pending one. respond_stream() (the demo) was separately
+        moshi-rag's Production Server" section: the broader pivot to
+        targeting moshi-rag's real production architecture (which has never
+        used in-process conditioning for *any* path, not just respond())
+        makes "always separate-process" the actual permanent fix rather than
+        a workaround pending one. respond_stream() (the demo) was separately
         confirmed to never have had this bug even when in-process
         conditioning still existed as an option — moot now since the demo no
-        longer runs through MoshiRAGAdapter at all (see CLAUDE.md).
+        longer runs through MoshiRAGAdapter at all.
 
     Retrieval:
       - If retrieval_backend is NullBackend or None: moshi-rag's RAG path is
@@ -1387,7 +1382,7 @@ class MoshiRAGAdapter(ModelInterface):
 
         Background: two specific recordings in OpenAudioBench (WebQ/LlamaQ)
         reliably reproduce this on every call — confirmed via a dedicated
-        diagnostic (see CLAUDE.md) that ruled out sample rate/resampling and
+        diagnostic that ruled out sample rate/resampling and
         loudness/gain as causes across controlled real-checkpoint runs; the
         model itself enters a genuine zero-engagement state for the whole
         turn (never a single non-pad token), not a pipeline artifact we can

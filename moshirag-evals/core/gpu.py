@@ -19,10 +19,9 @@ from dataclasses import dataclass
 # Front-end's own main model always claims physical GPU 0; the conditioner
 # claims GPU 1 only if a second one is actually visible. Fixed and
 # role-based, not negotiated between processes -- the eval path's two
-# processes are launched independently, from two separate terminals (see
-# CLAUDE.md's "Required setup: server_conditioner process"), with no shared
-# parent to coordinate a split at launch time. Each has to independently
-# arrive at the same answer from the same rule.
+# processes are launched independently, from two separate terminals, with no
+# shared parent to coordinate a split at launch time. Each has to
+# independently arrive at the same answer from the same rule.
 _FRONTEND_INDEX = "0"
 
 

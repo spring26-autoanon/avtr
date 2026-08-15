@@ -11,9 +11,8 @@ model:
     tail_silence_steps: 25
     # See configs/baseline_with_retrieval.yaml's matching comment —
     # unchanged from LMGen's own hardcoded defaults. The pad-token-sampling
-    # drift these two are a lever on (CLAUDE.md's "Real root cause of demo
-    # response lag") is confirmed present even without retrieval, so this
-    # config gets the same knobs.
+    # drift these two are a lever on is confirmed present even without
+    # retrieval, so this config gets the same knobs.
     temp_text: 0.7
     top_k_text: 25
   retrieval:

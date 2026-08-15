@@ -175,7 +175,7 @@ def test_run_resumes_without_recalling_model_for_done_items():
 
 
 # ── degenerate_silence flagging ──────────────────────────────────────────────
-# See MoshiRAGAdapter.respond()'s docstring / CLAUDE.md — an empty response
+# See MoshiRAGAdapter.respond()'s docstring — an empty response
 # with no <ret> is a distinct failure mode the eval must surface, not fold
 # silently into resp_verdict=incorrect.
 

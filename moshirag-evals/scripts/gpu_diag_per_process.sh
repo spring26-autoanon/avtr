@@ -7,8 +7,7 @@
 # its own, separate from the conditioner's own footprint, when both are
 # co-resident on the same GPU (today's only deployment). The ~66-69GB
 # combined figure on record is from the demo path's batch_size=16 default,
-# not this one — see CLAUDE.md's GPU-contention section for why that
-# distinction matters here.
+# not this one — that distinction matters here.
 #
 # Polls `nvidia-smi --query-compute-apps` (per-process memory, not just
 # total GPU memory) at ~0.5s resolution and reports peak usage per process

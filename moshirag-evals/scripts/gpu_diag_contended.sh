@@ -30,11 +30,9 @@
 # confirmed against moshi-rag's own source: `ServerState._step_loop` runs
 # the real per-step model computation synchronously inside an `async def`,
 # blocking the event loop and starving this exact conditioning HTTP call —
-# not GPU contention, and not something GPU topology can fix. See
-# CLAUDE.md's "SUPERSEDED: GPU contention conclusion was wrong" section for
-# the full evidence and the fix (core/model_interface.py's
-# _fetch_and_apply_reference_conditioning, applied on both the eval and
-# demo paths). If rerunning this pair after that fix, expect
+# not GPU contention, and not something GPU topology can fix. The fix is in
+# core/model_interface.py's _fetch_and_apply_reference_conditioning,
+# applied on both the eval and demo paths. If rerunning this pair after that fix, expect
 # context_injection_s to land close to the solo baseline regardless of
 # whether the conditioner shares a GPU with the front-end or not — the fix
 # targets the event-loop starvation directly, not GPU placement.
@@ -46,8 +44,7 @@
 # diagnostic as the demo path's DEMO_ASYNCIO_DEBUG (see
 # core/model_interface.py's _maybe_enable_eval_asyncio_debug() and
 # scripts/instrumented_server.py's _patch_event_loop_diagnostics()), useful
-# for checking the LocalSpeechToText-off-thread fix (CLAUDE.md's
-# "SUPERSEDED: GPU contention conclusion was wrong" section) on real
+# for checking the LocalSpeechToText-off-thread fix on real
 # hardware without a live demo conversation. Off by default; adds real
 # per-callback overhead, don't leave it on for normal runs.
 #   EVAL_ASYNCIO_DEBUG=1 bash scripts/gpu_diag_contended.sh

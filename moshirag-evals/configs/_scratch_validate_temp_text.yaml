@@ -17,9 +17,7 @@
 # (0.7 -> 0.8, a smaller step) -- see that file for the follow-up. This file
 # is kept as the record of what was tried and why it wasn't taken further.
 #
-# First real-hardware test of the pad-token-sampling-drift lever (see
-# CLAUDE.md's "Real root cause of demo response lag" and the
-# project_pad_token_sampling_investigation memory): temp_text raised from
+# First real-hardware test of the pad-token-sampling-drift lever: temp_text raised from
 # baseline_with_retrieval_moshi_style.yaml's default of 0.7 -> 1.0
 # (the "neutral" point -- removes the checkpoint's default extra sharpening
 # of the raw logits, rather than an arbitrary guess). top_k_text

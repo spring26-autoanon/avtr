@@ -78,8 +78,7 @@ export const useServerAudio = ({setGetAudioStats, setGetAudioDiagLog, setGetSock
     delay: 0,
     minDelay: 0,
     maxDelay: 0,});
-  // Jitter-buffer diagnostic (see project_demo_audio_quality_investigation
-  // memory / CLAUDE.md "Running the demo" section): socketOpenRef anchors
+  // Jitter-buffer diagnostic: socketOpenRef anchors
   // t_rel_s for cross-referencing against server.log/raw_events.jsonl's own
   // t_rel_s; diagLogRef accumulates one sample per worklet message
   // (~every 80ms during active playback). Capped defensively — a demo

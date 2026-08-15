@@ -25,10 +25,8 @@
 # didn't**: gpu_diag_contended.sh's context_injection_s came back
 # statistically unchanged from the original single-A100 figure (~1.5-1.9s)
 # even with the conditioner genuinely isolated on GPU 1, confirmed idle via
-# nvidia-smi throughout. See CLAUDE.md's "SUPERSEDED: GPU contention
-# conclusion was wrong" section for the full evidence and the real root
-# cause (moshi-rag's own real-time step loop blocking the event loop, not
-# GPU sharing) — since fixed, see that same section's follow-up. This pair
+# nvidia-smi throughout. Real root cause: moshi-rag's own real-time step
+# loop blocking the event loop, not GPU sharing — since fixed. This pair
 # stays useful as a real diagnostic tool (e.g. a regression check that the
 # fix stays fixed), just not as a way to prove GPU topology matters — it
 # doesn't. To force both processes back onto one GPU deliberately (e.g. to

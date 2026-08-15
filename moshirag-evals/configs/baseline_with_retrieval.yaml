@@ -12,8 +12,7 @@ model:
     # Both unchanged from LMGen's own hardcoded defaults (real checkpoint's
     # config.json has no lm_gen_config override, confirmed directly) —
     # left explicit here now that they're config-adjustable, rather than
-    # only living in core/model_interface.py's _DEFAULT_GENERATION. See
-    # CLAUDE.md's "Real root cause of demo response lag" section: these are
+    # only living in core/model_interface.py's _DEFAULT_GENERATION. These are
     # the one confirmed lever onto the pad-token-sampling drift (temp/top-k
     # applied directly to text_logits, the only place in the whole pipeline
     # that reaches it — cfg_coef also reaches text_logits but can't be used

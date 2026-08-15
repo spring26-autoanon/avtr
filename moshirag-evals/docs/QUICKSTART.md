@@ -1,14 +1,12 @@
 # Quick start
 
-Command reference for running this repo. For first-time VM setup (SSH/IAP alias, `uv`
-install, `.env`, checkpoint download), see `CLAUDE.md`'s "First-time setup on the VM"
-section — this page assumes that's already done.
+Command reference for running this repo. Assumes first-time VM setup (SSH/IAP alias, `uv`
+install, `.env`, checkpoint download) is already done.
 
 ## Requirements & setup
 
 GPU work (model loading, evals, demo) runs on a remote GCP VM, not locally — there is no
-native macOS/local execution path. See `CLAUDE.md`'s "Environment" and "Remote instances"
-sections for connection details and dependency installation:
+native macOS/local execution path:
 
 ```bash
 uv sync --all-extras
@@ -30,9 +28,8 @@ uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yam
 uv run --all-extras evals/runner.py --config configs/baseline_with_retrieval.yaml --mode full
 ```
 
-Requires a running `server_conditioner` process — see `CLAUDE.md`'s "Required setup:
-`server_conditioner` process" section. Full mode/config details, `--compare`, and
-`--spot-check` are in `CLAUDE.md`'s "Running evals" section.
+Requires a running `server_conditioner` process. See `evals/runner.py --help` for full
+mode/config details, `--compare`, and `--spot-check`.
 
 ## Running the demo
 
@@ -48,8 +45,8 @@ ssh -L 8998:localhost:8998 wb-gpu-a1ultra
 ```
 
 Then open **http://localhost:8998** (`localhost` is a secure context, so microphone access
-works without TLS). See `CLAUDE.md`'s "Running the demo" section for `--stt`/`--rag-timeout`
-flags, session log locations, and `scripts/summarize_demo_session.py`.
+works without TLS). See `scripts/run_demo.sh` for `--stt`/`--rag-timeout` flags, session log
+locations, and `scripts/summarize_demo_session.py`.
 
 ## Tests
 

@@ -5,8 +5,8 @@ backends:
   # with no quality/grounding regression once tested against a healthy
   # conditioner process (an earlier apparent regression — silently ungrounded
   # answers alongside a reference-encoder ConnectError — was root-caused to a
-  # degraded/dead long-running conditioner unrelated to this backend; see
-  # CLAUDE.md's reference-encoder ConnectError note). Previously listed as
+  # degraded/dead long-running conditioner unrelated to this backend).
+  # Previously listed as
   # "validated, not yet promoted" — promoted now specifically so retrieval
   # latency stops being a plausible explanation for demo dead-air, forcing
   # any remaining gap to be root-caused to something else. Retrieval only:

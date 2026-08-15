@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Count the growing "LM buffer empty" pad-token stall documented in
-project_pad_token_sampling_investigation memory / CLAUDE.md's "Real root
-cause of demo response lag" section — automates what every session in that
-investigation so far has done by hand: counting consecutive occurrences of
-moshi-rag's own
+Count the growing "LM buffer empty" pad-token stall documented in the
+pad-token-sampling-drift investigation — automates what every session in
+that investigation so far has done by hand: counting consecutive
+occurrences of moshi-rag's own
 
     [VAD] User stopped speaking but LM buffer empty, remaining in user turn
 
@@ -41,7 +40,7 @@ to model", case-insensitive) — confirmed verbatim against a real
 server.log on wb-gpu-a1ultra (2026-07-29T18-08-14Z session); an earlier
 version of this script guessed "switch to model" (present tense, unverified
 — this project's own source tree doesn't vendor moshi-rag, torch/moshi are
-VM-only per CLAUDE.md's `--all-extras` section) and matched nothing at all
+VM-only per the `--all-extras` install) and matched nothing at all
 on that real log. If a future moshi-rag version changes this wording again,
 a session reporting zero events despite having real turns is the signal to
 recheck it.

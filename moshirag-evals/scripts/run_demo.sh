@@ -39,10 +39,10 @@
 #   --rag-timeout Explicit override for the retrieval-LLM timeout, layered
 #                 on top of whatever --config's model.generation.rag_timeout
 #                 produced (default: unset, config value wins). moshi.server's
-#                 own hardcoded default is 1.5s, which CLAUDE.md's Phase 0
-#                 prodcheck investigation confirmed is shorter than real
-#                 Gemini round-trip latency (observed 2.5-3s) — see
-#                 CLAUDE.md's retrieval-latency notes before lowering this.
+#                 own hardcoded default is 1.5s, which a prodcheck
+#                 investigation confirmed is shorter than real
+#                 Gemini round-trip latency (observed 2.5-3s) — worth
+#                 keeping in mind before lowering this.
 #   --batch-size  moshi.server's reserved conversation slots (default: 1,
 #                 overriding moshi's own default of 16). Unused slots are not
 #                 free -- BatchRunner.run_step() computes the full batch
@@ -55,9 +55,9 @@
 #   --conditioner-only  Launch only server_conditioner (port 8001), skip
 #                 moshi.server entirely. For pointing evals/runner.py at a
 #                 real conditioner without also loading the full model a
-#                 second time (MoshiRAGAdapter loads its own copy) — see
-#                 CLAUDE.md's Phase 2 "mandatory separate-process
-#                 conditioning" section. Also sidesteps having to hand-type
+#                 second time (MoshiRAGAdapter loads its own copy) — part of
+#                 the mandatory separate-process conditioning requirement.
+#                 Also sidesteps having to hand-type
 #                 a long server_conditioner invocation into a terminal that
 #                 hard-wraps long pasted lines (confirmed to corrupt
 #                 multi-line commands on at least one real VM session).
@@ -70,9 +70,7 @@
 #                                      DEMO_ASYNCIO_DEBUG_THRESHOLD_S (default
 #                                      0.02s) with a repr identifying it. See
 #                                      scripts/instrumented_server.py's
-#                                      _patch_event_loop_diagnostics() and
-#                                      CLAUDE.md's "SUPERSEDED: GPU contention
-#                                      conclusion was wrong" section for why
+#                                      _patch_event_loop_diagnostics() for why
 #                                      this exists. Adds real per-callback
 #                                      overhead — don't leave this on for
 #                                      normal use.
@@ -207,9 +205,8 @@ if [[ "$CONDITIONER_ONLY" == "1" ]]; then
     # server process down), that scrollback was gone with it, along with any
     # crash traceback that would have explained why the conditioner stopped
     # responding. A conditioner crash mid-eval-run is exactly the kind of
-    # unattended failure this project's evals are most exposed to (see
-    # CLAUDE.md's reference-encoder ConnectError notes) — worth a durable log
-    # regardless of how rarely it fires.
+    # unattended failure this project's evals are most exposed to — worth a
+    # durable log regardless of how rarely it fires.
     CONDITIONER_ONLY_SESSION_ID=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
     CONDITIONER_ONLY_SESSION_DIR="$PROJECT_DIR/demo/sessions/$CONDITIONER_ONLY_SESSION_ID"
     mkdir -p "$CONDITIONER_ONLY_SESSION_DIR"
@@ -283,7 +280,7 @@ SERVER_CMD="$ENV_PREFIX CUDA_VISIBLE_DEVICES=$FRONTEND_CUDA_VISIBLE_DEVICES DEMO
 # This is not hypothetical: it is the confirmed mechanism behind the 2026-07-29
 # A/B mistake where two sessions believed to be testing STT_OFF_THREAD=0 in
 # fact ran with the off-thread chain enabled, costing a real VM round trip
-# (see CLAUDE.md's "Update (2026-07-29) — default flipped to disabled").
+# (the default was flipped to disabled as a result).
 # DEMO_ASYNCIO_DEBUG was already handled this way and worked, which is exactly
 # why it was the one diagnostic that never mysteriously failed to fire.
 #
@@ -341,8 +338,7 @@ fi
 # Informational, not a warning about data validity. The original text here
 # told the operator "do not trust retrieval-latency or grounding-dependent
 # behavior from this session" on the strength of the GPU-contention finding —
-# a conclusion CLAUDE.md's own "SUPERSEDED: GPU contention conclusion was
-# wrong" section later disproved on real dual-GPU hardware (true physical
+# a conclusion later disproved on real dual-GPU hardware (true physical
 # separation measured 1.686s vs single-GPU's 1.58s, i.e. no improvement; the
 # real cause was event-loop starvation, fixed in
 # _fetch_and_apply_reference_conditioning). Leaving that text in place was
@@ -355,8 +351,7 @@ if [[ "$GPU_CONTENDED" == "1" ]]; then
     echo ""
     echo "ⓘ single-GPU mode: conditioner and front-end share one physical GPU."
     echo "  This is fine for latency -- the old \"GPU contention\" finding was"
-    echo "  disproved (see CLAUDE.md's \"SUPERSEDED: GPU contention conclusion"
-    echo "  was wrong\"); conditioning is ~0.2-0.6s here. The real single-GPU"
+    echo "  disproved; conditioning is ~0.2-0.6s here. The real single-GPU"
     echo "  constraint is VRAM: front-end + conditioner reach ~66-69GB of 80GB"
     echo "  at --batch-size 16, so do not also start an eval against this"
     echo "  conditioner, and drop --batch-size if you hit OOM."
@@ -381,7 +376,7 @@ echo "  turns.jsonl, raw_events.jsonl, conditioner.log and server.log persist"
 echo "  there regardless of tmux's lifecycle (plus step_diag.jsonl when"
 echo "  DEMO_QUEUE_DIAG=1). Review with:"
 echo ""
-# --all-extras per CLAUDE.md's uv rule for the VM: a plain `uv run` only
+# --all-extras is required on the VM: a plain `uv run` only
 # reconciles the base dependency group and can leave gpu-extra packages
 # silently drifted.
 echo "  uv run --all-extras scripts/summarize_demo_session.py $SESSION_DIR"

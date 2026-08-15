@@ -3,7 +3,7 @@
 # `backend: gemini_api_moshi_style` as its own default on the same date (see
 # that file's comment for why). Kept rather than deleted so existing
 # `--config configs/baseline_with_retrieval_moshi_style.yaml` invocations —
-# in shell history, notes, and CLAUDE.md examples — keep working and keep
+# in shell history and notes — keep working and keep
 # meaning what they meant. Prefer the plain baseline config for new work;
 # this one should be retired once nothing references it.
 model:
@@ -19,8 +19,7 @@ model:
     tail_silence_steps: 25
     # See configs/baseline_with_retrieval.yaml's matching comment — unchanged
     # from LMGen's own hardcoded defaults, now config-adjustable for the
-    # pad-token-sampling-drift investigation (CLAUDE.md's "Real root cause
-    # of demo response lag").
+    # pad-token-sampling-drift investigation.
     temp_text: 0.7
     top_k_text: 25
   retrieval:

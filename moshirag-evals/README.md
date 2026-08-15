@@ -2,7 +2,7 @@
 
 Evaluation harness for [kyutai-labs/moshi-rag](https://github.com/kyutai-labs/moshi-rag) — measures answer quality and latency of the retrieval-augmented voice model against benchmark question sets (LlamaQ, WebQ, and others), plus a live demo stack for manual testing.
 
-Full requirements/spec: [`specs/moshirag-evals-requirements.md`](specs/moshirag-evals-requirements.md) — the authoritative source of truth for this project; `CLAUDE.md` is engineering/session notes, not spec. Setup and run commands are in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
+Full requirements/spec: [`specs/moshirag-evals-requirements.md`](specs/moshirag-evals-requirements.md) — the authoritative source of truth for this project. Setup and run commands are in [`docs/QUICKSTART.md`](docs/QUICKSTART.md).
 
 ## How MoshiRAG works
 
@@ -38,7 +38,7 @@ GPT-Realtime and Gemini Live are stronger general reasoners and someone else kee
 
 ## Status
 
-Actively developed. See `CLAUDE.md`'s dated sections for the current investigation thread and what's confirmed vs. still open on the VM. Most recent completed arc: a turn-onset delay and a metallic audio artifact were both root-caused to self-inflicted regressions and an upstream defect (see above), fixed and VM-validated across six live sessions — see [`docs/demo-turn-onset-regression.md`](docs/demo-turn-onset-regression.md) and [`docs/demo-turn-onset-fix-plan.md`](docs/demo-turn-onset-fix-plan.md).
+Actively developed. Most recent completed arc: a turn-onset delay and a metallic audio artifact were both root-caused to self-inflicted regressions and an upstream defect (see above), fixed and VM-validated across six live sessions.
 
 `.env`, model checkpoints, eval results, and demo/session recordings are gitignored — this repo is code and config only.
 
@@ -53,7 +53,7 @@ Actively developed. See `CLAUDE.md`'s dated sections for the current investigati
 | `scripts/` | VM setup, demo launch, diagnostic tooling |
 | `tests/` | Unit tests (no GPU required) |
 | `specs/` | Authoritative requirements doc |
-| `docs/` | Standalone investigation reports and work plans, referenced from `CLAUDE.md` |
+| `docs/` | Standalone investigation reports and work plans |
 
 ## Quick start
 

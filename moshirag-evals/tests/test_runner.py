@@ -718,7 +718,7 @@ def test_run_evals_resumes_completed_evals(tmp_path, capsys):
 
 
 # ── _print_eval_result degenerate-silence warning ────────────────────────────
-# See MoshiRAGAdapter.respond()'s docstring / CLAUDE.md — surfacing this
+# See MoshiRAGAdapter.respond()'s docstring — surfacing this
 # metadata key is reusable across any eval that populates it, not just
 # knowledge.open_audio_bench/halu_eval_audio.
 

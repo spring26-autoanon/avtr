@@ -899,8 +899,7 @@ def _patch_server_state_step_pacing() -> None:
 
     Supporting correction: the client-side jitter-buffer overrun cited
     below as the motivation was measured with the *first, later-corrected*
-    version of the liveBufferS field (CLAUDE.md records that correction
-    itself). The corrected field reads 0ms for 99.3% of samples — recorded
+    version of the liveBufferS field. The corrected field reads 0ms for 99.3% of samples — recorded
     at the time as "genuinely healthy", but a playback buffer pinned at
     zero is a *starved* client, i.e. the opposite condition. The evidence
     that justified this patch has since been invalidated.
@@ -939,9 +938,7 @@ def _patch_server_state_step_pacing() -> None:
     ~50-95ms steps), the server ships audio strictly faster than
     real-time, continuously, with nothing downstream to throttle it back
     down. This is the confirmed mechanism behind the demo's chronic
-    client-side jitter-buffer overrun (see
-    project_demo_audio_quality_investigation memory / CLAUDE.md's "Demo
-    audio quality" section) — a genuine average-rate mismatch, not
+    client-side jitter-buffer overrun — a genuine average-rate mismatch, not
     ordinary jitter, which the client's own buffer can absorb but never
     stabilize against.
 
@@ -1397,8 +1394,7 @@ def _patch_channel_conditioning() -> None:
 def _patch_event_loop_diagnostics() -> None:
     """
     Opt-in-only (DEMO_ASYNCIO_DEBUG=1) diagnostic for the conditioning-fetch
-    residual-latency investigation (CLAUDE.md's "SUPERSEDED: GPU contention
-    conclusion was wrong" section): a real demo session measured the
+    residual-latency investigation: a real demo session measured the
     post-fetch asyncio.to_thread handoff (loop.call_soon_threadsafe
     delivering the worker thread's already-finished result back to the
     awaiting coroutine) at 0.6-0.9s per trigger — ~6-9x the eval path's own

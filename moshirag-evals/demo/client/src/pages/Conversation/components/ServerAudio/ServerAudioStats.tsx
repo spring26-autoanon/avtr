@@ -19,8 +19,8 @@ type ServerAudioStatsProps = {
 /**
  * Downloads the accumulated jitter-buffer diagnostic (see useServerAudio.ts's
  * AudioDiagSample) as a JSON file, for manual placement alongside the
- * server-side session logs (demo/sessions/<id>/) — see CLAUDE.md's "Running
- * the demo" section for the analysis workflow this feeds.
+ * server-side session logs (demo/sessions/<id>/) that feed the same
+ * analysis workflow.
  */
 const downloadAudioDiagLog = (samples: AudioDiagSample[]) => {
   const blob = new Blob([JSON.stringify(samples, null, 2)], { type: "application/json" });

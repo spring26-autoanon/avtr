@@ -7,7 +7,7 @@
 # Outcomes:
 #   - loads + steps cleanly -> use example/moshika_rag_voice.yaml as-is for the real run.
 #   - fails building conditioners -> run scripts/strip_config.py and point config_path at
-#     the stripped copy (see CLAUDE.md step 2), then re-run this smoke test.
+#     the stripped copy, then re-run this smoke test.
 
 # ---- data ----
 data:

@@ -201,7 +201,7 @@ def test_stub_model_adapter_gpu_devices_defaults_to_none():
 # ── MoshiRAGAdapter.respond() degenerate-silence retry/flag ─────────────────
 # _respond_once() itself needs a real GPU/moshi environment — patched here to
 # fake single-call outcomes so respond()'s retry/flagging wrapper (see its
-# docstring — the WebQ/LlamaQ "zero engagement" investigation in CLAUDE.md)
+# docstring — the WebQ/LlamaQ "zero engagement" investigation)
 # is exercisable without one.
 
 
@@ -462,8 +462,7 @@ def test_patch_output_loop_handle_reference_fn_times_conditioning_call(monkeypat
 # ── _fetch_and_apply_reference_conditioning ─────────────────────────────────
 # See its own docstring in core/model_interface.py — the narrow fix for the
 # ~1.5-1.9s conditioning latency (moshi-rag's own step loop starving this
-# HTTP call's event-loop time, not GPU contention — see CLAUDE.md's
-# "SUPERSEDED: GPU contention conclusion was wrong"). moshi isn't installed
+# HTTP call's event-loop time, not GPU contention). moshi isn't installed
 # in this sandbox, so get_conditioning_remote_async's module is faked via
 # sys.modules injection — this still exercises the real per_slot/
 # update_streaming_sum_tensors logic, just not the real HTTP call itself.
@@ -536,8 +535,7 @@ def test_fetch_and_apply_reference_conditioning_runs_fetch_off_the_main_thread(m
 
 # ── _run_stt_frames_sync / _patched_stt_send_audio (LocalSpeechToText fix) ─────
 # See both functions' own docstrings in core/model_interface.py — the demo-
-# path residual-latency root cause (CLAUDE.md's "SUPERSEDED: GPU contention
-# conclusion was wrong"): LocalSpeechToText.send_audio ran real Mimi+STT-LM
+# path residual-latency root cause: LocalSpeechToText.send_audio ran real Mimi+STT-LM
 # compute fully synchronously inside an async def, blocking the shared event
 # loop for as long as a buffered-frame backlog took to drain. torch isn't
 # installed in this sandbox, so torch is faked via sys.modules injection for

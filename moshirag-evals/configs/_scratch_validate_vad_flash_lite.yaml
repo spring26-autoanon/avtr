@@ -5,7 +5,6 @@
 # was root-caused to a degraded/dead conditioner process from a long-running
 # session (confirmed: the tmux server itself had died), not to this
 # combination of settings — a fresh conditioner ran both backends cleanly.
-# See CLAUDE.md's reference-encoder ConnectError note for the full story.
 # judge.model and tts stay untouched — only vad_threshold and the retrieval
 # backend change from baseline_with_retrieval.yaml.
 model:
