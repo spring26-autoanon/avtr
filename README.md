@@ -36,6 +36,8 @@ preserve full-duplex interaction while adding retrieval.
     -   [Training and Evaluation](#-training-and-evaluation)
     -   [Experiments and Architecture
         Validation](#-experiments-and-architecture-validation)
+    -   [AVTR's Evaluation: Retrieval Probing and Demo
+        Harness](#-avtrs-evaluation-retrieval-probing-and-demo-harness)
     -   [Repository Components](#-repository-components)
 4.  [Future Work](#-future-work)
 5.  [Tools Utilized](#️-tools-utilized)
@@ -115,6 +117,19 @@ to the base conversational model.
     rank, sequence duration, learning rate, and evaluation cadence.
 -   **Architecture validation experiments** to determine where voice
     identity and turn-taking behavior are represented.
+
+## 🧭 Repository Layout
+
+AVTR spans two repositories, present here as subfolders:
+
+-   **[`moshi_proj/`](./moshi_proj)**: the fine-tuning system this
+    document covers below. File paths referenced from here on
+    (`train.py`, `scripts/prepare_stereo.py`, `finetune/...`) are
+    relative to this folder.
+-   **[`moshirag-evals/`](./moshirag-evals)**: the evaluation and
+    demo harness covered in [AVTR's
+    Evaluation](#-avtrs-evaluation-retrieval-probing-and-demo-harness)
+    below.
 
 # 🎢 Project
 
@@ -490,6 +505,50 @@ The proposed workflow is:
 This is intended to reduce the tradeoff between personalization and
 retrieval behavior.
 
+## 🔬 AVTR's Evaluation: Retrieval Probing and Demo Harness
+
+Path A depends on checking both sides of the tradeoff: voice fidelity
+and retrieval faithfulness. `moshirag-evals` is the harness built for
+that. It evaluates MoshiRAG's retrieval mechanism directly, independent
+of any specific voice adapter.
+
+MoshiRAG's retrieval runs inside the step loop, not in front of it. A
+`<ret>` token predicted by the model triggers a background retrieval
+call while generation continues. The retrieved reference is compressed
+and summed into the transformer's streaming input rather than inserted
+as context tokens, so retrieval never stalls the audio loop, the same
+property AVTR's own retrieval design depends on.
+
+### What It Measures
+
+-   **Knowledge evals**: TriviaQA/WebQ/LlamaQ, hallucination
+    detection, and an out-of-domain GSM8K check, using the MoshiRAG
+    paper's own benchmark suites.
+-   **Latency evals**: whether retrieval ever stalls
+    first-audio-token, and where retrieval time actually goes (ASR
+    wait, API call, context injection).
+-   **A live demo**: a browser-based full-duplex interface running
+    MoshiRAG's own unmodified server stack, for manual testing.
+
+The harness also keeps a table of figures verified directly against
+the Moshi and MoshiRAG papers, used to catch regressions the model's
+own behavior might otherwise mask. That same grounding feeds forward
+into training decisions: understanding how Moshi's temporal and depth
+transformers contribute to voice, timing, and retrieval-conditioning
+behavior informs fine-tuning, not just the score at the end.
+
+### Evaluation Repository Components
+
+| Path | Role |
+|---|---|
+| `core/` | Model adapter, GPU device resolution, checkpoint download |
+| `evals/` | Eval runner, scoring, latency/retrieval-breakdown instrumentation |
+| `configs/` | Eval configs (checkpoint, retrieval backend, dataset subset) |
+| `demo/` | Instrumented launch script + web client for live manual testing |
+| `scripts/` | VM setup, demo launch, diagnostic tooling |
+| `specs/` | Requirements doc |
+| `docs/` | Investigation reports and work plans |
+
 ## 🗂️ Repository Components
 
 The table below maps the Python scripts and supporting configuration
@@ -648,6 +707,11 @@ Future evaluation should separately measure:
 -   **retrieval relevance,**
 -   **retrieval faithfulness,**
 -   **task completion.**
+
+`moshirag-evals` already implements retrieval relevance, retrieval
+faithfulness, and latency harnesses (see [AVTR's
+Evaluation](#-avtrs-evaluation-retrieval-probing-and-demo-harness)).
+Scoring AVTR's own adapter against them is the natural next step.
 
 The central research challenge is not maximizing any one metric
 independently, but finding a useful balance between **voice fidelity,
