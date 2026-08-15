@@ -222,13 +222,10 @@ This creates two simultaneous loops:
 
 The diagram below summarizes the target integrated architecture.
 
-```{=html}
 <p align="center">
-```
 `<img src="./images/integrated_system_workflow.png" alt="AVTR integrated system workflow showing Moshi, streaming ASR, asynchronous retrieval, and reference injection" width="900">`{=html}
-```{=html}
 </p>
-```
+
 The **front end** contains the latency-sensitive components. Moshi
 produces and receives real-time audio, while the LoRA adapter
 personalizes the model. Streaming ASR simultaneously feeds the retrieval
