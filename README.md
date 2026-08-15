@@ -223,7 +223,7 @@ This creates two simultaneous loops:
 The diagram below summarizes the target integrated architecture.
 
 <p align="center">
-`<img src="./images/integrated_system_workflow.png" alt="AVTR integrated system workflow showing Moshi, streaming ASR, asynchronous retrieval, and reference injection" width="900">`{=html}
+`<img src="./images/integrated_system_workflow.png" alt="AVTR integrated system workflow showing Moshi, streaming ASR, asynchronous retrieval, and reference injection" width="900">`
 </p>
 
 The **front end** contains the latency-sensitive components. Moshi
