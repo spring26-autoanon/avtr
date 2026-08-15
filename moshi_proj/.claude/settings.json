@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv:*)",
+      "Bash(python:*)",
+      "Bash(python3:*)",
+      "Bash(torchrun:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(ffprobe:*)",
+      "Bash(huggingface-cli:*)",
+      "Bash(nvidia-smi)",
+      "Bash(rsync:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Read(//Users/leenatantawy/Downloads/capstone/moshi-finetune/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

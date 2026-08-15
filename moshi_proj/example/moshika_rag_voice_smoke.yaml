@@ -1,0 +1,59 @@
+# SMOKE TEST for the moshika-rag LoRA fine-tune.
+# Purpose: validate that moshika-rag's RAG-conditioner config.json loads and that a
+# single forward+backward step runs, BEFORE launching the real ~400-step run.
+# Run from the repo root on the A100 box:
+#   uv run torchrun --nproc-per-node 1 -m train example/moshika_rag_voice_smoke.yaml
+#
+# Outcomes:
+#   - loads + steps cleanly -> use example/moshika_rag_voice.yaml as-is for the real run.
+#   - fails building conditioners -> run scripts/strip_config.py and point config_path at
+#     the stripped copy (see CLAUDE.md step 2), then re-run this smoke test.
+
+# ---- data ----
+data:
+  train_data: "finetune/data/prepared/train.jsonl"
+  eval_data:  "finetune/data/prepared/eval.jsonl"
+  shuffle: true
+
+# ---- model: same base + config as the real run ----
+moshi_paths:
+  # Path B: train on PLAIN moshika (the non-RAG base). moshika-rag isn't trainable
+  # in this repo (see pyproject.toml note); we imprint voice on the shared layers
+  # here and apply the adapter to moshika-rag at serve time.
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"
+  # No config_path: plain moshika has no config.json; moshi's built-in default LM
+  # architecture is used (the "loads default models" warning is expected here).
+
+full_finetuning: false
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.
+  ft_embed: false
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# ---- optim (identical to real run; only step count differs) ----
+duration_sec: 100
+batch_size: 8
+max_steps: 1          # SMOKE: one step only
+gradient_checkpointing: true
+optim:
+  lr: 4e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ---- eval / checkpointing ----
+do_eval: false        # SMOKE: skip eval
+eval_freq: 50
+do_ckpt: false        # SMOKE: do not write checkpoints
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true
+
+# ---- other ----
+seed: 0
+log_freq: 1
+
+run_dir: "runs/moshika_rag_voice_smoke"

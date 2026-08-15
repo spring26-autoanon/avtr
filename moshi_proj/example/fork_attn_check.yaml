@@ -1,0 +1,42 @@
+# VERIFICATION (not a real run): does the moshi-rag FORK's trainer wrap ATTENTION
+# with LoRA on plain moshika? 2 steps, save one checkpoint, then inspect the adapter
+# for self_attn LoRA keys. Run in the fork training venv:
+#   CUDA_VISIBLE_DEVICES=0 uv run torchrun --nproc-per-node 1 -m train example/fork_attn_check.yaml
+
+data:
+  train_data: "finetune/data/prepared/train.jsonl"
+  eval_data:  "finetune/data/prepared/eval.jsonl"
+  shuffle: true
+
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"     # plain moshika (no conditioners)
+
+full_finetuning: false
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.
+  ft_embed: false
+  freeze_attention: false     # attention SHOULD be wrapped — that's what we're checking
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+duration_sec: 100
+batch_size: 8
+max_steps: 2
+gradient_checkpointing: true
+optim:
+  lr: 4e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+
+do_eval: false
+do_ckpt: true
+ckpt_freq: 2          # checkpoint at the last step
+num_ckpt_keep: 1
+save_adapters: true
+
+seed: 0
+log_freq: 1
+run_dir: "runs/fork_attn_check"

@@ -1,0 +1,52 @@
+# EXPERIMENT: MLP/gating-only voice LoRA (attention frozen).
+# Hypothesis: cloning the voice via MLP/gating only will (a) stay compatible with
+# moshika-rag across moshi versions, and (b) preserve turn-taking better, since
+# attention (frozen here) is where temporal/yield behavior largely lives.
+# Same data + recipe as example/moshika_rag_voice.yaml, so results are comparable
+# to that run's checkpoints (full-LoRA). See NEXT_STEPS.md.
+#   CUDA_VISIBLE_DEVICES=0 uv run torchrun --nproc-per-node 1 -m train example/moshika_voice_mlp_only.yaml
+
+# ---- data ----
+data:
+  train_data: "finetune/data/prepared/train.jsonl"
+  eval_data:  "finetune/data/prepared/eval.jsonl"
+  shuffle: true
+
+# ---- model: plain moshika base (Path B) ----
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"
+  # No config_path: plain moshika uses moshi's built-in default LM architecture.
+
+full_finetuning: false
+lora:
+  enable: true
+  rank: 64
+  scaling: 2.
+  ft_embed: false
+  freeze_attention: true    # <-- the experiment: attention LoRA frozen, MLP/gating only
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# ---- optim (same as the full-LoRA run for a fair comparison) ----
+duration_sec: 100
+batch_size: 8
+max_steps: 400
+gradient_checkpointing: true
+optim:
+  lr: 4e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ---- eval / checkpointing ----
+do_eval: false            # eval_loss is NaN with a single held-out file anyway
+eval_freq: 50
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 5          # keep all of 100/200/300/400 (no pruning surprises)
+save_adapters: true
+
+# ---- other ----
+seed: 0
+log_freq: 1
+run_dir: "runs/moshika_voice_mlp_only"

@@ -1,0 +1,70 @@
+# LoRA voice/personality fine-tune targeting the moshi-rag base checkpoint.
+# Run from the repo root on the A100 box:
+#   uv run torchrun --nproc-per-node 1 -m train example/moshika_rag_voice.yaml
+#
+# See CLAUDE.md for the full workflow (data prep, smoke test, packaging).
+
+# ---- data ----
+data:
+  train_data: "finetune/data/prepared/train.jsonl"   # 8 files (~51 min); use all.jsonl to train on all 9
+  eval_data:  "finetune/data/prepared/eval.jsonl"     # 1 held-out file (movies.wav)
+  shuffle: true
+
+# ---- model: train the LoRA against the EXACT weights moshi-rag serves ----
+moshi_paths:
+  # Path B: train on PLAIN moshika (the non-RAG base moshika-rag is built on).
+  # moshika-rag itself isn't trainable in this repo (see pyproject.toml note), so
+  # we imprint the voice on the shared transformer/depformer layers here, then
+  # apply the adapter to moshika-rag at serve time via --lora-weight.
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"
+  # No config_path: plain moshika ships no config.json and uses moshi's built-in
+  # default LM architecture (same as moshiko, different voice weights). The
+  # "loads default models" warning from args.py:58-63 is expected and correct here.
+  # moshi_path / mimi_path / tokenizer_path: leave unset -> pulled from hf_repo_id.
+  # moshi_path / mimi_path / tokenizer_path: leave unset -> pulled from hf_repo_id.
+
+full_finetuning: false
+lora:
+  enable: true
+  rank: 64          # conservative for a small (~58 min) dataset; raise to 96/128 if under-imprinted
+  scaling: 2.
+  ft_embed: false
+
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+
+# ---- optim (tuned to avoid overfitting on a small monologue set) ----
+duration_sec: 100
+batch_size: 8
+max_steps: 400        # ~tens of epochs over ~35 chunks; watch eval loss, stop early if it climbs
+gradient_checkpointing: true
+optim:
+  lr: 4e-6            # low: imprint voice, don't rewrite the model
+  weight_decay: 0.1
+  pct_start: 0.05
+
+# ---- eval / checkpointing ----
+do_eval: true
+eval_freq: 50
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 3
+save_adapters: true   # keep a portable lora.safetensors (applied over moshika-rag at serve time)
+
+# ---- other ----
+seed: 0
+log_freq: 1
+
+run_dir: "runs/moshika_rag_voice"
+
+# SMOKE TEST before the real run (validates moshika-rag's RAG-conditioner config loads):
+#   copy this file, set max_steps: 1 and do_ckpt: false, and run once.
+#   - loads + steps cleanly  -> use this config as-is
+#   - fails on conditioners  -> point config_path at a stripped config.json
+#                               (remove conditioners / fuser / rag_token_id)
+
+# wandb:
+#   project: ""
+#   run_name: ""
+#   key: ""
+#   offline: False

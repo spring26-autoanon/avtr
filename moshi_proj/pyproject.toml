@@ -1,0 +1,111 @@
+[project]
+name = "finetune"
+requires-python = ">= 3.10"
+description = "finetune moshi models"
+dynamic = ["version"]
+readme = "README.md"
+dependencies = [
+  "fire",
+  "simple-parsing",
+  "pyyaml",
+  "safetensors",
+  "tensorboard",
+  "tqdm",
+  # Fork stack (moshi 0.2.13). We train on PLAIN moshika under the moshi-rag fork so
+  # the adapter uses the SAME attention naming as moshika-rag (fused in_proj_weight)
+  # and overlays cleanly at serve time. The fork's earlier crash was the moshika-rag
+  # RAG ARC-encoder conditioner; plain moshika has no conditioners, so it's avoided.
+  # Mainline 0.2.4a1 (git@061cc4c) also trains plain moshika but its per-step attention
+  # (in_projs.N) makes the adapter HALF-incompatible with moshika-rag — see NEXT_STEPS.md.
+  "torch==2.9.1",
+  "triton>=3.2",
+  "moshi @ git+https://github.com/kyutai-labs/moshi-rag.git#subdirectory=moshi",
+  "sphn>=0.2.0,<0.3.0",
+  "auditok==0.2",
+  "whisper_timestamped",
+  "huggingface_hub",
+  "torchaudio",
+  "submitit",
+  "llvmlite>=0.44",
+  "numba>=0.61",
+]
+
+[project.optional-dependencies]
+# We're putting dev dependencies here rather than [dependency-groups.dev] because
+# this way non-uv users can still install them with `pip install -e .[dev]`
+dev = [
+  "flake8",
+  "mypy==1.4.0",
+  "mypy-extensions==1.0.0",
+  "pre-commit",
+  "ruff==0.11",
+  "pyright",
+  "pytest",
+]
+
+[tool.uv]
+# The following fixes Pylance/VSCode not seeing the `finetune` package. See
+# https://github.com/astral-sh/uv/issues/3898
+config-settings = { editable_mode = "compat" }
+
+# openai-whisper (pulled in by whisper_timestamped) imports pkg_resources at
+# build time. setuptools >=81 no longer ships pkg_resources, so the default
+# build env fails with ModuleNotFoundError. Pin an older setuptools that still
+# bundles it into openai-whisper's build environment.
+[tool.uv.extra-build-dependencies]
+openai-whisper = ["setuptools<81"]
+
+[tool.setuptools]
+packages = ["finetune"]
+
+[tool.black]
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | _build
+  | buck-out
+  | build
+  | dist
+)/
+'''
+line-length = 88
+
+[tool.isort]
+known_third_party = []
+line_length = 88
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+follow_imports = "normal"
+
+[tool.ruff]
+lint.select = ["E", "F", "W", "C90", "I", "C4", "PT", "RSE", "TID", "TCH", "FLY", "NPY", "RUF", "T10"]
+line-length = 88
+lint.ignore = ["E501"]
+target-version = "py38"
+exclude = [".git","__pycache__",".vscode",".mypy_cache"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 20
+
+[tool.pytest.ini_options]
+python_classes = [
+  "!TestConfig",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning",
+    "ignore::ImportWarning",
+    "ignore::DeprecationWarning:pkg_resources",
+    "ignore::DeprecationWarning:wandb",
+    "ignore::DeprecationWarning:torch.utils.tensorboard",
+    "ignore::UserWarning",
+]
+testpaths = []
+addopts = "--ignore=third_party --ignore=tokens"
