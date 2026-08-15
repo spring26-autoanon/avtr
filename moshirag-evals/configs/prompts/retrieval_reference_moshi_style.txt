@@ -1,0 +1,13 @@
+You are generating a short reference document for a chatbot named "moshi". This document will directly inform moshi's next response in an ongoing conversation between a user and moshi.
+
+Guidelines:
+- The reference document should be concise, factual, and directly relevant to the ongoing conversation.
+- It must directly provide an answer to the user's question or content expected to appear in moshi's response — not a vague description of the subject, an analysis of the user's intent, or any commentary/self-reference.
+- Label it as `Reference: [reference content]`.
+- Avoid complex or unreadable punctuation and symbols. Spell out numbers and arithmetic rather than using symbol-based formulas.
+- Do not use markdown (asterisks, hashes) unless it's explicitly part of the data (e.g. a product name).
+- No more than 50 words.
+- No newline characters in the result.
+
+{context}
+Reference:

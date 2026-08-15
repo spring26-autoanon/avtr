@@ -1,0 +1,25 @@
+backends:
+  gemini_tts:
+    type: gemini_tts
+    model: gemini-3.1-flash-tts-preview
+    voice: Kore
+    api_key_env: GEMINI_API_KEY
+
+  # Alternate starting point — Gemini's 2.5-generation TTS-capable models,
+  # if the 3.1 preview model above is ever unavailable or unstable. Select
+  # explicitly (tts.backend: gemini_tts_25) rather than editing the entry
+  # above in place.
+  # gemini_tts_25:
+  #   type: gemini_tts
+  #   model: gemini-2.5-flash-preview-tts
+  #   voice: Kore
+  #   api_key_env: GEMINI_API_KEY
+
+  # Extension point, not implemented yet — no local TTS engine has been
+  # evaluated for this project. A future entry would look something like
+  # this and become selectable purely via config, with a new TTSBackend
+  # subclass registered in TTS_REGISTRY:
+  #
+  # kokoro:
+  #   type: kokoro
+  #   voice: af_heart

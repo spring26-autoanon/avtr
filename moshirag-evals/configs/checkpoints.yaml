@@ -1,0 +1,2 @@
+aliases:
+  base: gs://${GCS_BUCKET}/checkpoints/base/moshirag-base-bf16

@@ -1,0 +1,67 @@
+# Scratch config — exploratory tuning pass, not a committed direction.
+#
+# Follow-up to configs/_scratch_validate_temp_text_0_8.yaml: that clean
+# STT_OFF_THREAD=0/temp_text=0.8 test (demo/sessions/2026-07-29T19-03-58Z/)
+# showed no improvement over the 0.7 baseline's retrieval-adjacent
+# pad-stall pattern (turn 1: 58, vs. 0.7's 57/59/61 — inside the same noise
+# band) and produced the single largest stall observed across the whole
+# investigation so far: 220 (~17.6s), a 17.14s real gap between the user
+# finishing "history of football?" (79.075s) and <ret> finally triggering
+# (96.211s) — confirmed via count_pad_stalls.py's compute check to still be
+# genuinely on-schedule GPU cadence throughout, not a warm-up/compute
+# artifact, same as every other run measured. With n=1 per setting this
+# doesn't prove 0.8 is worse than 0.7, but it clearly didn't demonstrate the
+# hoped-for improvement, which is reason enough to try the other untouched
+# variable before spending more sessions on temp_text alone.
+#
+# temp_text reverted to the 0.7 baseline here — deliberately isolating
+# top_k_text as the only change under test, same "one variable at a time"
+# discipline the temp_text tests used. 25 -> 50 (2x) is a first, moderate
+# step: top_k gates how many candidate tokens are even eligible for
+# sampling, so if <ret>/real-token logits are being out-ranked by <pad>
+# rather than just under-weighted by temperature, doubling the candidate
+# pool is a more direct test of that than raising temperature further would
+# be.
+#
+# server.log prints the applied values directly at startup
+# ("[Generation] temp_text=... top_k_text=..." — see core/model_interface.py's
+# _patch_load_models_generation_overrides()) and the STT threading mode
+# ("[STT] STT_OFF_THREAD=0 (default) -- ...") — confirm BOTH lines before
+# trusting this run's results.
+#
+# To revert: stop passing --config configs/_scratch_validate_top_k_text_50.yaml
+# -- baseline_with_retrieval_moshi_style.yaml (temp_text: 0.7, top_k_text: 25)
+# is untouched by this file and remains the shipped default.
+#
+# Everything else copied verbatim from baseline_with_retrieval_moshi_style.yaml.
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
+    temp_text: 0.7   # reverted to baseline -- not under test in this file
+    top_k_text: 50   # was 25 -- the one change under test in this file
+  retrieval:
+    enabled: true
+    backend: gemini_api_moshi_style   # key into configs/retrieval_backends.yaml
+    latency_gate_ms: 8000
+    fallback: null
+
+judge:
+  model: gemini-3.5-flash
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.e2ekd
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

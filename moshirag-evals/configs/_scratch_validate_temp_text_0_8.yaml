@@ -1,0 +1,67 @@
+# Scratch config — exploratory tuning pass, not a committed direction.
+#
+# Follow-up to configs/_scratch_validate_temp_text.yaml (see that file for
+# the full 1.0 result): temp_text=1.0 improved the VAD "LM buffer empty"
+# stall-count-before-switch-to-model metric but introduced real incoherence
+# — non-sequiturs and garbled word fragments not present at the 0.7
+# baseline. That 1.0 result is now known to be CONFOUNDED, not a clean
+# read on temp_text alone: both the 1.0 and a later 0.8-vs-nothing test
+# session silently ran with STT_OFF_THREAD defaulting to enabled (the
+# demo's off-thread STT chain), which independently correlated with a real
+# dropped-user-utterance bug (real speech, zero server-side VAD/STT
+# registration — see project_stt_cuda_graph_thread_safety /
+# project_pad_token_sampling_investigation memories). A model that never
+# heard the real question will look "incoherent" regardless of temp_text.
+# STT_OFF_THREAD now defaults to disabled (2026-07-29,
+# core/model_interface.py's _stt_off_thread_enabled()) and a clean
+# STT_OFF_THREAD=0/temp_text=0.7 baseline session
+# (demo/sessions/2026-07-29T07-10-18Z/) confirmed the dropped-utterance bug
+# is gone and content is correct/coherent throughout — so THIS run is the
+# first genuinely clean test of temp_text=0.8 alone, isolated from that
+# confound. 0.7 -> 0.8 is a ~14% relative increase in softmax temperature
+# (vs. 1.0's ~43%) — a smaller step, testing whether some of the
+# stall-count improvement survives without as much coherence cost.
+# top_k_text left at its default (25), unchanged — one variable at a time.
+#
+# server.log prints the applied values directly at startup
+# ("[Generation] temp_text=... top_k_text=..." — see core/model_interface.py's
+# _patch_load_models_generation_overrides()) and the STT threading mode
+# ("[STT] STT_OFF_THREAD=0 (default) -- ...") — confirm BOTH lines before
+# trusting this run's results.
+#
+# To revert: stop passing --config configs/_scratch_validate_temp_text_0_8.yaml
+# -- baseline_with_retrieval_moshi_style.yaml (temp_text: 0.7, top_k_text: 25)
+# is untouched by this file and remains the shipped default.
+#
+# Everything else copied verbatim from baseline_with_retrieval_moshi_style.yaml.
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
+    temp_text: 0.8   # was 0.7 -- the one change under test in this file
+    top_k_text: 25   # unchanged, deliberately -- see header comment
+  retrieval:
+    enabled: true
+    backend: gemini_api_moshi_style   # key into configs/retrieval_backends.yaml
+    latency_gate_ms: 8000
+    fallback: null
+
+judge:
+  model: gemini-3.5-flash
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.e2ekd
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

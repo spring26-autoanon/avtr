@@ -1,0 +1,66 @@
+# Scratch config — exploratory tuning pass, not a committed direction.
+#
+# RESULT (2026-07-29, real VM session, demo/sessions/2026-07-29T05-50-41Z/):
+# mixed. The VAD "LM buffer empty" stall-count-before-switch-to-model metric
+# this was meant to fix genuinely improved (0, 0, 8 vs. the original
+# session's 21->63->58->69->80 growth). But the turn transcripts show new,
+# real incoherence not present at temp_text=0.7 -- non-sequiturs ("That
+# sounds perfect for a Tuesday" in response to a World Cup question) and
+# outright garbled fragments ("Happy! To!" split across a turn boundary).
+# 0.7 -> 1.0 is a ~43% relative jump in softmax temperature, which compounds
+# over every token in a response -- framed at the time as "the conservative,
+# neutral choice," in hindsight too large a first step. Session also
+# contained a real, likely-unrelated ~44s user pause (confirmed silent in
+# both server.log and the recorded audio) and one isolated 457.8ms step
+# spike -- neither clearly tied to the temp_text change.
+# Conclusion: don't ship 1.0. Next test is configs/_scratch_validate_temp_text_0_8.yaml
+# (0.7 -> 0.8, a smaller step) -- see that file for the follow-up. This file
+# is kept as the record of what was tried and why it wasn't taken further.
+#
+# First real-hardware test of the pad-token-sampling-drift lever (see
+# CLAUDE.md's "Real root cause of demo response lag" and the
+# project_pad_token_sampling_investigation memory): temp_text raised from
+# baseline_with_retrieval_moshi_style.yaml's default of 0.7 -> 1.0
+# (the "neutral" point -- removes the checkpoint's default extra sharpening
+# of the raw logits, rather than an arbitrary guess). top_k_text
+# deliberately left at its default (25), unchanged -- one variable at a
+# time, so any effect on the VAD "LM buffer empty" stall-count-before-
+# switch-to-model pattern (21->63->58->69->80 in the session that motivated
+# this) can be attributed to temp_text alone.
+#
+# To revert: stop passing --config configs/_scratch_validate_temp_text.yaml
+# -- baseline_with_retrieval_moshi_style.yaml (temp_text: 0.7, top_k_text: 25)
+# is untouched by this file and remains the shipped default.
+#
+# Everything else copied verbatim from baseline_with_retrieval_moshi_style.yaml.
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
+    temp_text: 1.0   # was 0.7 -- the one change under test in this file
+    top_k_text: 25   # unchanged, deliberately -- see header comment
+  retrieval:
+    enabled: true
+    backend: gemini_api_moshi_style   # key into configs/retrieval_backends.yaml
+    latency_gate_ms: 8000
+    fallback: null
+
+judge:
+  model: gemini-3.5-flash
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.e2ekd
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

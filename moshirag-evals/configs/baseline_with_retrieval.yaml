@@ -1,0 +1,80 @@
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.5
+    power_threshold: -65
+    tail_silence_steps: 25
+    # Both unchanged from LMGen's own hardcoded defaults (real checkpoint's
+    # config.json has no lm_gen_config override, confirmed directly) —
+    # left explicit here now that they're config-adjustable, rather than
+    # only living in core/model_interface.py's _DEFAULT_GENERATION. See
+    # CLAUDE.md's "Real root cause of demo response lag" section: these are
+    # the one confirmed lever onto the pad-token-sampling drift (temp/top-k
+    # applied directly to text_logits, the only place in the whole pipeline
+    # that reaches it — cfg_coef also reaches text_logits but can't be used
+    # here, see that field's own comment above). No moshi.server CLI flag
+    # exists for either — scripts/print_demo_env.py excludes both from its
+    # CLI-flags translation; the demo applies them via
+    # core/model_interface.py's _patch_load_models_generation_overrides()
+    # reading this same config directly instead.
+    temp_text: 0.7
+    top_k_text: 25
+  retrieval:
+    enabled: true
+    backend: gemini_api_moshi_style   # key into configs/retrieval_backends.yaml
+    # Was plain `gemini_api` until 2026-07-30. Changed because the moshi-style
+    # backend is the validated-better one and had been carried only by
+    # configs/baseline_with_retrieval_moshi_style.yaml, which meant anything
+    # using this file as the default — including every scripts/run_demo.sh
+    # launch that didn't pass --config — silently got the weaker prompt. That
+    # bit a real demo A/B on 2026-07-30 (three sessions run on `gemini_api`
+    # without noticing) and produced retrieval output that looked like a model
+    # problem: references restating turn 1's fact regardless of the question.
+    #
+    # The difference is more than the prompt template. `gemini_api` has
+    # thread_reference_history=False (the retrieval LLM sees no record of what
+    # it already returned, so it re-derives from a transcript dominated by the
+    # model's own last answer) and drop_leading/trailing_incomplete_turn=False
+    # (turn-boundary fragments go into the retrieval context as noise).
+    #
+    # Caveat for scored runs: eval results from before this date used the
+    # `gemini_api` prompt and are NOT directly comparable to results after it.
+    # Re-baseline rather than diffing across the change.
+    # 1500 was tuned for gemini-2.0-flash (now deprecated/shut down). Its
+    # replacement, gemini-3.5-flash, is a "thinking" model that defaults to
+    # medium thinking effort and — unlike the 2.5 family's
+    # reasoning_effort="none" — cannot fully disable it. Observed real-world
+    # latency on a short retrieval prompt was ~6.8s at the default thinking
+    # level, before core/retrieval_backend.py requested thinking_level="low".
+    # 8000 is a buffer above that unoptimized figure. This history predates
+    # gemini_api's promotion to gemini-3.5-flash-lite above, which measures
+    # ~0.35-0.5s (see retrieval_backends.yaml) — 8000 is now a much looser
+    # gate than the actual model needs, but left as-is (not retuned) since
+    # a loose gate doesn't hide a real problem, just under-warns; tighten if
+    # real flash-lite latency stats suggest a better number.
+    latency_gate_ms: 8000
+    fallback: null                # scaffold slot — a second backend name to
+                                   # race/fall back to; unimplemented beyond
+                                   # this config slot existing, see
+                                   # core/retrieval_backend.py's registry note
+
+judge:
+  model: gemini-3.5-flash
+
+tts:
+  backend: gemini_tts          # key into configs/tts_backends.yaml — used by knowledge.gsm8k
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - knowledge.gsm8k
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

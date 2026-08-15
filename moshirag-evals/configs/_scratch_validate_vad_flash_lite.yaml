@@ -1,0 +1,38 @@
+
+# Scratch config — exploratory tuning pass, not a committed direction.
+# vad_threshold=0.15 (the original intent) + gemini_api_flash_lite. The
+# reference-encoder ConnectError seen earlier while testing this combination
+# was root-caused to a degraded/dead conditioner process from a long-running
+# session (confirmed: the tmux server itself had died), not to this
+# combination of settings — a fresh conditioner ran both backends cleanly.
+# See CLAUDE.md's reference-encoder ConnectError note for the full story.
+# judge.model and tts stay untouched — only vad_threshold and the retrieval
+# backend change from baseline_with_retrieval.yaml.
+model:
+  checkpoint: base
+  generation:
+    cfg_coef: 1.0
+    stt_wait_time: 0.5
+    rag_timeout: 8.0
+    max_reference_tokens: 64
+    vad_window_size: 4
+    vad_threshold: 0.15
+    power_threshold: -65
+    tail_silence_steps: 25
+  retrieval:
+    enabled: true
+    backend: gemini_api_flash_lite   # key into configs/retrieval_backends.yaml
+    latency_gate_ms: 8000
+    fallback: null
+
+judge:
+  model: gemini-3.5-flash
+
+evals:
+  - knowledge.open_audio_bench
+  - knowledge.halu_eval_audio
+  - duplex.full_duplex_bench
+  - latency.ttfat
+  - latency.retrieval_breakdown
+
+output_dir: ./evals/results/

@@ -1,0 +1,34 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# secrets
+.env
+.env.local
+*.env.local
+
+# runtime artifacts
+checkpoint_cache/
+evals/results/
+demo/sessions/
+gpu_diag/
+
+# demo/client/ (forked web client) build tooling
+node_modules/
+
+# editor
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# local scratch / Claude Code local settings
+audio/
+temp
+.claude/
