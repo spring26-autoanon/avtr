@@ -10,6 +10,8 @@ import sentencepiece
 import torch
 from moshi.conditioners import ConditionAttributes
 
+from .reference_io import load_references as _load_reference_tensors
+
 Alignment = tuple[str, tuple[float, float], str]
 TokenizedAlignment = tuple[list[int], tuple[float, float], str]
 
@@ -18,19 +20,32 @@ TokenizedAlignment = tuple[list[int], tuple[float, float], str]
 class Sample:
     codes: torch.Tensor
     condition_attributes: ConditionAttributes | None = None
+    # list of [T_ref, D] precomputed reference_with_time, one per <RAG> marker in this
+    # clip, in marker order; None for plain dialogue with no retrieval
+    reference_tensor: list | None = None
 
 
 @dataclass
 class Batch:
     codes: torch.Tensor
     condition_attributes: list[ConditionAttributes] | None = None
+    # per-example list of [T_ref, D] (or None); carries replay reference_with_time
+    reference_tensors: list | None = None
 
     @classmethod
     def collate(cls, batch: list[Sample]) -> "Batch":
         codes = torch.cat([b.codes for b in batch])
-        if batch[0].condition_attributes is None:
-            return Batch(codes)
-        return Batch(codes, [b.condition_attributes for b in batch])
+        condition_attributes = (
+            None
+            if batch[0].condition_attributes is None
+            else [b.condition_attributes for b in batch]
+        )
+        reference_tensors = (
+            [b.reference_tensor for b in batch]
+            if any(b.reference_tensor is not None for b in batch)
+            else None
+        )
+        return Batch(codes, condition_attributes, reference_tensors)
 
 
 def tokenize(
@@ -120,7 +135,10 @@ class Interleaver:
         # Tokenizes each word individually into a list of ints.
         out = []
         for word, ts, speaker in alignments:
-            toks = tokenize(self.tokenizer, word.strip(), bos=False)
+            if word.strip() == "<RAG>":
+                toks = [4]  # rag_token_id -> emit the ⟨ret⟩ retrieval trigger
+            else:
+                toks = tokenize(self.tokenizer, word.strip(), bos=False)
             out.append((toks, ts, speaker))
         return out
 
@@ -286,4 +304,5 @@ class InterleavedTokenizer:
             )
 
             codes = torch.cat([text_tokens, audio_tokens], dim=1)
-            return Sample(codes, data.get("text_conditions", None))
+            reference_tensor = _load_reference_tensors(path)
+            return Sample(codes, data.get("text_conditions", None), reference_tensor)

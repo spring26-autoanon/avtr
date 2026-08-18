@@ -1,0 +1,21 @@
+{
+  "checkpoint": "FILL_run_ckpt",
+  "scaling": 2.0,
+  "session": 1,
+  "voice": 0,
+  "interrupt_yields": null,
+  "results": {
+    "q01": {"fired": null, "passed": false, "notes": ""},
+    "q02": {"fired": null, "passed": false, "notes": ""},
+    "q03": {"fired": null, "passed": false, "notes": ""},
+    "q04": {"fired": null, "passed": false, "notes": ""},
+    "q05": {"fired": null, "passed": false, "notes": ""},
+    "q06": {"fired": null, "passed": false, "notes": ""},
+    "q07": {"fired": null, "passed": false, "notes": ""},
+    "q08": {"fired": null, "passed": false, "notes": ""},
+    "q09": {"fired": null, "passed": false, "notes": ""},
+    "q10": {"fired": null, "passed": false, "notes": ""},
+    "q11": {"fired": null, "passed": false, "notes": ""},
+    "q12": {"fired": null, "passed": false, "notes": ""}
+  }
+}

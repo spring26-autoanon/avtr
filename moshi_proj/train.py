@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import os
 import pprint
+import random
 import shutil
 from contextlib import ExitStack
 from pathlib import Path
@@ -64,6 +65,9 @@ def train(config: str):
 def _train(args: TrainArgs, exit_stack: ExitStack):
     # 1. Initial setup and checks
     set_random_seed(args.seed)
+    # Dedicated stream for reference delay/dropout so those draws don't shift the
+    # data-order or init RNG, keeping runs comparable across the env-var switches.
+    reference_rng = random.Random(args.seed)
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     # Init NCCL
@@ -245,11 +249,49 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
             batch = next(data_loader)
             codes = batch.codes
 
+            # Which examples in this microbatch carry a reference. Examples WITHOUT one are
+            # windows where we never verified whether retrieval was warranted, so their text
+            # loss must not push P(⟨ret⟩) down (see finetune/loss.py). Opt-in per run:
+            # MASK_UNLABELLED_RAG=1 alongside RAG_TOKEN_WEIGHT on the moshika-rag track only.
+            # Track A trains on plain moshika, where token 4 is an ordinary token.
+            rag_loss_mask = None
+            if os.environ.get("MASK_UNLABELLED_RAG", "0") == "1":
+                refs_for_mask = getattr(batch, "reference_tensors", None) or [None] * len(codes)
+                rag_loss_mask = torch.tensor(
+                    [not (r is not None and len(r)) for r in refs_for_mask],
+                    device=codes.device,
+                )
+
             condition_tensors = None
             if batch.condition_attributes is not None:
                 condition_tensors = model.condition_provider.prepare(
                     batch.condition_attributes
                 )
+
+            if getattr(batch, "reference_tensors", None) is not None:
+                # Inject precomputed reference_with_time (replay) at EVERY rag_token (⟨ret⟩)
+                # frame, so multi-retrieval clips condition each answer (matches serve).
+                from moshi.conditioners.base import ConditionType
+
+                from finetune.data.reference_injection import build_reference_condition
+
+                refs = batch.reference_tensors
+                present = [r for r in refs if r is not None and len(r)]
+                if present:
+                    first = present[0]
+                    dim = (first[0] if isinstance(first, list) else first).shape[-1]
+                    # RAG_DELAY=1 places each reference at hit + d' (Eq. 3) instead of at
+                    # the hit, matching serve time where the document takes 1.7-3.4 s to
+                    # arrive. RAG_REF_DROPOUT is the paper's 0.2. Both off by default.
+                    ref_cond, ref_mask = build_reference_condition(
+                        codes[:, 0, :], refs, dim, next(model.parameters()).dtype,
+                        sample_delay=os.environ.get("RAG_DELAY", "0") == "1",
+                        dropout=float(os.environ.get("RAG_REF_DROPOUT", "0.0")),
+                        rng=reference_rng,
+                    )
+                    if condition_tensors is None:
+                        condition_tensors = {}
+                    condition_tensors["reference_with_time"] = ConditionType(ref_cond, ref_mask)
 
             # forward / backward
             output = model(codes=codes, condition_tensors=condition_tensors)
@@ -263,6 +305,9 @@ def _train(args: TrainArgs, exit_stack: ExitStack):
                     model.text_padding_token_id,
                     model.end_of_text_padding_id,
                 },
+                rag_token_id=4,
+                rag_token_weight=float(os.environ.get("RAG_TOKEN_WEIGHT", "1.0")),
+                rag_loss_mask=rag_loss_mask,
             )
             audio_loss = compute_loss_with_mask(
                 output.logits,

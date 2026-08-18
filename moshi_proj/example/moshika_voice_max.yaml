@@ -1,0 +1,58 @@
+# TRACK A — maximum voice clone on PLAIN moshika. No retrieval.
+#
+# Goal: the best-sounding Danielle we can produce, with nothing else to protect.
+# This is the safe deliverable: no retrieval behaviour to damage, and the settings are the
+# repo's own recommended ones (README "Recommended settings for quick training") rather than
+# anything we invented.
+#
+# Deliberately the OPPOSITE direction from the RAG track. There we minimise intervention to
+# preserve base behaviour; here we maximise it, because voice is the only objective.
+#
+#   README: rank 128, batch_size 16, max_steps 2000, lr 2e-6
+#   Stage 3 used rank 64, batch 8, 800 steps, lr 4e-6 — half the rank, and DOUBLE the
+#   learning rate both the README and the moshi-rag paper recommend.
+#
+# ⚠️ PREREQUISITE: strip <RAG> markers from the retrieval clips before using them here.
+# interleaver._tokenize maps "<RAG>" to raw token id 4, which is the rag token on moshika-rag
+# but an ordinary token on plain moshika — feeding it here injects garbage into the text
+# stream. Use marker-free copies of the clips (see scripts/strip_rag_markers.py).
+data:
+  # dialogue + marker-STRIPPED retrieval clips + the new persona/decline session.
+  # Update this line once the 2026-08-07 recording is cut.
+  train_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl,/home/leenatantawy/moshi-finetune/replay/retrieval_nomarkers/train.jsonl,/home/leenatantawy/moshi-finetune/finetune/data/prepared_michelle/all.jsonl,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  # Plain moshika (female voice), NOT moshika-rag. It ships no config.json, and under the
+  # pinned fork (moshi 0.2.13) the built-in DEFAULT architecture includes the RAG ARC
+  # conditioner, which crashes on the meta device at load. Verified fix (wb-gpu-training,
+  # 2026-08-07 smoke: 1 step, loss 2.101, peak 35 GB): point config_path at the
+  # conditioner-stripped moshika-rag config — same 7B dims, no conditioners/fuser
+  # (scripts/strip_config.py output).
+  hf_repo_id: "kyutai/moshika-pytorch-bf16"
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.stripped.json"
+full_finetuning: false
+lora: { enable: true, rank: 128, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+# 200 s windows, batch 8: same tokens/step as the README's 16x100, but the adapter trains
+# positions to 200 s. Prior adapters (trained at 100 s) went unresponsive at ~99 s of live
+# session — the base model trained on 5-min sequences, so an adapter that never saw a
+# context past 100 s extrapolates off-distribution there. 2026-08-07.
+duration_sec: 200
+batch_size: 8
+max_steps: 2000
+gradient_checkpointing: true
+optim:
+  lr: 2.0e-6          # README and the moshi-rag paper both use 2e-6; our runs used 4e-6
+  weight_decay: 0.1
+  pct_start: 0.05
+# do_eval is false; at batch 8 / duration 200 the 10-min eval slice is only 3 windows anyway.
+do_eval: false
+do_ckpt: true
+ckpt_freq: 200      # 2000 steps -> 10 checkpoints
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_voice_max"

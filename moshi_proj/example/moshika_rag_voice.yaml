@@ -4,8 +4,8 @@
 
 # ---- data ----
 data:
-  train_data: "finetune/data/prepared/train.jsonl"   # 8 files (~51 min); use all.jsonl to train on all 9
-  eval_data:  "finetune/data/prepared/eval.jsonl"     # 1 held-out file (movies.wav)
+  train_data: "finetune/data/prepared_dialogue/train.jsonl"  # 3 files (~135 min dialogue: clay + joshua_train_a/b; leena conv excluded, bad split)
+  eval_data:  "finetune/data/prepared_dialogue/eval.jsonl"    # 1 held-out file (danielle_joshuarhodes_eval.wav, 10 min)
   shuffle: true
 
 # ---- model: train the LoRA against the EXACT weights moshi-rag serves ----
@@ -34,7 +34,7 @@ text_padding_weight: .5
 # ---- optim (tuned to avoid overfitting on a small monologue set) ----
 duration_sec: 100
 batch_size: 8
-max_steps: 400        # ~tens of epochs over ~35 chunks; watch eval loss, stop early if it climbs
+max_steps: 800        # ~80 epochs over ~81 dialogue chunks; more data => fewer epochs/step, so voice imprints slower. Watch eval loss + turn-taking; pick the sweet spot.
 gradient_checkpointing: true
 optim:
   lr: 4e-6            # low: imprint voice, don't rewrite the model
@@ -46,14 +46,14 @@ do_eval: true
 eval_freq: 50
 do_ckpt: true
 ckpt_freq: 100
-num_ckpt_keep: 3
+num_ckpt_keep: 8   # keep 100..800 so we can audition the voice-vs-turntaking curve
 save_adapters: true   # keep a portable lora.safetensors (applied over moshika-rag at serve time)
 
 # ---- other ----
 seed: 0
 log_freq: 1
 
-run_dir: "runs/moshika_rag_voice"
+run_dir: "runs/moshika_dialogue"
 
 # SMOKE TEST before the real run (validates moshika-rag's RAG-conditioner config loads):
 #   copy this file, set max_steps: 1 and do_ckpt: false, and run once.

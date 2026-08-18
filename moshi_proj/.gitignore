@@ -109,3 +109,7 @@ example/debug_configs/
 finetune/data/datastereo/
 # Prepared audio (large; upload to the training box via rsync, not git)
 finetune/data/prepared/*.wav
+finetune/data/prepared_dialogue/*.wav
+finetune/data/prepared_retrieval/*.wav
+replay/retrieval/
+replay/retrieval_nomarkers/

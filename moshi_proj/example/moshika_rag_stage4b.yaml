@@ -1,0 +1,48 @@
+# TRACK B, RUN 4b — minimal intervention. Run ONLY after 4a has been auditioned.
+#
+# Premise from the base-model control: base moshika-rag fires the rag token on 7 consecutive
+# turns, never stalls, declines gracefully and takes turns cleanly. Our LoRA made all four
+# worse. Retrieval, turn-taking and fluency are therefore to be PRESERVED, not taught — the
+# only thing we add is voice. So adapt as little as gets us the voice.
+#
+# Changes vs 4a:
+#   rank 64 -> 32     one halving from the only value with evidence behind it (every
+#                     successful clone in this project used 64). Not 16: a two-step drop
+#                     would make a voice regression uninterpretable.
+#   800 -> 400 steps  run 1's history says voice imprints by ~300; past that damage accrues
+#                     while voice plateaus.
+#   batch 8 -> 16     Stage 3 peaked at 26.4 GB of 80, so there is headroom. WATCH memory on
+#                     the first few steps.
+#   lr 4e-6 -> 2e-6   both the README and the paper use 2e-6; we have been at double.
+#
+# ⚠️ Total adaptation (roughly lr x steps) is ~1/4 of Stage 3. If the voice does not imprint,
+# that is the first thing to relax — try 4e-6 x 400 or 2e-6 x 800 before touching rank.
+data:
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.35,/home/leenatantawy/moshi-finetune/replay/persona/train.jsonl:0.15,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.25"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-rag-pytorch-bf16"
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.spike.json"
+full_finetuning: false
+lora: { enable: true, rank: 32, scaling: 2., ft_embed: false }
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+# 300 s windows at batch 8: matches the base model's own 5-minute training sequences, so the
+# adapter's trained horizon equals the base's — prior adapters trained at 100 s went
+# unresponsive at ~99 s of live session. 4b hedges that ceiling; 4a deliberately keeps
+# Stage 3's 100 s so it stays a single-variable test of the loss-mask/delay fixes.
+# Decision 2026-08-08 at launch.
+duration_sec: 300
+batch_size: 8
+max_steps: 400
+gradient_checkpointing: true
+optim: { lr: 2.0e-6, weight_decay: 0.1, pct_start: 0.05 }
+do_eval: false
+do_ckpt: true
+ckpt_freq: 50        # 400 steps -> 8 checkpoints, same granularity as before
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_rag_stage4b"

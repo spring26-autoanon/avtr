@@ -1,0 +1,42 @@
+# TRACK B, RUN 4a — delay fix + reference dropout ONLY.
+#
+# Deliberately keeps every Stage 3 hyperparameter so the ONLY change is where the reference
+# lands in time. Stage 3 injected the document AT the rag-token frame; the paper injects at
+# i_ret + d', with d' bounded by the lead duration (Eq. 3), so it arrives while she is still
+# saying filler. Our zero-delay training is why she committed to "Argentina" 1.8s before the
+# correct document arrived and then defended it.
+#
+# Do NOT also change rank/steps/ratio here. Five knobs at once means a worse run teaches
+# nothing — that is run 4b's job.
+#
+# Requires: delay sampling + dropout in finetune/data/reference_injection.py, and lead/body
+# labelling from segment_retrieval_audio.py (d_lead per turn).
+#
+# MEASURED CONSTRAINT: her median lead is 1.20s, retrieval takes 1.7-3.4s, and only 30% of
+# her turns leave >=2s. The delay fix cannot ground a turn whose lead is shorter than the
+# lookup. The 2026-08-07 recording targets 2-4s of runway to move that number.
+data:
+  train_data: "/home/leenatantawy/moshi-finetune/replay/retrieval/train.jsonl:0.35,/home/leenatantawy/moshi-finetune/replay/persona/train.jsonl:0.15,/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/train.jsonl:0.25,/home/leenatantawy/moshi-finetune/finetune/data/prepared_persona/all.jsonl:0.25"
+  eval_data: "/home/leenatantawy/moshi-finetune/finetune/data/prepared_dialogue/eval.jsonl"
+  shuffle: true
+moshi_paths:
+  hf_repo_id: "kyutai/moshika-rag-pytorch-bf16"
+  config_path: "/home/leenatantawy/moshi-finetune/checkpoints/moshika-rag/config.spike.json"
+full_finetuning: false
+lora: { enable: true, rank: 64, scaling: 2., ft_embed: false }   # unchanged from Stage 3
+first_codebook_weight_multiplier: 100.
+text_padding_weight: .5
+duration_sec: 100
+batch_size: 8
+max_steps: 800
+gradient_checkpointing: true
+optim: { lr: 4.0e-6, weight_decay: 0.1, pct_start: 0.05 }          # unchanged, so 4a isolates the delay
+do_eval: false
+do_ckpt: true
+ckpt_freq: 100
+num_ckpt_keep: 10
+save_adapters: true
+seed: 0
+log_freq: 1
+# RAG_TOKEN_WEIGHT=25 in the environment. 15 never fired; 25 fires ~50%.
+run_dir: "/home/leenatantawy/moshi-finetune/runs/moshika_rag_stage4a"
